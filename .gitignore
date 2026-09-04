@@ -1,0 +1,35 @@
+# Secrets
+.env
+*.key
+.secrets/
+
+# Optional project-local runtime overrides
+.cache/
+.conda/
+.home/
+.tmp/
+data/
+results/
+logs/
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+
+# Local databases and test output
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.coverage
+htmlcov/
+build/
+dist/

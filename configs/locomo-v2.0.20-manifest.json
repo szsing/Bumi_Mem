@@ -1,0 +1,29 @@
+{
+  "generated_on": "2026-09-03",
+  "mem0_new": {
+    "version": "2.0.20",
+    "commit": "9a7924befd7026e41e445ba809370009e5e985a6",
+    "branch": "reproduce-v2.0.20"
+  },
+  "memory_benchmarks": {
+    "commit": "4b61c5d31b9c668a12b4f5e78064248a02c82d2b"
+  },
+  "dataset": "/home/legendre/data/ZhixingSun/dataset/locomo10.json",
+  "dataset_conversations": 10,
+  "evaluated_categories": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "evaluated_questions": 1540,
+  "top_k": 200,
+  "embedding_model": "/home/legendre/data/ZhixingSun/models/Qwen3-Embedding-0.6B",
+  "embedding_dims": 1024,
+  "estimated_deepseek_calls": {
+    "memory_extraction": 5882,
+    "answer_generation": 1540,
+    "llm_judging": 1540,
+    "total": 8962
+  }
+}

@@ -1,0 +1,6 @@
+[submodule "src/mem0-new"]
+	path = src/mem0-new
+	url = https://github.com/mem0ai/mem0.git
+[submodule "src/memory-benchmarks"]
+	path = src/memory-benchmarks
+	url = https://github.com/mem0ai/memory-benchmarks.git
