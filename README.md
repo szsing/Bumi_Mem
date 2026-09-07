@@ -1,10 +1,11 @@
 # Bumi_Mem
 
-Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型。当前版本实现：
+Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型。v0.2 在原 MVP 基础上增加持久化后台整理，当前实现：
 
 - **L1 会话记忆**：SQLite 持久化，最多 20 条有效消息、8,000 token；
 - **L2 会话摘要**：会话边界生成，仅用于存档、调试和审计；
-- **L3 长期记忆**：通过 Mem0 提取、更新并使用本地向量检索；
+- **L3 长期记忆**：通过 Mem0 提取并检索（固定 2.0.20 的普通抽取路径是 ADD-only，不自动更新旧事实）；
+- **后台整理任务**：SQLite 持久化、立即切换会话、有限重试、分块检查点、租约恢复；
 - DeepSeek/OpenAI-compatible API 与本地 Qwen Provider 独立可选；
 - 达到窗口上限或输入 `/new` 后才写入 L3，普通消息只检索 L3。
 
@@ -13,40 +14,22 @@ Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型
 ## Architecture
 
 ```text
-                           ┌──────────────────────┐
-用户输入 ─────────────────►│ L1 SQLite Session   │
-                           │ 20 messages / 8k tok │
-                           └──────────┬───────────┘
-                                      │
-                    当前输入           │ 最近 L1
-                       │              │
-                       ▼              ▼
-                 Mem0.search()   Context Builder
-                       │              │
-                       └──── L3 ──────┤
-                                      ▼
-                              Chat Provider
-                                      │
-                                  先展示回答
-                                      │
-                 /new 或窗口上限       ▼
-                           ┌──────────────────────┐
-                           │ Session Consolidator│
-                           ├──────────────────────┤
-                           │ L2 summary           │
-                           │ Mem0.add() -> L3     │
-                           └──────────┬───────────┘
-                                      ▼
-                         新 session + 4 条只读衔接上下文
+用户输入 → 保存 L1 → 有截止时间的 L3 检索 → 原有 L1/L3 Prompt → Chat Provider → 回答
+                                                                    │
+                                                             到达会话边界
+                                                                    ▼
+                           同一 SQLite 事务：冻结旧 L1 + 保存任务快照 + 新建会话
+                                                                    │
+                                       新会话立即可继续（仍保留最后 4 条只读衔接）
+
+后台 Worker → 领取任务/续租 → L2 摘要 → 分块 L3 写入与核对 → 成功 / 延迟重试 / 待人工核查
 ```
 
-普通对话的关键路径是：
+普通对话不调用记忆提取模型，不等待上一段整理结束。任务在当前进程运行期间执行；关闭程序后不继续运行，下次启动恢复。
 
-```text
-SQLite append → Mem0.search → L1/L3 Prompt → Chat LLM
-```
+**本地 SDK 的安全边界**：一个固定线程创建并串行调用同一个 Mem0/Qdrant 实例。前台检索不能无限等待后台写入，默认等待上限为 0.2 秒；超时或检索失败时，本轮仅使用原有 L1/衔接上下文，`TurnResult.recall_status` 为 `unavailable`。这不改变查询算法、Top-5、20 message / 8,000 token 或 4 条 carry-over，但不承诺后台忙时每轮都能取到 L3。模型首次加载也可能触发该降级。可用 `--memory-read-timeout` 调整等待上限。
 
-不会在每条消息后调用 `Mem0.add()`。长期记忆整合只发生在明确的会话边界。
+同一本地 Qdrant 目录只运行一个应用进程；本版不将其当作支持多进程共享的服务端数据库。
 
 ## Repository layout
 
@@ -201,38 +184,67 @@ scripts/stop_vllm_qwen.sh
 ## CLI commands
 
 ```text
-/help                  显示帮助
-/memories              查看当前用户全部 L3
-/search <query>        手动检索 L3
-/session               查看 L1 session 状态
-/recall on|off         控制回答前的 L3 检索
-/debug on|off          控制调试输出
-/new                   整合当前 L1 并开始新 session
-/discard               不写 L3，丢弃当前 session
-/forget-all            删除当前用户全部 L3，需输入完整 user-id
-/quit                  save / discard / cancel
+/help                            显示帮助
+/memories                        查看当前 user/agent 的 L3
+/search <query>                  手动检索 L3
+/session                         查看 L1 以及后台任务
+/jobs                            查看最近 50 个任务的状态、尝试次数与错误
+/retry <job-id>                  手动重试失败任务
+/retry <job-id> --allow-replay   核查 L3 后，显式允许重放结果不确定的分块；需再次输入 REPLAY
+/recall on|off                   控制回答前的 L3 检索
+/debug on|off                    调试输出，包括 recall_status 和任务回执
+/new                            保存整理任务并立即开始新会话
+/discard                        不写 L3，丢弃当前会话；不撤销之前已提交的后台任务
+/forget-all                     屏蔽当前 user/agent 的 L3、取消旧写入并后台清理；需输入 user-id
+/quit                           save / discard / cancel
 ```
 
-正常模式不会向用户展示 Mem0、向量库或自动 session 边界。Debug 模式会显示 L2、L3 事件和 session ID。
+`/new` 和 `save` 返回的是**任务已持久化的回执**，不是“记忆整理完成”。`/quit` 不等待新的整理任务；EOF/Ctrl+C 保留当前 L1，不自动打包。关闭时正在进行的外部调用无法安全强杀；进程终止后不会继续工作。
 
-## Session semantics
+## Session and task semantics
 
-触发会话整合的条件：
+触发条件保持不变：20 条有效消息、8,000 L1 token、`/new`、`/quit` 选择 `save`。
 
-- 达到 20 条有效 message；
-- 达到 8,000 L1 token；
-- 用户输入 `/new`；
-- `/quit` 时选择 `save`。
+1. 一个 SQLite 事务冻结完整有效 L1、持久化源消息快照和不含密钥的任务配置、关闭旧窗口、新建 active 会话并复制最后 4 条 `context_only` 衔接消息。
+2. 同一用户/agent 只能有一个 active 会话，但可以有多个待整理的历史会话。聊天状态与任务状态分离。
+3. 一个进程内 Worker 从 SQLite 队列领取任务，使用租约避免第二个 Worker 重复领取。后台模型/向量调用不持有 SQLite 事务。
+4. L2 成功后持久化并在后续重试复用；L2 失败时保存确定性 fallback 摘要并继续 L3，不改变原摘要/抽取 Prompt。
+5. 分块 ID 由 job 和 chunk index 决定，不包含 attempt。已确认成功的块不重放；未完成块保留检查点。`context_only` 不作为新证据再次写入。
+6. 已确认发生在写入前的失败（如固定 SDK 的 LLMError）自动退避重试，默认最多 3 次任务尝试。间隔默认 5、10 秒，可配置。失败任务不阻塞新聊天，`/retry` 可给它新的尝试预算。
+7. 普通后台任务状态：`queued → running → succeeded`，或 `retry_wait / failed / cancelled`。
 
-整合顺序：
+可配置参数：
 
-1. 冻结完整 L1 snapshot；
-2. Memory Provider 生成 L2；
-3. Mem0 `infer=True` 处理原始会话并写入 L3；
-4. 成功后关闭旧 session；
-5. 新 session 获得最后 4 条 `context_only` 衔接消息。
+```text
+--memory-read-timeout 0.2
+--memory-max-attempts 3
+--memory-retry-base-seconds 5
+```
 
-L3 失败时不会删除 L1。若 L2 已成功但 L3 失败，L2 会被清除，重试时重新生成 L2 和 L3。若 L2 失败但 L3 成功，系统使用确定性 fallback 摘要。
+### Crash recovery and write uncertainty
+
+- 排队任务在下次启动恢复。中断任务先等待旧租约过期（默认最多约 30 秒），不能在启动时把所有 running 任务直接重置。
+- 摘要/准备阶段中断可以自动恢复；已经确认成功的分块保持成功。
+- **如果外部写入可能已成功，但 SQLite 还没收到成功确认，不能同时保证自动重试与绝不重复。** 本版将该块标为 `uncertain`、任务标为 `failed`，停止盲目重试。先核查 L3，再用 `/retry <job-id> --allow-replay` 显式允许重放；它可能产生重复记忆。
+- 正常返回的 Mem0 ADD 记录会按 ID 读回核对。固定 SDK 仍可能将某些抽取解析失败表示成空结果；本层不能把这个接口变成端到端 exactly-once 保证。
+- 新版任务表会增量创建，原 L1/L2 与历史审计保留。v0.1 的遗留 processing/failed 会话会转为任务；若旧审计显示已经尝试过 L3 写入（成功、失败或进行中），无法从旧日志证明是否产生副作用，先标记为待人工核查，不自动重放。首次升级前应关闭旧程序并备份运行数据库；不要直接用 v0.1 回滚已经迁移的运行数据库。
+- 任务记录 provider/model 标识；配置发生变化时停止自动处理，恢复原配置后重试，避免悄悄用不同模型重放。
+
+### Forget and background writes
+
+`/forget-all` 保留“清理当前 user/agent 的 L3”的范围，不等同于删除全部原始聊天、L2、审计日志或备份。
+
+- 请求先落盘，立即屏蔽该 scope 的 L3 读取并取消旧任务。
+- 已经在执行的旧写入可能完成，但后台删除排在它后面；清理并核对成功之前，不解除读取屏蔽。
+- 请求之前的 L1 源消息被标记为禁止再进入整理，防止以后再次提交旧 L1 造成复活。它们仍可作为原有聊天上下文，用户有明确的新表达时可形成新的记忆。
+- 删除代际持久化；第一次删除之后用新的 Mem0 `run_id` 隔离其内部最近消息抽取缓存，避免旧缓存成为新的抽取来源。删除前的 generation 0 保持原 SDK 默认 scope。
+- 删除失败时继续屏蔽并记录任务错误；原用户可以 `/retry`。新代际写入等待删除成功后再执行。
+
+### Python API change
+
+`BumiMemory.chat()` 的 `auto_consolidation` 与 `end_session()` 现在返回 `ConsolidationSubmission`（`accepted/job_id/status/new_session_id`），不再同步返回整合结果。不能把 `accepted=True` 当成 L3 成功。
+
+使用 `memory_jobs()` / `store.get_job(job_id)` 查看结果，`retry_memory_job()` 重试。CLI 自动管理 Worker 生命周期；嵌入其他程序时应调用 `engine.close()` 或使用上下文管理器。真实 SDK 必须通过 `SerialMemoryAccess(factory=...)` 在拥有它的线程中创建，不要自行并发调用裸 Mem0。`auto_start=False` 和 `worker.run_once()` 供受控测试使用，不应与正在运行的 Worker 混用。
 
 ## Long-term memory policy
 
@@ -259,7 +271,9 @@ Mem0 提取 Prompt 要求使用以下前缀：
   -m pytest -q
 ```
 
-覆盖自动边界、失败恢复、幂等重试、carry-over、多用户隔离、Provider 独立配置、Prompt 顺序和本地切块。
+测试覆盖自动边界、任务回执、L1/carry-over/Prompt 不变性、有限重试、已成功分块不重放、租约和重启恢复、后台慢写不阻塞下一轮、删除竞态、SDK 线程归属、写后核对、旧 SQLite 迁移和 CLI 退出行为。
+
+这些是使用 Fake/受控替身的离线测试，不代表真实 Qdrant、GPU、DeepSeek 或多设备部署已经验收。真实运行仍需初始化 submodule、安装依赖，并在目标环境用 `/new`、连续对话、`/jobs`、退出重启做冒烟测试。旧的 Mem0 benchmark 入口不等于 Bumi 端到端测试。
 
 ## Existing evaluation tools
 

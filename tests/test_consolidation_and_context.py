@@ -58,8 +58,12 @@ def test_local_chunking_never_splits_a_dialogue_round(tmp_path: Path) -> None:
         memory_token_counter=FixedTokenCounter(),
         config=ConsolidatorConfig(local_chunk_tokens=15),
     )
-    result = consolidator.consolidate(session.session_id, reason="manual_new")
-    assert result.success
+    from bumi_mem.worker import MemoryWorker
+    receipt = consolidator.submit(session.session_id, reason="manual_new")
+    worker = MemoryWorker(consolidator)
+    worker.run_once()
+    worker.stop()
+    assert store.get_job(receipt.job_id).status == "succeeded"
     assert len(long_term.add_calls) == 3
     for call in long_term.add_calls:
         roles = [item["role"] for item in call["messages"]]
@@ -88,13 +92,12 @@ def test_one_open_session_per_user_agent_pair(tmp_path: Path) -> None:
     assert first.session_id == second.session_id
 
 
-def test_processing_session_recovers_as_failed_after_restart(tmp_path: Path) -> None:
-    path = tmp_path / "db.sqlite3"
-    store = SQLiteSessionStore(path)
-    session = store.create_session("u", "a")
-    store.append_message(session.session_id, role="user", content="x", token_count=1)
-    store.begin_consolidation(session.session_id)
-    restarted = SQLiteSessionStore(path)
-    recovered = restarted.get_session(session.session_id)
-    assert recovered is not None
-    assert recovered.status == "failed"
+def test_opening_store_does_not_relabel_running_job(tmp_path: Path) -> None:
+    from test_bumi_memory import make_engine, chat_turn, submit
+    engine, store, _, _, _ = make_engine(tmp_path)
+    chat_turn(engine)
+    receipt = submit(engine)
+    job = store.claim_job("live-worker", lease_seconds=30)
+    restarted = SQLiteSessionStore(store.path)
+    assert restarted.get_job(job.job_id).status == "running"
+    assert restarted.get_session(receipt.new_session_id).status == "active"

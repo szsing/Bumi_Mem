@@ -12,9 +12,10 @@ from urllib.request import urlopen
 from bumi_mem.consolidator import ConsolidatorConfig, SessionConsolidator
 from bumi_mem.engine import BumiMemory, BumiMemoryConfig
 from bumi_mem.long_term import Mem0AdapterConfig, Mem0LongTermMemory
+from bumi_mem.memory_access import SerialMemoryAccess
 from bumi_mem.paths import DATA_ROOT, MODEL_ROOT, PROJECT_ROOT, configure_runtime
 from bumi_mem.providers import OpenAICompatibleProvider, ProviderConfig
-from bumi_mem.schemas import ConsolidationResult, ProviderConfigurationError, SessionBlockedError
+from bumi_mem.schemas import ConsolidationSubmission, ProviderConfigurationError
 from bumi_mem.session_store import SQLiteSessionStore
 from bumi_mem.token_counter import ApproxTokenCounter, HuggingFaceTokenCounter, TokenCounter
 
@@ -125,20 +126,17 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
 
     db_path = Path(args.db_path).expanduser().resolve() if args.db_path else DATA_ROOT / "bumi_memory.sqlite3"
     store = SQLiteSessionStore(db_path)
-    l3 = Mem0LongTermMemory(
-        memory_config,
-        Mem0AdapterConfig(
-            data_dir=DATA_ROOT / "bumi_mem_l3",
-            embed_model=MODEL_ROOT / "Qwen3-Embedding-0.6B",
-            embed_device=args.embed_device,
-            collection_name=args.collection_name,
-            memory_max_tokens=(
-                args.memory_max_tokens
-                if args.memory_max_tokens is not None
-                else (512 if args.memory_provider == "local" else int(os.getenv("MEM0_MEMORY_MAX_TOKENS", "4096")))
-            ),
-        ),
+    adapter_config = Mem0AdapterConfig(
+        data_dir=DATA_ROOT / "bumi_mem_l3",
+        embed_model=MODEL_ROOT / "Qwen3-Embedding-0.6B",
+        embed_device=args.embed_device,
+        collection_name=args.collection_name,
+        memory_max_tokens=(args.memory_max_tokens if args.memory_max_tokens is not None else
+                           (512 if args.memory_provider == "local" else int(os.getenv("MEM0_MEMORY_MAX_TOKENS", "4096")))),
     )
+    # Construct the native SDK on its owning thread, not on the CLI thread.
+    l3 = SerialMemoryAccess(lambda: Mem0LongTermMemory(memory_config, adapter_config),
+                            read_timeout=args.memory_read_timeout)
     consolidator = SessionConsolidator(
         store=store,
         long_term=l3,
@@ -149,6 +147,8 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
             carryover_messages=args.carryover_messages,
             local_chunk_tokens=args.local_chunk_tokens,
             summary_max_tokens=args.summary_max_tokens,
+            max_attempts=args.memory_max_attempts,
+            retry_base_seconds=args.memory_retry_base_seconds,
         ),
     )
     return BumiMemory(
@@ -163,7 +163,9 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
             top_k=args.top_k,
             search_threshold=args.search_threshold,
             max_answer_tokens=args.max_answer_tokens,
+            memory_read_timeout=args.memory_read_timeout,
         ),
+        auto_start=False,
     )
 
 
@@ -181,164 +183,159 @@ def _print_memories(rows: list[dict[str, Any]]) -> None:
         print(f"  {index}. [{row.get('id', '-')}] {_memory_text(row)}{suffix}")
 
 
-def _print_consolidation(result: ConsolidationResult, *, debug: bool) -> None:
-    if not result.success:
-        print(f"[会话整合失败] 消息已安全保存在 L1：{result.error}", file=sys.stderr)
-        print("请使用 /new 重试，或使用 /discard 放弃当前会话。", file=sys.stderr)
-        return
-    if not debug:
-        return
-    counts = result.event_counts
-    print(f"[会话边界] reason={result.reason} attempt={result.attempt}")
-    print(f"[L2] status={result.summary_status} summary={result.summary}")
-    print(
-        "[L3] "
-        + " ".join(f"{name}={count}" for name, count in sorted(counts.items()))
-        if counts
-        else "[L3] 没有新增或变更"
-    )
-    print(f"[新会话] {result.new_session_id}")
+def _print_submission(receipt: ConsolidationSubmission, *, debug: bool) -> None:
+    if debug:
+        print(f"[后台整理] job={receipt.job_id} status={receipt.status} new_session={receipt.new_session_id}")
+
+
+def _print_jobs(engine: BumiMemory, args: argparse.Namespace) -> None:
+    jobs = engine.memory_jobs(user_id=args.user_id, agent_id=args.agent_id)
+    if not jobs:
+        print("（没有后台任务）")
+    for job in jobs:
+        print(f"job={job.job_id} kind={job.kind} status={job.status} attempts={job.attempts}/{job.max_attempts}")
+        if job.last_error:
+            print(f"  error: {job.last_error}")
 
 
 def _help() -> None:
-    print(
-        """命令：
+    print("""命令：
   /help                  显示帮助
-  /memories              查看当前用户的全部 L3 记忆
-  /search <内容>         手动检索 L3
-  /session               查看当前 L1 状态
-  /recall on|off         控制回答前是否检索 L3
+  /memories              查看当前 user/agent 的 L3
+  /search <query>        手动检索 L3
+  /session               查看当前 L1 和后台任务
+  /jobs                  查看后台任务状态和错误
+  /retry <job-id>        重试失败任务（仅限当前 user/agent）
+  /retry <job-id> --allow-replay
+                         核查 L3 后，显式允许重放结果不确定的分块（再次确认）
+  /recall on|off         控制回答前的 L3 检索
   /debug on|off          显示或隐藏内部调试信息
-  /new                   整合当前会话并开始新会话
-  /discard               不写 L3，丢弃当前会话并开始新会话
-  /forget-all            删除当前用户全部 L3，需要再次输入 user-id
-  /quit                  退出；有未整合消息时选择 save/discard/cancel
-"""
-    )
+  /new                   保存整理任务并立即开始新会话
+  /discard               丢弃当前 L1，不影响之前已经提交的任务
+  /forget-all            屏蔽当前 user/agent 的 L3，取消旧写入并后台清理
+  /quit                  退出；save 只保证记录/任务落盘，不保证 L3 已整理完
+""")
 
 
 def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
+    try:
+        engine.start()
+        _run_interactive(engine, args)
+    finally:
+        engine.close()
+
+
+def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
     debug = bool(args.debug)
     recall_enabled = True
     session = engine.get_or_create_session(user_id=args.user_id, agent_id=args.agent_id)
-    print("\nBumi_Mem L1/L2/L3 交互测试")
-    print(f"user-id: {args.user_id}")
-    print(f"agent-id: {args.agent_id}")
+    print("\nBumi_Mem L1/L2/L3 交互测试（持久化后台整理）")
+    print(f"user-id: {args.user_id}  agent-id: {args.agent_id}")
     print(f"session-id: {session.session_id}")
-    print(f"Chat Provider: {args.chat_provider}")
-    print(f"Memory Provider: {args.memory_provider}")
-    print("输入 /help 查看命令。\n")
-
+    print(f"Chat Provider: {args.chat_provider}  Memory Provider: {args.memory_provider}")
+    print("输入 /help 查看命令；/jobs 查看后台整理状态。\n")
     while True:
         try:
             text = input("你> ").strip()
+            if not text:
+                continue
+            if text == "/help":
+                _help()
+                continue
+            if text == "/memories":
+                if engine.store.reads_blocked(args.user_id, args.agent_id):
+                    print("L3 正在等待删除确认，暂不展示；请用 /jobs 查看。")
+                else:
+                    _print_memories(engine.get_memories(user_id=args.user_id, agent_id=args.agent_id))
+                continue
+            if text.startswith("/search "):
+                _print_memories(engine.search_long_term(user_id=args.user_id, agent_id=args.agent_id,
+                                                        query=text.removeprefix("/search ").strip()))
+                continue
+            if text in ("/session", "/jobs"):
+                if text == "/session":
+                    stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
+                    print(f"session={stats.session_id} status={stats.status} "
+                          f"messages={stats.effective_messages}/{args.max_messages} "
+                          f"tokens={stats.effective_tokens}/{args.max_l1_tokens} carryover={stats.context_only_messages}")
+                _print_jobs(engine, args)
+                continue
+            if text.startswith("/retry "):
+                parts = text.split()
+                if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "--allow-replay"):
+                    print("用法：/retry <job-id> [--allow-replay]")
+                    continue
+                allow_replay = len(parts) == 3
+                if allow_replay and input("重放可能产生重复记忆。核查 L3 后输入 REPLAY 确认：").strip() != "REPLAY":
+                    print("已取消。")
+                    continue
+                job = engine.retry_memory_job(parts[1], user_id=args.user_id, agent_id=args.agent_id,
+                                              allow_replay=allow_replay)
+                print(f"任务已重新排队：{job.job_id}")
+                continue
+            if text.startswith("/recall ") or text.startswith("/debug "):
+                command, value = text.split(maxsplit=1)
+                value = value.strip().lower()
+                if value not in ("on", "off"):
+                    print(f"用法：{command} on 或 off")
+                elif command == "/recall":
+                    recall_enabled = value == "on"
+                    print(f"L3 检索已{'开启' if recall_enabled else '关闭'}。")
+                else:
+                    debug = value == "on"
+                    print(f"调试显示已{'开启' if debug else '关闭'}。")
+                continue
+            if text == "/new":
+                receipt = engine.end_session(user_id=args.user_id, agent_id=args.agent_id)
+                _print_submission(receipt, debug=debug)
+                print("已开始新会话；上一段已保存，后台整理不影响继续聊天。")
+                continue
+            if text == "/discard":
+                if input("输入 DISCARD 确认放弃当前 L1（不撤销之前的后台任务）：").strip() == "DISCARD":
+                    engine.discard_session(user_id=args.user_id, agent_id=args.agent_id)
+                    print("当前会话已丢弃，已开始新会话。")
+                else:
+                    print("已取消。")
+                continue
+            if text == "/forget-all":
+                confirm = input(f"输入完整 user-id {args.user_id!r} 确认清理当前 user/agent 的全部 L3：").strip()
+                if confirm == args.user_id:
+                    job = engine.forget_all(user_id=args.user_id, agent_id=args.agent_id)
+                    print(f"L3 已屏蔽，旧写入已取消，删除任务已保存：{job.job_id}。用 /jobs 确认物理清理结果。")
+                else:
+                    print("已取消。")
+                continue
+            if text == "/quit":
+                stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
+                if stats.effective_messages:
+                    action = input("输入 save / discard / cancel（save 保存任务，下次启动可继续整理）：").strip().lower()
+                    if action == "save":
+                        # Do not let the worker start the new quit-save job as we exit.
+                        engine.worker.stop(timeout=0.0)
+                        receipt = engine.end_session(user_id=args.user_id, agent_id=args.agent_id, reason="quit_save")
+                        _print_submission(receipt, debug=debug)
+                    elif action == "discard":
+                        engine.discard_session(user_id=args.user_id, agent_id=args.agent_id)
+                    else:
+                        print("已取消退出。")
+                        continue
+                print("已退出；未完成整理任务已落盘，下次启动恢复。正在写入时中断的任务可能需要核查后手动重试。")
+                return
+            if text.startswith("/"):
+                print("未知命令；输入 /help 查看帮助。")
+                continue
+            result = engine.chat(user_id=args.user_id, agent_id=args.agent_id, text=text,
+                                 recall_enabled=recall_enabled, on_answer=lambda answer: print(f"Bumi> {answer}"))
+            if debug:
+                print(f"[L3 检索] status={result.recall_status}")
+                _print_memories(result.recalled)
+                if result.auto_consolidation is not None:
+                    _print_submission(result.auto_consolidation, debug=True)
         except (EOFError, KeyboardInterrupt):
-            print("\n已退出；当前 L1 已保存在 SQLite，尚未自动整合。")
+            print("\n已退出；L1 和已提交任务均已保存。当前未提交的 L1 将在下次启动继续，不自动打包。")
             return
-        if not text:
-            continue
-        if text == "/help":
-            _help()
-            continue
-        if text == "/memories":
-            print("[L3 长期记忆]")
-            _print_memories(engine.get_memories(user_id=args.user_id, agent_id=args.agent_id))
-            continue
-        if text.startswith("/search "):
-            query = text.removeprefix("/search ").strip()
-            print("[L3 手动检索]")
-            _print_memories(engine.search_long_term(user_id=args.user_id, agent_id=args.agent_id, query=query))
-            continue
-        if text == "/session":
-            stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
-            print(
-                f"session={stats.session_id} status={stats.status} "
-                f"messages={stats.effective_messages}/{args.max_messages} "
-                f"tokens={stats.effective_tokens}/{args.max_l1_tokens} "
-                f"carryover={stats.context_only_messages} "
-                f"chat_provider={args.chat_provider} memory_provider={args.memory_provider}"
-            )
-            continue
-        if text.startswith("/recall "):
-            value = text.removeprefix("/recall ").strip().lower()
-            if value not in {"on", "off"}:
-                print("用法：/recall on 或 /recall off")
-            else:
-                recall_enabled = value == "on"
-                print(f"L3 检索已{'开启' if recall_enabled else '关闭'}。")
-            continue
-        if text.startswith("/debug "):
-            value = text.removeprefix("/debug ").strip().lower()
-            if value not in {"on", "off"}:
-                print("用法：/debug on 或 /debug off")
-            else:
-                debug = value == "on"
-                print(f"Debug 已{'开启' if debug else '关闭'}。")
-            continue
-        if text == "/new":
-            result = engine.end_session(user_id=args.user_id, agent_id=args.agent_id)
-            _print_consolidation(result, debug=debug)
-            if result.success and not debug:
-                print("新会话已开始。")
-            continue
-        if text == "/discard":
-            confirm = input("输入 DISCARD 确认放弃当前 L1：").strip()
-            if confirm == "DISCARD":
-                session = engine.discard_session(user_id=args.user_id, agent_id=args.agent_id)
-                print(f"当前会话已丢弃；新 session：{session.session_id}")
-            else:
-                print("已取消。")
-            continue
-        if text == "/forget-all":
-            confirm = input(f"输入完整 user-id {args.user_id!r} 确认删除全部 L3：").strip()
-            if confirm == args.user_id:
-                engine.forget_all(user_id=args.user_id, agent_id=args.agent_id)
-                print("当前用户的全部 L3 已删除。")
-            else:
-                print("已取消。")
-            continue
-        if text == "/quit":
-            stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
-            if stats.effective_messages == 0:
-                print("已退出。")
-                return
-            action = input("当前 L1 尚未整合。输入 save / discard / cancel：").strip().lower()
-            if action == "save":
-                result = engine.end_session(user_id=args.user_id, agent_id=args.agent_id, reason="quit_save")
-                _print_consolidation(result, debug=debug)
-                if result.success:
-                    print("已保存并退出。")
-                    return
-            elif action == "discard":
-                engine.discard_session(user_id=args.user_id, agent_id=args.agent_id)
-                print("已丢弃当前会话并退出。")
-                return
-            else:
-                print("已取消退出。")
-            continue
-        if text.startswith("/"):
-            print("未知命令；输入 /help 查看帮助。")
-            continue
-
-        try:
-            result = engine.chat(
-                user_id=args.user_id,
-                agent_id=args.agent_id,
-                text=text,
-                recall_enabled=recall_enabled,
-                on_answer=lambda answer: print(f"Bumi> {answer}"),
-            )
-        except SessionBlockedError as exc:
-            print(f"[会话被阻止] {exc}", file=sys.stderr)
-            continue
         except Exception as exc:
-            print(f"[错误] 本轮失败：{exc}", file=sys.stderr)
-            continue
-        if debug:
-            print("[L3 检索]")
-            _print_memories(result.recalled)
-        if result.auto_consolidation is not None:
-            _print_consolidation(result.auto_consolidation, debug=debug)
+            print(f"[错误] {exc}；记录未自动丢弃，可用 /session 或 /jobs 检查。", file=sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:
@@ -363,6 +360,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-answer-tokens", type=int, default=512)
     parser.add_argument("--summary-max-tokens", type=int, default=512)
     parser.add_argument("--memory-max-tokens", type=int, default=None)
+    parser.add_argument("--memory-read-timeout", type=float, default=0.2)
+    parser.add_argument("--memory-max-attempts", type=int, default=3)
+    parser.add_argument("--memory-retry-base-seconds", type=float, default=5.0)
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 

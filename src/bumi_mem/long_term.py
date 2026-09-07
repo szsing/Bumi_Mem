@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 from bumi_mem.providers import ProviderConfig
+from bumi_mem.schemas import MemoryWriteUncertainError, RetryableMemoryError
 
 
 def unwrap_results(value: Any) -> list[dict[str, Any]]:
@@ -118,15 +119,40 @@ class Mem0LongTermMemory:
         metadata: dict[str, Any],
         prompt: str,
     ) -> list[dict[str, Any]]:
-        result = self.memory.add(
-            list(messages),
-            user_id=user_id,
-            agent_id=agent_id,
-            metadata=dict(metadata),
-            prompt=prompt,
-            infer=True,
-        )
-        return unwrap_results(result)
+        # In the pinned SDK, LLMError is raised before vector persistence.
+        # Other failures can happen after side effects and must not be replayed blindly.
+        from mem0.exceptions import LLMError
+
+        try:
+            result = self.memory.add(
+                list(messages), user_id=user_id, agent_id=agent_id,
+                # Mem0 keeps its own last-message extraction cache. A public
+                # run_id namespace prevents pre-forget cache from being reused.
+                run_id=(f"bumi-generation-{int(metadata['memory_generation'])}"
+                        if int(metadata.get('memory_generation', 0)) > 0 else None),
+                metadata=dict(metadata), prompt=prompt, infer=True,
+            )
+        except LLMError as exc:
+            raise RetryableMemoryError(str(exc)) from exc
+        except Exception as exc:
+            raise MemoryWriteUncertainError(str(exc)) from exc
+        if not ((isinstance(result, dict) and isinstance(result.get("results"), list))
+                or isinstance(result, list)):
+            raise MemoryWriteUncertainError("Unexpected Mem0 add response shape")
+        events = unwrap_results(result)
+        # v2.0.20 can swallow individual vector insert errors. Verify returned
+        # ADD records before declaring the chunk complete (not an exactly-once guarantee).
+        try:
+            for event in events:
+                if event.get("event") == "ADD":
+                    saved = self.memory.get(event["id"])
+                    if (not saved or saved.get("memory") != event.get("memory")
+                        or saved.get("user_id") != user_id or saved.get("agent_id") != agent_id
+                        or saved.get("metadata", {}).get("consolidation_id") != metadata.get("consolidation_id")):
+                        raise RuntimeError("Mem0 ADD read-back mismatch")
+        except Exception as exc:
+            raise MemoryWriteUncertainError(f"Memory write verification failed: {exc}") from exc
+        return events
 
     def get_all(self, *, user_id: str, agent_id: str) -> list[dict[str, Any]]:
         return unwrap_results(
@@ -138,6 +164,21 @@ class Mem0LongTermMemory:
 
     def delete_all(self, *, user_id: str, agent_id: str) -> None:
         self.memory.delete_all(user_id=user_id, agent_id=agent_id)
+        # A failed/partial delete must not release the durable read suppression.
+        remaining = self.memory.get_all(filters=self._filters(user_id, agent_id), top_k=1, show_expired=True)
+        if not isinstance(remaining, (dict, list)) or (isinstance(remaining, dict) and not isinstance(remaining.get("results"), list)):
+            raise RuntimeError("Unexpected Mem0 delete verification response")
+        if unwrap_results(remaining):
+            raise RuntimeError("Mem0 delete verification found remaining memories")
+
+    def close(self) -> None:
+        # Invoked on the same executor thread, after all SDK calls have finished.
+        try:
+            self.memory.close()
+        finally:
+            client = getattr(getattr(self.memory, "vector_store", None), "client", None)
+            if client is not None:
+                client.close()
 
 
 class FakeLongTermMemory:
@@ -185,7 +226,7 @@ class FakeLongTermMemory:
         self.add_calls.append(call)
         if self.fail_add_count > 0:
             self.fail_add_count -= 1
-            raise RuntimeError("fake Mem0 failure")
+            raise RetryableMemoryError("fake Mem0 failure")
         user_texts = [item["content"] for item in messages if item.get("role") == "user"]
         text = " | ".join(user_texts) or "session memory"
         event = {"id": f"fake-{len(self.add_calls)}", "event": "ADD", "memory": text}

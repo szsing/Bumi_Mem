@@ -78,7 +78,8 @@ class TurnResult:
     answer: str
     recalled: list[dict[str, Any]] = field(default_factory=list)
     prompt_messages: list[dict[str, str]] = field(default_factory=list)
-    auto_consolidation: ConsolidationResult | None = None
+    auto_consolidation: ConsolidationSubmission | None = None
+    recall_status: str = "ok"
 
 
 class BumiMemoryError(RuntimeError):
@@ -91,3 +92,52 @@ class SessionBlockedError(BumiMemoryError):
 
 class ProviderConfigurationError(BumiMemoryError):
     """Raised for incomplete provider configuration."""
+
+
+@dataclass(slots=True, frozen=True)
+class ConsolidationSubmission:
+    """A durable receipt, NOT a claim that L2/L3 has completed."""
+
+    job_id: str
+    session_id: str
+    new_session_id: str
+    status: str
+    accepted: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryJob:
+    job_id: str
+    kind: str
+    session_id: str | None
+    new_session_id: str | None
+    user_id: str
+    agent_id: str
+    generation: int
+    status: str
+    attempts: int
+    max_attempts: int
+    available_at: float
+    owner: str | None
+    lease_until: float | None
+    reason: str
+    payload_json: str
+    created_at: str
+    updated_at: str
+    last_error: str | None = None
+
+
+class JobCancelledError(BumiMemoryError):
+    """The job lost its lease, was cancelled, or predates a deletion."""
+
+
+class MemoryReadUnavailable(BumiMemoryError):
+    """Memory reads must not wait behind background SDK work."""
+
+
+class RetryableMemoryError(BumiMemoryError):
+    """The backend guarantees this failed attempt has not written memories."""
+
+
+class MemoryWriteUncertainError(BumiMemoryError):
+    """A write may have committed; blind replay needs explicit authorization."""

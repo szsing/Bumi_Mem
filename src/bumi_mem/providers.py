@@ -41,7 +41,10 @@ class OpenAICompatibleProvider:
 
         self.config = config
         self.name = config.provider
-        self.client = OpenAI(api_key=config.api_key, base_url=config.base_url.rstrip("/"))
+        self.client = OpenAI(
+            api_key=config.api_key, base_url=config.base_url.rstrip("/"),
+            timeout=60.0, max_retries=0,
+        )
 
     def generate(
         self,
