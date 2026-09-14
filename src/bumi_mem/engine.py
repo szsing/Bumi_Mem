@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -63,6 +64,27 @@ class BumiMemory:
         if self._closed:
             raise RuntimeError('memory engine is closed')
         self.worker.start()
+
+    def warmup(
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        query: str = '记忆系统预热',
+        timeout: float = 120.0,
+    ) -> tuple[float, int]:
+        if self._closed:
+            raise RuntimeError('memory engine is closed')
+        started = time.perf_counter()
+        rows = self.long_term.warmup(
+            timeout=timeout,
+            user_id=user_id,
+            agent_id=agent_id,
+            query=query,
+            top_k=1,
+            threshold=self.config.search_threshold,
+        )
+        return (time.perf_counter() - started) * 1000, len(rows)
 
     def close(self) -> None:
         if self._closed:

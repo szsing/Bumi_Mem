@@ -219,6 +219,24 @@ def _help() -> None:
 
 def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
     try:
+        if not getattr(args, 'no_memory_warmup', False):
+            timeout = float(getattr(args, 'memory_warmup_timeout', 120.0))
+            query = str(getattr(args, 'memory_warmup_query', '记忆系统预热'))
+            print(f'正在预热 Memory（timeout={timeout:.1f}s）……', flush=True)
+            try:
+                elapsed_ms, recalled = engine.warmup(
+                    user_id=args.user_id,
+                    agent_id=args.agent_id,
+                    query=query,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                print(f'记忆预热失败：{exc}', file=sys.stderr, flush=True)
+                return
+            print(
+                f'Memory 预热完成：{elapsed_ms:.3f} ms，召回 {recalled} 条；服务已就绪。',
+                flush=True,
+            )
         engine.start()
         _run_interactive(engine, args)
     finally:
@@ -361,6 +379,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-max-tokens", type=int, default=512)
     parser.add_argument("--memory-max-tokens", type=int, default=None)
     parser.add_argument("--memory-read-timeout", type=float, default=0.2)
+    parser.add_argument(
+        "--memory-warmup-timeout",
+        type=float,
+        default=float(os.getenv("BUMI_MEMORY_WARMUP_TIMEOUT", "120")),
+    )
+    parser.add_argument(
+        "--memory-warmup-query",
+        default=os.getenv("BUMI_MEMORY_WARMUP_QUERY", "记忆系统预热"),
+    )
+    parser.add_argument(
+        "--no-memory-warmup",
+        action="store_true",
+        help="skip startup embedding and vector-store warmup",
+    )
     parser.add_argument("--memory-max-attempts", type=int, default=3)
     parser.add_argument("--memory-retry-base-seconds", type=float, default=5.0)
     parser.add_argument("--debug", action="store_true")
