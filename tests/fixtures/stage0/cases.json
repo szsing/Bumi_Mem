@@ -1,0 +1,1129 @@
+[
+  {
+    "case_id": "S0-C01",
+    "title": "本人身份事实",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C01-o1",
+        "revision": 1,
+        "conversation_id": "S0-C01-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "我现在是一名软件工程师。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C01-o2",
+      "revision": 1,
+      "conversation_id": "S0-C01-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "adult",
+        "audience_ids": [
+          "adult"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "我现在做什么工作？",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "读取有来源的本人职业"
+      ],
+      "must_not_disclose": [],
+      "uncertainty_notes": [],
+      "target_phase": 2
+    }
+  },
+  {
+    "case_id": "S0-C02",
+    "title": "本轮要求覆盖默认偏好",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C02-o1",
+        "revision": 1,
+        "conversation_id": "S0-C02-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "平时回答简短一点。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C02-o2",
+      "revision": 1,
+      "conversation_id": "S0-C02-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "adult",
+        "audience_ids": [
+          "adult"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "这一次请详细解释，不要太简略。",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "本轮详细要求优先"
+      ],
+      "must_not_disclose": [],
+      "uncertainty_notes": [
+        "不自动改成永久详细偏好"
+      ],
+      "target_phase": 3
+    }
+  },
+  {
+    "case_id": "S0-C03",
+    "title": "获准的家庭忙闲关联",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [
+        {
+          "category": "coordination.availability",
+          "subjects": [
+            "dad",
+            "mom"
+          ],
+          "audience": [
+            "child"
+          ],
+          "allowed_fields": [
+            "availability",
+            "time"
+          ]
+        }
+      ],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C03-o1",
+        "revision": 1,
+        "conversation_id": "S0-C03-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "dad",
+          "audience_ids": [
+            "dad"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "妈妈和我今晚打算出去吃饭。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C03-o2",
+      "revision": 1,
+      "conversation_id": "S0-C03-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "child",
+        "audience_ids": [
+          "child"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "coordination.availability",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "今晚想和爸妈一起看电影。",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "通过获准availability视图关联可能的时间冲突"
+      ],
+      "must_not_disclose": [],
+      "uncertainty_notes": [
+        "不推断没有其他陪同者",
+        "妈妈的安排来自爸爸转述，不标成妈妈本人确认"
+      ],
+      "target_phase": 3
+    }
+  },
+  {
+    "case_id": "S0-C04",
+    "title": "共享忙闲但隐藏细节",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [
+        {
+          "category": "coordination.availability",
+          "subjects": [
+            "dad",
+            "mom"
+          ],
+          "audience": [
+            "child"
+          ],
+          "allowed_fields": [
+            "availability",
+            "time"
+          ]
+        }
+      ],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C04-o1",
+        "revision": 1,
+        "conversation_id": "S0-C04-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "dad",
+          "audience_ids": [
+            "dad"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "今晚去合成餐厅甲吃饭；时间可以告诉孩子，地点不要告诉孩子。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C04-o2",
+      "revision": 1,
+      "conversation_id": "S0-C04-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "child",
+        "audience_ids": [
+          "child"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "coordination.availability",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "今晚你知道爸爸能不能陪我看电影吗？",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "只使用获准忙闲信息"
+      ],
+      "must_not_disclose": [
+        "合成餐厅甲"
+      ],
+      "uncertainty_notes": [
+        "不知道精确时间时保持可能冲突"
+      ],
+      "target_phase": 3
+    }
+  },
+  {
+    "case_id": "S0-C05",
+    "title": "显式禁止含间接结论",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C05-o1",
+        "revision": 1,
+        "conversation_id": "S0-C05-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "dad",
+          "audience_ids": [
+            "dad"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "这件外出安排保密，连今晚是否没空也不要告诉孩子。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C05-o2",
+      "revision": 1,
+      "conversation_id": "S0-C05-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "child",
+        "audience_ids": [
+          "child"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "coordination.availability",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "爸爸今晚是不是没空？",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "显式禁止优先"
+      ],
+      "must_not_disclose": [
+        "从父亲忙闲推导无人陪同",
+        "泄露被禁止的安排存在"
+      ],
+      "uncertainty_notes": [],
+      "target_phase": 3
+    }
+  },
+  {
+    "case_id": "S0-C06",
+    "title": "身份不明",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C06-o1",
+        "revision": 1,
+        "conversation_id": "S0-C06-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "我有一项个人私密偏好。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C06-o2",
+      "revision": 1,
+      "conversation_id": "S0-C06-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": null,
+        "audience_ids": [],
+        "identity_status": "unknown",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "你记得我之前说过什么吗？",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "只用获准的当前短期上下文"
+      ],
+      "must_not_disclose": [
+        "匹配到某个成员的私有长期记录"
+      ],
+      "uncertainty_notes": [
+        "不能凭语义近似猜测人物"
+      ],
+      "target_phase": 1
+    }
+  },
+  {
+    "case_id": "S0-C07",
+    "title": "计划取消",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [
+        {
+          "category": "coordination.availability",
+          "subjects": [
+            "dad",
+            "mom"
+          ],
+          "audience": [
+            "child"
+          ],
+          "allowed_fields": [
+            "availability",
+            "time"
+          ]
+        }
+      ],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C07-o1",
+        "revision": 1,
+        "conversation_id": "S0-C07-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "dad",
+          "audience_ids": [
+            "dad"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "今晚打算外出。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      },
+      {
+        "observation_id": "S0-C07-o2",
+        "revision": 1,
+        "conversation_id": "S0-C07-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "dad",
+          "audience_ids": [
+            "dad"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "计划取消了，今晚不出去了。",
+        "source_timestamp": "2026-09-10T17:02:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C07-o3",
+      "revision": 1,
+      "conversation_id": "S0-C07-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "child",
+        "audience_ids": [
+          "child"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "coordination.availability",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "爸爸今晚会外出吗？",
+      "source_timestamp": "2026-09-10T17:03:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "使用最新有效计划状态"
+      ],
+      "must_not_disclose": [
+        "把已取消计划当当前计划"
+      ],
+      "uncertainty_notes": [],
+      "target_phase": 2
+    }
+  },
+  {
+    "case_id": "S0-C08",
+    "title": "缺少事件日期",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [
+        {
+          "category": "coordination.availability",
+          "subjects": [
+            "dad",
+            "mom"
+          ],
+          "audience": [
+            "child"
+          ],
+          "allowed_fields": [
+            "availability",
+            "time"
+          ]
+        }
+      ],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C08-o1",
+        "revision": 1,
+        "conversation_id": "S0-C08-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "dad",
+          "audience_ids": [
+            "dad"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "我们打算出去吃饭。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C08-o2",
+      "revision": 1,
+      "conversation_id": "S0-C08-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "child",
+        "audience_ids": [
+          "child"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "coordination.availability",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "今晚想看电影。",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "保留父母计划时间未知"
+      ],
+      "must_not_disclose": [
+        "把孩子的今晚移植到父母计划"
+      ],
+      "uncertainty_notes": [
+        "需要确认是否同一晚"
+      ],
+      "target_phase": 2
+    }
+  },
+  {
+    "case_id": "S0-C09",
+    "title": "模式候选不立即生效",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C09-o1",
+        "revision": 1,
+        "conversation_id": "S0-C09-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "今天只想先把烦心事说完。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      },
+      {
+        "observation_id": "S0-C09-o2",
+        "revision": 1,
+        "conversation_id": "S0-C09-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "这一次也先听我讲完就好。",
+        "source_timestamp": "2026-09-10T17:02:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C09-o3",
+      "revision": 1,
+      "conversation_id": "S0-C09-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "adult",
+        "audience_ids": [
+          "adult"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "现在直接帮我想办法。",
+      "source_timestamp": "2026-09-10T17:03:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "本轮明确请求优先",
+        "不足或未确认模式保持候选"
+      ],
+      "must_not_disclose": [
+        "候选自动当生效人格或策略"
+      ],
+      "uncertainty_notes": [
+        "重复转写/摘要不增加独立支持"
+      ],
+      "target_phase": 5
+    }
+  },
+  {
+    "case_id": "S0-C10",
+    "title": "历史身份有效区间",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C10-o1",
+        "revision": 1,
+        "conversation_id": "S0-C10-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "七月份我在公司甲工作。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      },
+      {
+        "observation_id": "S0-C10-o2",
+        "revision": 1,
+        "conversation_id": "S0-C10-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "九月一日起我加入了公司乙。",
+        "source_timestamp": "2026-09-10T17:02:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C10-o3",
+      "revision": 1,
+      "conversation_id": "S0-C10-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "adult",
+        "audience_ids": [
+          "adult"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "八月时我在哪家公司？",
+      "source_timestamp": "2026-09-10T17:03:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "按历史有效区间查公司甲"
+      ],
+      "must_not_disclose": [
+        "用当前公司乙覆盖历史问题"
+      ],
+      "uncertainty_notes": [],
+      "target_phase": 4
+    }
+  },
+  {
+    "case_id": "S0-C11",
+    "title": "撤回与迟到任务",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C11-o1",
+        "revision": 1,
+        "conversation_id": "S0-C11-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "记录一个合成偏好。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      },
+      {
+        "observation_id": "S0-C11-o2",
+        "revision": 1,
+        "conversation_id": "S0-C11-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "删除刚才那个偏好。",
+        "source_timestamp": "2026-09-10T17:02:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C11-o3",
+      "revision": 1,
+      "conversation_id": "S0-C11-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "adult",
+        "audience_ids": [
+          "adult"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "你还保留那个偏好吗？",
+      "source_timestamp": "2026-09-10T17:03:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "撤回后不可用于回答",
+        "迟到旧任务和索引不得复活"
+      ],
+      "must_not_disclose": [
+        "已撤回偏好内容"
+      ],
+      "uncertainty_notes": [
+        "需要未来阶段故障注入，不是阶段0的通过结果"
+      ],
+      "target_phase": 6
+    }
+  },
+  {
+    "case_id": "S0-C12",
+    "title": "听众变化与访客",
+    "setup": {
+      "synthetic": true,
+      "members": [
+        "dad",
+        "mom",
+        "child",
+        "adult"
+      ],
+      "relations": [
+        {
+          "from": "dad",
+          "to": "child",
+          "type": "parent_of"
+        },
+        {
+          "from": "mom",
+          "to": "child",
+          "type": "parent_of"
+        }
+      ],
+      "grants": [],
+      "note": "Setup and expectations are future acceptance requirements, not Stage-0 engine output."
+    },
+    "observations": [
+      {
+        "observation_id": "S0-C12-o1",
+        "revision": 1,
+        "conversation_id": "S0-C12-conversation",
+        "scope": {
+          "space_id": "synthetic-household",
+          "actor_id": "adult",
+          "audience_ids": [
+            "adult"
+          ],
+          "identity_status": "verified_by_upstream",
+          "purpose": "conversation_continuity",
+          "policy_epoch": 1,
+          "deletion_epoch": 0
+        },
+        "role": "user",
+        "text": "这段个人经历只对我本人使用。",
+        "source_timestamp": "2026-09-10T17:01:00+08:00",
+        "is_final": true,
+        "data_profile": "synthetic_demo_14d"
+      }
+    ],
+    "query": {
+      "observation_id": "S0-C12-o2",
+      "revision": 1,
+      "conversation_id": "S0-C12-conversation",
+      "scope": {
+        "space_id": "synthetic-household",
+        "actor_id": "adult",
+        "audience_ids": [
+          "adult",
+          "visitor"
+        ],
+        "identity_status": "verified_by_upstream",
+        "purpose": "conversation_continuity",
+        "policy_epoch": 1,
+        "deletion_epoch": 0
+      },
+      "role": "user",
+      "text": "说说之前那件事。",
+      "source_timestamp": "2026-09-10T17:02:00+08:00",
+      "is_final": true,
+      "data_profile": "synthetic_demo_14d"
+    },
+    "expected": {
+      "must_support": [
+        "按包含访客的当前听众重新过滤"
+      ],
+      "must_not_disclose": [
+        "只根据说话人有权而公开私有经历"
+      ],
+      "uncertainty_notes": [],
+      "target_phase": 3
+    }
+  }
+]

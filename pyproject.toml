@@ -12,6 +12,7 @@ dependencies = [
   "mem0ai==2.0.20",
   "openai>=2",
   "transformers>=5",
+  "pydantic>=2,<3",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,18 @@
+{
+  "stage": 0,
+  "synthetic_only": true,
+  "business_engine_mode": "legacy_baseline",
+  "future_mode_label": "typed_pending_stage1",
+  "run_root": "/home/legendre/data/ZhixingSun/mem0-runtime/stage0/runs",
+  "legacy_namespace": "stage0_legacy",
+  "typed_namespace": "stage0_typed",
+  "raw_audio_video_persistence": false,
+  "real_data_persistence_without_policy": false,
+  "synthetic_retention_days": 14,
+  "retention_enforcement_status": "not implemented in stage0; clean explicitly after testing",
+  "embedding_model_path": "/home/legendre/data/ZhixingSun/models/Qwen3-Embedding-0.6B",
+  "embedding_dimensions": 1024,
+  "memory_bundle_target_p95_ms": 60,
+  "memory_bundle_target_status": "not measured; future stage4/6",
+  "api_calls_default": false
+}
