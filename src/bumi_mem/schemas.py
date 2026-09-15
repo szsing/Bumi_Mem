@@ -80,6 +80,8 @@ class TurnResult:
     prompt_messages: list[dict[str, str]] = field(default_factory=list)
     auto_consolidation: ConsolidationSubmission | None = None
     recall_status: str = "ok"
+    user_id: str = ""
+    agent_id: str = ""
 
 
 class BumiMemoryError(RuntimeError):
@@ -141,3 +143,30 @@ class RetryableMemoryError(BumiMemoryError):
 
 class MemoryWriteUncertainError(BumiMemoryError):
     """A write may have committed; blind replay needs explicit authorization."""
+
+
+class IdentityRequiredError(BumiMemoryError):
+    """Long-term memory is unavailable without an explicit user identity."""
+
+
+class MemoryScopeError(BumiMemoryError):
+    """Backend returned a record outside the requested identity scope."""
+
+
+@dataclass(slots=True, frozen=True)
+class SavedMemory:
+    memory_id: str
+    user_id: str
+    agent_id: str
+    content_sha256: str
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryWriteReceipt:
+    """Confirmed records, not merely a queued extraction task."""
+    user_id: str
+    agent_id: str
+    records: tuple[SavedMemory, ...]
+    confirmed_at: str
+    memory_generation: int
+    confirmed: bool = True
