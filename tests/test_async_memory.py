@@ -468,21 +468,18 @@ def test_delete_suppression_survives_restart(tmp_path):
 
 
 def test_warmup_can_use_a_longer_timeout_than_foreground_reads():
-    class SlowSearch(FakeLongTermMemory):
+    class SlowMemory(FakeLongTermMemory):
+        def warmup(self, **kwargs):
+            time.sleep(0.05)
+            return super().warmup(**kwargs)
+
         def search(self, **kwargs):
             time.sleep(0.05)
             return super().search(**kwargs)
 
-    access = SerialMemoryAccess(lambda: SlowSearch(), read_timeout=0.01)
+    access = SerialMemoryAccess(lambda: SlowMemory(), read_timeout=0.01)
     try:
-        assert access.warmup(
-            timeout=1.0,
-            user_id='u1',
-            agent_id='a1',
-            query='warmup',
-            top_k=1,
-            threshold=0.1,
-        ) == []
+        assert access.warmup(timeout=1.0, query='warmup') is None
         with pytest.raises(MemoryReadUnavailable):
             access.search(
                 user_id='u1',
@@ -495,17 +492,14 @@ def test_warmup_can_use_a_longer_timeout_than_foreground_reads():
         access.close()
 
 
-def test_engine_warmup_reports_elapsed_time_and_result_count(tmp_path):
+def test_engine_start_warms_backend_once_without_a_user_scope(tmp_path):
     engine, _, memory, _, _ = make_engine(tmp_path)
-    memory.search_results = [{'memory': 'warm'}]
     try:
-        elapsed_ms, count = engine.warmup(
-            user_id='u1',
-            agent_id='a1',
-            timeout=1.0,
-        )
+        elapsed_ms = engine.start()
         assert elapsed_ms >= 0
-        assert count == 1
-        assert memory.search_calls[-1]['query'] == '记忆系统预热'
+        assert memory.warmup_calls == ['记忆系统预热']
+        assert memory.search_calls == []
+        assert engine.start() == elapsed_ms
+        assert memory.warmup_calls == ['记忆系统预热']
     finally:
         engine.close()

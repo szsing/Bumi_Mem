@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
+from uuid import uuid4
 
 from bumi_mem.identity import require_pair
 from bumi_mem.providers import ProviderConfig
@@ -20,7 +21,44 @@ def unwrap_results(value: Any) -> list[dict[str, Any]]:
     return value if isinstance(value, list) else []
 
 
+def resolve_embed_device(requested: str, *, cuda_available: bool | None = None) -> str:
+    requested = requested.strip().lower()
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("embed device must be one of: auto, cpu, cuda")
+    if requested == "cpu":
+        return "cpu"
+    if cuda_available is None:
+        try:
+            import torch
+        except ImportError as exc:
+            if requested == "cuda":
+                raise RuntimeError("CUDA embedding requested but PyTorch is not installed") from exc
+            return "cpu"
+        cuda_available = bool(torch.cuda.is_available())
+    if requested == "cuda" and not cuda_available:
+        raise RuntimeError(
+            "CUDA embedding requested but this Python environment has no CUDA-enabled PyTorch"
+        )
+    return "cuda" if cuda_available else "cpu"
+
+
+def warmup_mem0_backend(memory: Any, *, query: str) -> None:
+    """Exercise the full Mem0 search path without using a real user namespace."""
+    query = query.strip()
+    if not query:
+        raise ValueError("warmup query must not be empty")
+    memory.search(
+        query=query,
+        top_k=1,
+        filters={"run_id": f"__bumi_internal_warmup__{uuid4().hex}"},
+        threshold=0.0,
+        rerank=False,
+    )
+
+
 class LongTermMemory(Protocol):
+    def warmup(self, *, query: str) -> None: ...
+
     def search(
         self, *, user_id: str, agent_id: str, query: str, top_k: int, threshold: float
     ) -> list[dict[str, Any]]: ...
@@ -48,7 +86,7 @@ class LongTermMemory(Protocol):
 class Mem0AdapterConfig:
     data_dir: Path
     embed_model: Path
-    embed_device: str = "cpu"
+    embed_device: str = "auto"
     collection_name: str = "bumi_mem_l3"
     embedding_dims: int = 1024
     memory_max_tokens: int = 4096
@@ -61,6 +99,7 @@ class Mem0LongTermMemory:
         self.provider_name = llm.provider
         self.llm_config = llm
         self.config = config
+        embed_device = resolve_embed_device(config.embed_device)
         config.data_dir.mkdir(parents=True, exist_ok=True)
         self.memory = Memory.from_config(
             {
@@ -82,7 +121,7 @@ class Mem0LongTermMemory:
                         "model": str(config.embed_model),
                         "embedding_dims": config.embedding_dims,
                         "model_kwargs": {
-                            "device": config.embed_device,
+                            "device": embed_device,
                             "local_files_only": True,
                         },
                     },
@@ -98,6 +137,9 @@ class Mem0LongTermMemory:
                 },
             }
         )
+
+    def warmup(self, *, query: str) -> None:
+        warmup_mem0_backend(self.memory, query=query)
 
     @staticmethod
     def _filters(user_id: str, agent_id: str) -> dict[str, str]:
@@ -244,11 +286,15 @@ class FakeLongTermMemory:
     """In-memory test double with observable calls."""
 
     def __init__(self) -> None:
+        self.warmup_calls: list[str] = []
         self.search_calls: list[dict[str, Any]] = []
         self.add_calls: list[dict[str, Any]] = []
         self.memories: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.search_results: list[dict[str, Any]] = []
         self.fail_add_count = 0
+
+    def warmup(self, *, query: str) -> None:
+        self.warmup_calls.append(query)
 
     @staticmethod
     def _rows_for_scope(rows, user_id, agent_id):

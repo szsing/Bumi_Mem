@@ -165,6 +165,9 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
             search_threshold=args.search_threshold,
             max_answer_tokens=args.max_answer_tokens,
             memory_read_timeout=args.memory_read_timeout,
+            memory_warmup_enabled=not args.no_memory_warmup,
+            memory_warmup_timeout=args.memory_warmup_timeout,
+            memory_warmup_query=args.memory_warmup_query,
         ),
         auto_start=False,
     )
@@ -222,35 +225,23 @@ def _help() -> None:
 """)
 
 
-def _warmup_memory(engine: BumiMemory, args: argparse.Namespace) -> bool:
-    """Warm the scoped backend only after a trusted user identity is bound."""
-    if getattr(args, "no_memory_warmup", False) or getattr(args, "user_id", None) is None:
-        return True
-    timeout = float(getattr(args, "memory_warmup_timeout", 120.0))
-    query = str(getattr(args, "memory_warmup_query", "记忆系统预热"))
-    print(f"正在预热 Memory（timeout={timeout:.1f}s）……", flush=True)
-    try:
-        elapsed_ms, recalled = engine.warmup(
-            user_id=args.user_id,
-            agent_id=args.agent_id,
-            query=query,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        print(f"记忆预热失败：{exc}", file=sys.stderr, flush=True)
-        return False
-    print(
-        f"Memory 预热完成：{elapsed_ms:.3f} ms，召回 {recalled} 条；服务已就绪。",
-        flush=True,
-    )
-    return True
-
-
 def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
     try:
-        if not _warmup_memory(engine, args):
+        if engine.config.memory_warmup_enabled:
+            print(
+                f"正在预热 Memory（timeout={engine.config.memory_warmup_timeout:.1f}s）……",
+                flush=True,
+            )
+        try:
+            elapsed_ms = engine.start()
+        except Exception as exc:
+            print(f"记忆预热失败：{exc}", file=sys.stderr, flush=True)
             return
-        engine.start()
+        if elapsed_ms is not None:
+            print(
+                f"Memory 预热完成：{elapsed_ms:.3f} ms；embedding 与向量库已就绪。",
+                flush=True,
+            )
         _run_interactive(engine, args)
     finally:
         engine.close()
@@ -422,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-base-url", default=None)
     parser.add_argument("--db-path", default=None)
     parser.add_argument("--collection-name", default=os.getenv("BUMI_COLLECTION_NAME", "bumi_mem_l3"))
-    parser.add_argument("--embed-device", choices=["cpu", "cuda"], default=os.getenv("MEM0_EMBED_DEVICE", "cpu"))
+    parser.add_argument("--embed-device", choices=["auto", "cpu", "cuda"], default=os.getenv("MEM0_EMBED_DEVICE", "auto"))
     parser.add_argument("--max-messages", type=int, default=20)
     parser.add_argument("--max-l1-tokens", type=int, default=8000)
     parser.add_argument("--carryover-messages", type=int, default=4)

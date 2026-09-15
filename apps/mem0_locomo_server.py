@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from contextlib import asynccontextmanager
 import os
 import threading
 from datetime import datetime, timezone
@@ -9,6 +11,8 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from bumi_mem.long_term import resolve_embed_device, warmup_mem0_backend
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -29,6 +33,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 _memory: Any | None = None
 _memory_lock = threading.Lock()
+_warmup_elapsed_ms: float | None = None
 
 
 class AddRequest(BaseModel):
@@ -78,7 +83,7 @@ def _settings() -> dict[str, Any]:
         "base_url": base_url,
         "model": model,
         "embed_model": embed_model,
-        "embed_device": os.getenv("MEM0_EMBED_DEVICE", "cpu"),
+        "embed_device": resolve_embed_device(os.getenv("MEM0_EMBED_DEVICE", "auto")),
         "collection": os.getenv("MEM0_COLLECTION_NAME", "locomo_v3_memories"),
         "memory_max_tokens": int(os.getenv("MEM0_MEMORY_MAX_TOKENS", "4096")),
     }
@@ -143,7 +148,44 @@ def _get_memory():
         return _memory
 
 
-app = FastAPI(title="Mem0 v2.0.20 LoCoMo OSS server", version="2.0.20")
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _startup_warmup() -> float | None:
+    global _warmup_elapsed_ms
+    if not _env_flag("BUMI_MEMORY_WARMUP", True):
+        logger.info("Mem0 startup warmup disabled")
+        return None
+    if _warmup_elapsed_ms is not None:
+        return _warmup_elapsed_ms
+    query = os.getenv("BUMI_MEMORY_WARMUP_QUERY", "记忆系统预热")
+    started = time.perf_counter()
+    memory = _get_memory()
+    warmup_mem0_backend(memory, query=query)
+    _warmup_elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        "Mem0 startup warmup complete: %.3f ms device=%s",
+        _warmup_elapsed_ms,
+        _settings()["embed_device"],
+    )
+    return _warmup_elapsed_ms
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _startup_warmup()
+    yield
+
+
+app = FastAPI(
+    title="Mem0 v2.0.20 LoCoMo OSS server",
+    version="2.0.20",
+    lifespan=lifespan,
+)
 
 
 @app.get("/health")
@@ -155,6 +197,9 @@ def health() -> dict[str, Any]:
         "mem0ai": version("mem0ai"),
         "algorithm": "2026-add-only",
         "initialized": _memory is not None,
+        "warmed_up": _warmup_elapsed_ms is not None,
+        "warmup_elapsed_ms": _warmup_elapsed_ms,
+        "embed_device": resolve_embed_device(os.getenv("MEM0_EMBED_DEVICE", "auto")),
         "data_dir": str(DATA_DIR),
     }
 

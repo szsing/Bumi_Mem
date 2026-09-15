@@ -6,7 +6,9 @@
 - `/remember <text>`明确写入并返回核验后的长期记忆ID；普通后台任务的queued/accepted不等于LTM已保存。
 - 详细边界与专项验收见 [用户记忆说明](docs/user_memory/README.md)。
 - 只验证自己的隔离进程正常重启/SIGKILL及模拟前端重连；整机休眠/断电另行安排，不冒充已验收。
-- 原模型、检索参数及同事的性能配置不在本轮调整；之前的typed模块保留但不作为本轮入口。
+- 启动时在内部隔离作用域完成 embedding、CUDA kernel、Qdrant 与 BM25 预热，不依赖真实 user_id，也不读取真实用户记忆。
+- `MEM0_EMBED_DEVICE=auto` 在 CUDA 可用时选择 GPU；显式指定 `cuda` 时禁止静默回退到 CPU。
+- 之前的 typed 模块保留，但不作为本轮入口。
 
 
 Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型。v0.2 在原 MVP 基础上增加持久化后台整理，当前实现：
@@ -36,7 +38,7 @@ Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型
 
 普通对话不调用记忆提取模型，不等待上一段整理结束。任务在当前进程运行期间执行；关闭程序后不继续运行，下次启动恢复。
 
-**本地 SDK 的安全边界**：一个固定线程创建并串行调用同一个 Mem0/Qdrant 实例。前台检索不能无限等待后台写入，默认等待上限为 0.2 秒；超时或检索失败时，本轮仅使用原有 L1/衔接上下文，`TurnResult.recall_status` 为 `unavailable`。这不改变查询算法、Top-5、20 message / 8,000 token 或 4 条 carry-over，但不承诺后台忙时每轮都能取到 L3。模型首次加载也可能触发该降级。可用 `--memory-read-timeout` 调整等待上限。
+**本地 SDK 的安全边界**：一个固定线程创建并串行调用同一个 Mem0/Qdrant 实例。程序启动时先使用随机内部 `run_id` 执行完整检索预热，服务 ready 前完成 embedding 模型加载、一次实际编码、Qdrant 查询和 BM25 初始化；该作用域不包含真实 `user_id`/`agent_id`。前台检索不能无限等待后台写入，默认等待上限为 0.2 秒；超时或检索失败时，本轮仅使用原有 L1/衔接上下文，`TurnResult.recall_status` 为 `unavailable`。可用 `--memory-warmup-timeout` 和 `--memory-read-timeout` 分别调整启动与前台等待上限。
 
 同一本地 Qdrant 目录只运行一个应用进程；本版不将其当作支持多进程共享的服务端数据库。
 
@@ -153,7 +155,17 @@ scripts/run_mem0_chat.sh --user-id demo_user --agent-id bumi_companion
 ```bash
 CHAT_PROVIDER=deepseek
 MEMORY_PROVIDER=deepseek
+MEM0_EMBED_DEVICE=auto
+BUMI_MEMORY_WARMUP=true
 ```
+
+`auto` 会在当前 Python 环境支持 CUDA 时使用 GPU；若部署要求必须使用 GPU，可在外部 `deepseek.env` 中明确设置：
+
+```bash
+MEM0_EMBED_DEVICE=cuda
+```
+
+显式 `cuda` 但安装的是 CPU-only PyTorch 时，程序会在启动阶段直接失败并给出错误，不会静默退回 CPU。可使用 `--no-memory-warmup` 临时禁用 CLI 启动预热，服务端可设置 `BUMI_MEMORY_WARMUP=false`。
 
 回答模型和记忆模型可以独立选择：
 

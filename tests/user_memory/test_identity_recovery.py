@@ -109,6 +109,7 @@ def test_cli_no_default_user_and_no_implicit_ltm_access(tmp_path,monkeypatch,cap
     run_interactive(engine,args)
     assert len(backend.memories.get(('A','bot'),[]))==1
     assert not backend.memories.get(('B','bot'))
+    assert backend.warmup_calls == ['记忆系统预热']
     assert all(call['user_id'] for call in backend.search_calls)
     assert '尚未确认 user_id' in capsys.readouterr().out
 

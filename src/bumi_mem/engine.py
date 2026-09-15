@@ -34,6 +34,9 @@ class BumiMemoryConfig:
     search_threshold: float = 0.1
     max_answer_tokens: int = 512
     memory_read_timeout: float = 0.2
+    memory_warmup_enabled: bool = True
+    memory_warmup_timeout: float = 120.0
+    memory_warmup_query: str = "记忆系统预热"
 
 
 class BumiMemory:
@@ -56,6 +59,8 @@ class BumiMemory:
                                                max_l1_tokens=self.config.max_l1_tokens)
         self._locks_guard = threading.Lock()
         self._turn_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._warmup_lock = threading.Lock()
+        self._warmup_elapsed_ms: float | None = None
         self._closed = False
         self.worker = MemoryWorker(consolidator)
         self.consolidator.recover_legacy()
@@ -67,32 +72,33 @@ class BumiMemory:
         with self._locks_guard:
             return self._turn_locks.setdefault((user_id, agent_id), threading.RLock())
 
-    def start(self) -> None:
+    def start(self) -> float | None:
         if self._closed:
             raise RuntimeError('memory engine is closed')
+        elapsed_ms = None
+        if self.config.memory_warmup_enabled:
+            elapsed_ms = self.warmup(
+                query=self.config.memory_warmup_query,
+                timeout=self.config.memory_warmup_timeout,
+            )
         self.worker.start()
+        return elapsed_ms
 
     def warmup(
         self,
         *,
-        user_id: str,
-        agent_id: str,
-        query: str = '记忆系统预热',
+        query: str = "记忆系统预热",
         timeout: float = 120.0,
-    ) -> tuple[float, int]:
-        require_pair(user_id, agent_id)
+    ) -> float:
         if self._closed:
             raise RuntimeError('memory engine is closed')
-        started = time.perf_counter()
-        rows = self.long_term.warmup(
-            timeout=timeout,
-            user_id=user_id,
-            agent_id=agent_id,
-            query=query,
-            top_k=1,
-            threshold=self.config.search_threshold,
-        )
-        return (time.perf_counter() - started) * 1000, len(rows)
+        with self._warmup_lock:
+            if self._warmup_elapsed_ms is not None:
+                return self._warmup_elapsed_ms
+            started = time.perf_counter()
+            self.long_term.warmup(timeout=timeout, query=query)
+            self._warmup_elapsed_ms = (time.perf_counter() - started) * 1000
+            return self._warmup_elapsed_ms
 
     def close(self) -> None:
         if self._closed:

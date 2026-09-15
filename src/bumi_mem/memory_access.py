@@ -91,10 +91,10 @@ class SerialMemoryAccess:
     def search(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._call('search', kwargs, read=True)
 
-    def warmup(self, *, timeout: float, **kwargs: Any) -> list[dict[str, Any]]:
+    def warmup(self, *, timeout: float, query: str) -> None:
         if timeout <= 0:
             raise ValueError('warmup timeout must be positive')
-        return self._call('search', kwargs, read=True, timeout=timeout)
+        self._call('warmup', {"query": query}, read=True, timeout=timeout)
 
     def get_all(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._call('get_all', kwargs, read=True)

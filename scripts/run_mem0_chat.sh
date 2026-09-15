@@ -15,7 +15,7 @@ fi
 
 export CHAT_PROVIDER="${CHAT_PROVIDER:-deepseek}"
 export MEMORY_PROVIDER="${MEMORY_PROVIDER:-deepseek}"
-export MEM0_EMBED_DEVICE="${MEM0_EMBED_DEVICE:-cpu}"
+export MEM0_EMBED_DEVICE="${MEM0_EMBED_DEVICE:-auto}"
 export PYTHONPATH="$ROOT/src:$ROOT/src/mem0-new${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ ! -x "$PYTHON" ]]; then
