@@ -102,6 +102,12 @@ class SerialMemoryAccess:
     def add_session(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._call('add_session', kwargs)
 
+    def remember(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._call('remember', kwargs)
+
+    def get_memory(self, **kwargs: Any) -> dict[str, Any] | None:
+        return self._call('get_memory', kwargs, read=True)
+
     def delete_all(self, **kwargs: Any) -> None:
         self._call('delete_all', kwargs)
 

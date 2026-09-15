@@ -422,7 +422,7 @@ def test_cli_jobs_and_new_report_receipts(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr('builtins.input', lambda _: next(inputs))
     run_interactive(engine, cli_args())
     output = capsys.readouterr().out
-    assert '上一段已保存' in output
+    assert '长期记忆仍待后台完成' in output
     assert 'kind=consolidate' in output
 
 
