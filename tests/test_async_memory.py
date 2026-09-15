@@ -422,7 +422,7 @@ def test_cli_jobs_and_new_report_receipts(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr('builtins.input', lambda _: next(inputs))
     run_interactive(engine, cli_args())
     output = capsys.readouterr().out
-    assert '上一段已保存' in output
+    assert '长期记忆仍待后台完成' in output
     assert 'kind=consolidate' in output
 
 
@@ -464,3 +464,42 @@ def test_delete_suppression_survives_restart(tmp_path):
     other.worker.run_once()
     assert store.get_job(deletion.job_id).status == 'succeeded'
     assert memory.memories.get(('u1','a1'), []) == []
+
+
+
+def test_warmup_can_use_a_longer_timeout_than_foreground_reads():
+    class SlowMemory(FakeLongTermMemory):
+        def warmup(self, **kwargs):
+            time.sleep(0.05)
+            return super().warmup(**kwargs)
+
+        def search(self, **kwargs):
+            time.sleep(0.05)
+            return super().search(**kwargs)
+
+    access = SerialMemoryAccess(lambda: SlowMemory(), read_timeout=0.01)
+    try:
+        assert access.warmup(timeout=1.0, query='warmup') is None
+        with pytest.raises(MemoryReadUnavailable):
+            access.search(
+                user_id='u1',
+                agent_id='a1',
+                query='q',
+                top_k=1,
+                threshold=0.1,
+            )
+    finally:
+        access.close()
+
+
+def test_engine_start_warms_backend_once_without_a_user_scope(tmp_path):
+    engine, _, memory, _, _ = make_engine(tmp_path)
+    try:
+        elapsed_ms = engine.start()
+        assert elapsed_ms >= 0
+        assert memory.warmup_calls == ['记忆系统预热']
+        assert memory.search_calls == []
+        assert engine.start() == elapsed_ms
+        assert memory.warmup_calls == ['记忆系统预热']
+    finally:
+        engine.close()

@@ -46,7 +46,7 @@ def test_first_nineteen_messages_do_not_write_l3(tmp_path):
     for _ in range(9):
         chat_turn(engine)
     session = engine.get_or_create_session(user_id='u1', agent_id='a1')
-    engine.record_user_message(session.session_id, '第十九条')
+    engine.record_user_message(session.session_id, '第十九条', user_id=session.user_id, agent_id=session.agent_id)
     assert store.stats(session.session_id).effective_messages == 19
     assert memory.add_calls == []
     assert engine.memory_jobs(user_id='u1', agent_id='a1') == []

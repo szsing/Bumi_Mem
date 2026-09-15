@@ -11,6 +11,7 @@ from urllib.request import urlopen
 
 from bumi_mem.consolidator import ConsolidatorConfig, SessionConsolidator
 from bumi_mem.engine import BumiMemory, BumiMemoryConfig
+from bumi_mem.identity import UserIdentity
 from bumi_mem.long_term import Mem0AdapterConfig, Mem0LongTermMemory
 from bumi_mem.memory_access import SerialMemoryAccess
 from bumi_mem.paths import DATA_ROOT, MODEL_ROOT, PROJECT_ROOT, configure_runtime
@@ -164,6 +165,9 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
             search_threshold=args.search_threshold,
             max_answer_tokens=args.max_answer_tokens,
             memory_read_timeout=args.memory_read_timeout,
+            memory_warmup_enabled=not args.no_memory_warmup,
+            memory_warmup_timeout=args.memory_warmup_timeout,
+            memory_warmup_query=args.memory_warmup_query,
         ),
         auto_start=False,
     )
@@ -201,6 +205,10 @@ def _print_jobs(engine: BumiMemory, args: argparse.Namespace) -> None:
 def _help() -> None:
     print("""命令：
   /help                  显示帮助
+  /user <id>             开发用身份绑定/切换；生产由可信声纹前端提供
+  /logout                清除当前身份，不删除其记忆
+  /remember <text>        明确写入长期记忆，校验后返回确认与 memory_id
+  /read <memory-id>       仅按当前用户读取指定记忆
   /memories              查看当前 user/agent 的 L3
   /search <query>        手动检索 L3
   /session               查看当前 L1 和后台任务
@@ -219,7 +227,21 @@ def _help() -> None:
 
 def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
     try:
-        engine.start()
+        if engine.config.memory_warmup_enabled:
+            print(
+                f"正在预热 Memory（timeout={engine.config.memory_warmup_timeout:.1f}s）……",
+                flush=True,
+            )
+        try:
+            elapsed_ms = engine.start()
+        except Exception as exc:
+            print(f"记忆预热失败：{exc}", file=sys.stderr, flush=True)
+            return
+        if elapsed_ms is not None:
+            print(
+                f"Memory 预热完成：{elapsed_ms:.3f} ms；embedding 与向量库已就绪。",
+                flush=True,
+            )
         _run_interactive(engine, args)
     finally:
         engine.close()
@@ -228,10 +250,15 @@ def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
 def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
     debug = bool(args.debug)
     recall_enabled = True
-    session = engine.get_or_create_session(user_id=args.user_id, agent_id=args.agent_id)
+    identity = UserIdentity()
+    if args.user_id is not None:
+        identity.bind(args.user_id)
+        session = engine.get_or_create_session(user_id=args.user_id, agent_id=args.agent_id)
+    else:
+        session = None
     print("\nBumi_Mem L1/L2/L3 交互测试（持久化后台整理）")
-    print(f"user-id: {args.user_id}  agent-id: {args.agent_id}")
-    print(f"session-id: {session.session_id}")
+    print(f"user-id: {args.user_id or '未识别'}  agent-id: {args.agent_id}")
+    print(f"session-id: {session.session_id if session else '未绑定；长期记忆关闭'}")
     print(f"Chat Provider: {args.chat_provider}  Memory Provider: {args.memory_provider}")
     print("输入 /help 查看命令；/jobs 查看后台整理状态。\n")
     while True:
@@ -241,6 +268,38 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
                 continue
             if text == "/help":
                 _help()
+                continue
+            if text.startswith("/user "):
+                ticket = identity.bind(text.removeprefix("/user ").strip())
+                args.user_id = ticket.user_id
+                session = engine.get_or_create_session(user_id=ticket.user_id, agent_id=args.agent_id)
+                recall_enabled = True
+                print(f"当前用户已绑定：{ticket.user_id}；仅使用该用户会话 {session.session_id}")
+                continue
+            if text == "/user":
+                print(f"当前 user-id: {args.user_id or '未识别'}；用法 /user <id>")
+                continue
+            if text == "/logout":
+                identity.clear()
+                args.user_id = None
+                print("当前身份已清除；长期记忆已锁定，已有记忆不删除。")
+                continue
+            if args.user_id is None:
+                if text == "/quit":
+                    print("已退出；未使用未识别用户的长期记忆。")
+                    return
+                print("尚未确认 user_id，本入口不读写长期记忆；请先 /user <id>。")
+                continue
+            if text.startswith("/remember "):
+                ticket = identity.snapshot()
+                saved = engine.remember(user_id=ticket.user_id, agent_id=args.agent_id,
+                                        contents=[text.removeprefix("/remember ")])
+                identity.deliver(ticket, print, f"已确认长期保存：user_id={saved.user_id}，memory_id={','.join(x.memory_id for x in saved.records)}")
+                continue
+            if text.startswith("/read "):
+                row = engine.read_memory(user_id=args.user_id, agent_id=args.agent_id,
+                                         memory_id=text.removeprefix("/read ").strip())
+                _print_memories([row] if row else [])
                 continue
             if text == "/memories":
                 if engine.store.reads_blocked(args.user_id, args.agent_id):
@@ -288,7 +347,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
             if text == "/new":
                 receipt = engine.end_session(user_id=args.user_id, agent_id=args.agent_id)
                 _print_submission(receipt, debug=debug)
-                print("已开始新会话；上一段已保存，后台整理不影响继续聊天。")
+                print("已开始新会话；会话记录与整理任务已落盘，长期记忆仍待后台完成。")
                 continue
             if text == "/discard":
                 if input("输入 DISCARD 确认放弃当前 L1（不撤销之前的后台任务）：").strip() == "DISCARD":
@@ -324,8 +383,12 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
             if text.startswith("/"):
                 print("未知命令；输入 /help 查看帮助。")
                 continue
-            result = engine.chat(user_id=args.user_id, agent_id=args.agent_id, text=text,
-                                 recall_enabled=recall_enabled, on_answer=lambda answer: print(f"Bumi> {answer}"))
+            ticket = identity.snapshot()
+            result = engine.chat(user_id=ticket.user_id, agent_id=args.agent_id, text=text,
+                                 recall_enabled=recall_enabled,
+                                 on_answer=lambda answer: identity.deliver(ticket, lambda value: print(f"Bumi> {value}"), answer))
+            if not identity.accepts(ticket):
+                continue
             if debug:
                 print(f"[L3 检索] status={result.recall_status}")
                 _print_memories(result.recalled)
@@ -340,7 +403,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bumi_Mem layered companion-memory CLI")
-    parser.add_argument("--user-id", default="demo_user")
+    parser.add_argument("--user-id", default=None, help="显式用户身份；不提供时长期记忆保持锁定")
     parser.add_argument("--agent-id", default="bumi_companion")
     parser.add_argument("--chat-provider", choices=["deepseek", "local"], default=os.getenv("CHAT_PROVIDER", "deepseek"))
     parser.add_argument("--memory-provider", choices=["deepseek", "local"], default=os.getenv("MEMORY_PROVIDER", "deepseek"))
@@ -350,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-base-url", default=None)
     parser.add_argument("--db-path", default=None)
     parser.add_argument("--collection-name", default=os.getenv("BUMI_COLLECTION_NAME", "bumi_mem_l3"))
-    parser.add_argument("--embed-device", choices=["cpu", "cuda"], default=os.getenv("MEM0_EMBED_DEVICE", "cpu"))
+    parser.add_argument("--embed-device", choices=["auto", "cpu", "cuda"], default=os.getenv("MEM0_EMBED_DEVICE", "auto"))
     parser.add_argument("--max-messages", type=int, default=20)
     parser.add_argument("--max-l1-tokens", type=int, default=8000)
     parser.add_argument("--carryover-messages", type=int, default=4)
@@ -361,6 +424,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-max-tokens", type=int, default=512)
     parser.add_argument("--memory-max-tokens", type=int, default=None)
     parser.add_argument("--memory-read-timeout", type=float, default=0.2)
+    parser.add_argument(
+        "--memory-warmup-timeout",
+        type=float,
+        default=float(os.getenv("BUMI_MEMORY_WARMUP_TIMEOUT", "120")),
+    )
+    parser.add_argument(
+        "--memory-warmup-query",
+        default=os.getenv("BUMI_MEMORY_WARMUP_QUERY", "记忆系统预热"),
+    )
+    parser.add_argument(
+        "--no-memory-warmup",
+        action="store_true",
+        help="skip startup embedding and vector-store warmup",
+    )
     parser.add_argument("--memory-max-attempts", type=int, default=3)
     parser.add_argument("--memory-retry-base-seconds", type=float, default=5.0)
     parser.add_argument("--debug", action="store_true")

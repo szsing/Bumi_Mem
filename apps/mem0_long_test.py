@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from runtime_paths import DATA_ROOT, MODEL_ROOT, configure_environment
+from bumi_mem.long_term import resolve_embed_device
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
@@ -523,7 +524,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-threshold", type=float, default=0.1)
     parser.add_argument("--search-explain", action="store_true")
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--max-answer-tokens", type=int, default=240)
     parser.add_argument("--quick", action="store_true", help="只运行标记为 quick 的小测试")
     parser.add_argument("--dry-run", action="store_true", help="只检查并打印用例，不加载模型")
@@ -602,7 +603,7 @@ def main() -> None:
             search_threshold=args.search_threshold,
             search_explain=args.search_explain,
             top_k=args.top_k,
-            device=args.device,
+            device=resolve_embed_device(args.device),
             max_answer_tokens=args.max_answer_tokens,
         )
         passed = app.run(ingest_turns, eval_turns)

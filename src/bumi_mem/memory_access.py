@@ -60,7 +60,14 @@ class SerialMemoryAccess:
                 if close is not None:
                     close()
 
-    def _call(self, method: str, kwargs: dict[str, Any], *, read: bool = False) -> Any:
+    def _call(
+        self,
+        method: str,
+        kwargs: dict[str, Any],
+        *,
+        read: bool = False,
+        timeout: float | None = None,
+    ) -> Any:
         try:
             self._start()
         except MemoryReadUnavailable as exc:
@@ -72,8 +79,9 @@ class SerialMemoryAccess:
             if self._closed:
                 raise (MemoryReadUnavailable if read else RetryableMemoryError)('memory executor is closed')
             self._queue.put((future, method, kwargs))
+        wait_timeout = timeout if timeout is not None else (self.read_timeout if read else None)
         try:
-            return future.result(timeout=self.read_timeout if read else None)
+            return future.result(timeout=wait_timeout)
         except CancelledError as exc:
             raise RetryableMemoryError('queued memory call cancelled before execution') from exc
         except TimeoutError as exc:
@@ -83,11 +91,22 @@ class SerialMemoryAccess:
     def search(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._call('search', kwargs, read=True)
 
+    def warmup(self, *, timeout: float, query: str) -> None:
+        if timeout <= 0:
+            raise ValueError('warmup timeout must be positive')
+        self._call('warmup', {"query": query}, read=True, timeout=timeout)
+
     def get_all(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._call('get_all', kwargs, read=True)
 
     def add_session(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._call('add_session', kwargs)
+
+    def remember(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._call('remember', kwargs)
+
+    def get_memory(self, **kwargs: Any) -> dict[str, Any] | None:
+        return self._call('get_memory', kwargs, read=True)
 
     def delete_all(self, **kwargs: Any) -> None:
         self._call('delete_all', kwargs)
