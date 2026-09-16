@@ -17,9 +17,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+server = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "filelock>=3.13"]
+client = ["httpx>=0.27,<1"]
+runtime = ["sentence-transformers>=5.2,<7", "fastembed>=0.3.1,<1", "spacy>=3.7,<4"]
+test = ["pytest>=8", "fastapi>=0.115,<1", "httpx>=0.27,<1", "filelock>=3.13"]
 
 [project.scripts]
 bumi-mem-chat = "bumi_mem.cli:main"
+bumi-memory-server = "bumi_mem.api:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

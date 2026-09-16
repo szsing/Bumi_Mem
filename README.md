@@ -1,9 +1,15 @@
 # Bumi_Mem
 
+## Agent 部门接入（单接口 HTTP 服务）
+
+唯一业务接口 `POST /v1/memory/context`，接收 `user_id`、`previous_ai_reply`、`query`：先补存上一轮 agent 回复，再保存当前用户问题并返回完整 messages。第一轮回复为空；结束时 query=null 可补存最后回复。回答模型由对方调用，后台摘要和长期提取继续由我们负责。
+
+用户发言带 user_id；AI 发言只有 agent_id，不标为某个用户的发言。服务端固定 agent_id，保留共享 L1 与个人 L3 隔离。完整协议、重试规则、配置和部署见 **docs/agent_api/README.md**；旧双业务路由已移除。主 SQLite 升级为 v5，部署旧库前请备份。
+
 ## 当前短期 / 长期记忆边界
 
 - **L1 按 agent 共享**：同一个 `agent_id` 的用户共享最近对话，切换 `user_id` 不重置短期窗口。
-- 每条短期消息保留 `user_id`、`agent_id`、`role`；助手消息的 `user_id` 是当时回复的对象。
+- 短期用户消息保留 `user_id`、`agent_id`、`role`；助手消息只以 `agent_id` 标识说话者，Prompt 不包含助手的 `user_id`。
 - 默认窗口为 **20 条有效消息（约 10 轮）+ 最多 4 条 carry-over（约 2 轮）**，不是每位用户各 20 条，也不是保留 4 轮。Token 预算仍可能进一步裁剪。
 - **L3 按 user_id + agent_id 隔离**：查询、列表、ID 读取、显式写入、删除、任务重试仍保持个人作用域。
 - 共享窗口轮转时，在同一事务内分别保存各参与用户的整理快照。共有短期上下文不会作为当前用户的完整 L3 提取输入。

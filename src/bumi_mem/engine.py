@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 from collections import Counter
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -11,7 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from bumi_mem.identity import require_pair
+from bumi_mem.identity import require_pair, require_id
+from bumi_mem.turn_store import TurnConflict
 from bumi_mem.schemas import MemoryWriteReceipt, SavedMemory, MemoryWriteUncertainError, SessionBlockedError, MemoryScopeError
 from bumi_mem.consolidator import SessionConsolidator
 from bumi_mem.context import ContextBuilder
@@ -41,7 +44,7 @@ class BumiMemoryConfig:
 
 class BumiMemory:
     def __init__(self, *, store: SQLiteSessionStore, long_term: LongTermMemory,
-                 chat_provider: TextProvider, consolidator: SessionConsolidator,
+                 chat_provider: TextProvider | None, consolidator: SessionConsolidator,
                  chat_token_counter: TokenCounter, config: BumiMemoryConfig | None = None,
                  auto_start: bool = True) -> None:
         if isinstance(long_term, Mem0LongTermMemory):
@@ -158,48 +161,150 @@ class BumiMemory:
             return []
         return self._scoped_results(rows, user_id, agent_id)
 
-    def build_context(self, *, session_id: str, recalled: list[dict[str, Any]], user_id: str, agent_id: str) -> list[dict[str, str]]:
+    def build_context(self, *, session_id: str, recalled: list[dict[str, Any]], user_id: str, agent_id: str,
+                      memory_only: bool = False) -> list[dict[str, str]]:
         self._owned_session(session_id, user_id, agent_id)
         self._scoped_results(recalled, user_id, agent_id)
         return self.context_builder.build(recalled=recalled, l1_messages=self.store.list_shared_messages(agent_id),
-                                          current_user_id=user_id, current_agent_id=agent_id)
+                                          current_user_id=user_id, current_agent_id=agent_id, memory_only=memory_only)
+
+    def prepare_prompt(self, *, user_id: str, agent_id: str, query: str,
+                       idempotency_key: str | None = None, ttl_seconds: float = 300.0,
+                       recall_enabled: bool = True, memory_only: bool = True) -> dict[str, Any]:
+        """Persist input and return context; never invoke the answering model."""
+        if self._closed:
+            raise RuntimeError('memory engine is closed')
+        require_pair(user_id, agent_id)
+        if not isinstance(query, str) or not query.strip() or len(query) > 16000:
+            raise ValueError('query must contain 1..16000 characters')
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError('turn ttl must be positive and finite')
+        if idempotency_key is not None:
+            require_id(idempotency_key, 'Idempotency-Key')
+        query = query.strip()
+        with self._pair_lock(user_id, agent_id):
+            turn = self.store.reserve_turn(
+                user_id=user_id, agent_id=agent_id, query=query,
+                token_count=self.chat_token_counter.count_text(
+                    MessageRecord.attributed_content('user', query, user_id, agent_id)) + 4,
+                idempotency_key=idempotency_key, ttl_seconds=ttl_seconds,
+                settings=self.consolidator._settings(), max_messages=self.config.max_messages,
+                max_l1_tokens=self.config.max_l1_tokens)
+            self.worker.wake()  # a prior timed-out window may have rotated
+            return self._prompt_for_turn(turn, recall_enabled=recall_enabled, memory_only=memory_only)
+
+    def _prompt_for_turn(self, turn, *, recall_enabled=True, memory_only=True):
+        user_id, agent_id, query = turn['user_id'], turn['agent_id'], turn['query']
+        if self.store.read_scope(user_id, agent_id)[0] != turn['generation']:
+            raise TurnConflict('memory_scope_changed')
+        if turn['prompt_json']:
+            return json.loads(turn['prompt_json'])
+        recalled: list[dict[str, Any]] = []
+        recall_status = 'disabled'
+        if recall_enabled:
+            if self.store.reads_blocked(user_id, agent_id):
+                recall_status = 'deleting'
+            else:
+                try:
+                    recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=query)
+                    recall_status = 'ok'
+                except Exception as exc:
+                    logger.debug('L3 unavailable: %s', type(exc).__name__)
+                    recall_status = 'unavailable'
+        messages = self.build_context(session_id=turn['session_id'], recalled=recalled,
+                                      user_id=user_id, agent_id=agent_id, memory_only=memory_only)
+        return self.store.save_turn_prompt(turn['turn_id'], messages=messages, recall_status=recall_status, recalled=recalled)
+
+    def process_context(self, *, user_id: str, agent_id: str, previous_ai_reply: str | None,
+                        query: str | None, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Single external call: append previous agent speech, then prepare current context."""
+        if self._closed:
+            raise RuntimeError('memory engine is closed')
+        require_pair(user_id, agent_id)
+        if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 16000):
+            raise ValueError('query must be null or contain 1..16000 characters')
+        if previous_ai_reply is not None and (not isinstance(previous_ai_reply, str) or len(previous_ai_reply) > 64000):
+            raise ValueError('previous_ai_reply must be null or at most 64000 characters')
+        if idempotency_key is not None:
+            require_id(idempotency_key, 'Idempotency-Key')
+        query = query.strip() if query is not None else None
+        previous_ai_reply = (previous_ai_reply or '').strip()
+        with self._pair_lock(user_id, agent_id):
+            request = self.store.begin_context_request(
+                user_id=user_id, agent_id=agent_id, query=query, previous_ai_reply=previous_ai_reply,
+                idempotency_key=idempotency_key,
+                query_tokens=self.chat_token_counter.count_text(
+                    MessageRecord.attributed_content('user', query or '', user_id, agent_id)) + 4,
+                reply_tokens=self.chat_token_counter.count_text(
+                    MessageRecord.attributed_content('assistant', previous_ai_reply, '', agent_id)) + 4,
+                settings=self.consolidator._settings(), max_messages=self.config.max_messages,
+                max_l1_tokens=self.config.max_l1_tokens)
+            self.worker.wake()
+            if request['response_json']:
+                return json.loads(request['response_json'])
+            messages, recall_status = [], 'not_requested'
+            if request['turn_id']:
+                turn = self.store.get_turn(request['turn_id'], agent_id)
+                prepared = self._prompt_for_turn(turn)
+                messages, recall_status = prepared['messages'], prepared['recall_status']
+            return self.store.save_context_response(request['request_id'], messages=messages, recall_status=recall_status)
+
+
+    def record_reply(self, *, turn_id: str, agent_id: str, reply: str | None = None,
+                     status: str = 'completed') -> dict[str, Any]:
+        """Persist agent speech in the preceding conversation, then rotate L1 atomically."""
+        if self._closed:
+            raise RuntimeError('memory engine is closed')
+        require_id(turn_id, 'turn_id')
+        require_id(agent_id, 'agent_id')
+        if status not in ('completed', 'interrupted', 'cancelled', 'failed'):
+            raise ValueError('invalid reply status')
+        if reply is not None and (not isinstance(reply, str) or len(reply) > 64000):
+            raise ValueError('reply must contain at most 64000 characters')
+        reply = (reply or '').strip()
+        if status == 'completed' and not reply:
+            raise ValueError('completed turns require a reply')
+        if status in ('cancelled', 'failed') and reply:
+            raise ValueError('cancelled/failed turns must not contain a reply; use interrupted for partial output')
+        turn = self.store.get_turn(turn_id, agent_id)
+        with self._pair_lock(turn['user_id'], agent_id):
+            result = self.store.finish_turn(
+                turn_id=turn_id, agent_id=agent_id, reply=reply, status=status,
+                token_count=self.chat_token_counter.count_text(
+                    MessageRecord.attributed_content('assistant', reply, turn['user_id'], agent_id)) + 4,
+                settings=self.consolidator._settings(), max_messages=self.config.max_messages,
+                max_l1_tokens=self.config.max_l1_tokens)
+            self.worker.wake()
+            return result
 
     def chat(self, *, user_id: str, agent_id: str, text: str, recall_enabled: bool = True,
              on_answer: Callable[[str], None] | None = None) -> TurnResult:
-        if self._closed:
-            raise RuntimeError('memory engine is closed')
+        """CLI adapter for the same prepare/reply flow used by external agents."""
+        if self.chat_provider is None:
+            raise RuntimeError('no answering model configured; use prepare_prompt and record_reply')
         with self._pair_lock(user_id, agent_id):
-            session = self.get_or_create_session(user_id=user_id, agent_id=agent_id)
-            self.record_user_message(session.session_id, text, user_id=user_id, agent_id=agent_id)
-            recalled: list[dict[str, Any]] = []
-            recall_status = 'disabled'
-            if recall_enabled:
-                if self.store.reads_blocked(user_id, agent_id):
-                    recall_status = 'deleting'
-                else:
-                    try:
-                        recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=text)
-                        recall_status = 'ok'
-                    except Exception as exc:
-                        # No fallback ever invents/reuses another user's memories.
-                        logger.debug('L3 unavailable for this turn: %s', type(exc).__name__)
-                        recall_status = 'unavailable'
-            prompt = self.build_context(session_id=session.session_id, recalled=recalled, user_id=user_id, agent_id=agent_id)
-            answer = self.chat_provider.generate(prompt, max_tokens=self.config.max_answer_tokens).strip()
-            self.record_assistant_message(session.session_id, answer, user_id=user_id, agent_id=agent_id)
+            prepared = self.prepare_prompt(user_id=user_id, agent_id=agent_id, query=text,
+                                           recall_enabled=recall_enabled, memory_only=False)
+            turn = self.store.get_turn(prepared['turn_id'], agent_id)
+            try:
+                answer = self.chat_provider.generate(prepared['messages'],
+                                                      max_tokens=self.config.max_answer_tokens).strip()
+                result = self.record_reply(turn_id=turn['turn_id'], agent_id=agent_id, reply=answer)
+            except Exception:
+                # Do not release an already persisted response or hide the original error.
+                try:
+                    self.record_reply(turn_id=turn['turn_id'], agent_id=agent_id, status='failed')
+                except Exception:
+                    pass
+                raise
             if on_answer is not None:
                 on_answer(answer)
-            stats = self.store.shared_stats(agent_id, session_id=session.session_id)
-            reason = ('message_limit' if stats.effective_messages >= self.config.max_messages else
-                      'token_limit' if stats.effective_tokens >= self.config.max_l1_tokens else None)
-            receipt = self.consolidator.submit(session.session_id, reason=reason) if reason else None
-            if receipt:
-                self.worker.wake()
-            return TurnResult(session_id=session.session_id,
-                              active_session_id=receipt.new_session_id if receipt else session.session_id,
-                              answer=answer, recalled=recalled, prompt_messages=prompt,
-                              auto_consolidation=receipt, recall_status=recall_status,
-                              user_id=user_id, agent_id=agent_id)
+            receipt = ConsolidationSubmission(**result['submission']) if result['submission'] else None
+            return TurnResult(session_id=turn['session_id'],
+                              active_session_id=receipt.new_session_id if receipt else turn['session_id'],
+                              answer=answer, recalled=prepared.get('recalled', []),
+                              prompt_messages=prepared['messages'], auto_consolidation=receipt,
+                              recall_status=prepared['recall_status'], user_id=user_id, agent_id=agent_id)
 
     def end_session(self, *, user_id: str, agent_id: str, reason: str = 'manual_new') -> ConsolidationSubmission:
         with self._pair_lock(user_id, agent_id):

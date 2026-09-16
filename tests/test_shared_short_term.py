@@ -39,14 +39,14 @@ def test_b_sees_a_and_agent_speech_but_only_b_private_l3(tmp_path):
     assert '我刚说了一句话' in prompt[1]['content']
     assert '刚才回答了A' in prompt[2]['content']
     assert '"user_id": "A"' in prompt[1]['content']
-    assert '"user_id": "A"' in prompt[2]['content']  # reply recipient
+    assert '"user_id"' not in prompt[2]['content'].split("\n", 1)[0]
     assert '"speaker_role": "assistant"' in prompt[2]['content']
     assert '"user_id": "B"' in prompt[3]['content']
     assert all('"agent_id": "bot"' in row['content'] for row in prompt[1:])
     assert backend.search_calls[-1]['user_id'] == 'B'
     assert engine.session_stats(user_id='A', agent_id='bot').effective_messages == 4
     assert engine.session_stats(user_id='B', agent_id='bot').effective_messages == 4
-    assert [(m.user_id, m.agent_id) for m in store.list_shared_messages('bot')] == [('A','bot')]*2+[('B','bot')]*2
+    assert [(m.user_id, m.agent_id) for m in store.list_shared_messages('bot')] == [('A','bot'),('','bot'),('B','bot'),('','bot')]
 
 
 def test_agent_boundary_is_not_shared(tmp_path):
@@ -66,10 +66,10 @@ def test_twenty_message_boundary_is_global_and_owner_jobs_are_separate(tmp_path)
     for job in jobs:
         rows = json.loads(job.payload_json)['messages']
         assert len(rows) == 10
-        assert all(m['user_id'] == job.user_id and m['agent_id'] == 'bot' for m in rows)
+        assert all(m['user_id'] == (job.user_id if m['role'] == 'user' else '') and m['agent_id'] == 'bot' for m in rows)
     tail = store.list_shared_messages('bot')
     assert len(tail) == 4 and all(m.context_only for m in tail)
-    assert [m.user_id for m in tail] == ['A','A','B','B']
+    assert [m.user_id for m in tail] == ['A','','B','']
     assert engine.session_stats(user_id='B', agent_id='bot').effective_messages == 0
     drain(engine)
     assert all(store.get_job(j.job_id).status == 'succeeded' for j in jobs)
@@ -176,7 +176,7 @@ def test_same_agent_turns_are_serialized_across_users(tmp_path):
             release.set()
         a.result(); b.result()
     assert [(m.user_id,m.role) for m in store.list_shared_messages('bot')] == [
-        ('A','user'),('A','assistant'),('B','user'),('B','assistant')]
+        ('A','user'),('','assistant'),('B','user'),('','assistant')]
 
 
 def test_migrate_v2_backfills_speaker_and_only_imports_live_window_once(tmp_path):
@@ -197,12 +197,12 @@ def test_migrate_v2_backfills_speaker_and_only_imports_live_window_once(tmp_path
         c.execute('ALTER TABLE messages DROP COLUMN agent_id')
         c.execute('PRAGMA user_version=2')
     migrated = SQLiteSessionStore(path)
-    assert [(m.user_id,m.content) for m in migrated.list_shared_messages('bot')] == [('A','a'),('A','reply a'),('B','b')]
+    assert [(m.user_id,m.content) for m in migrated.list_shared_messages('bot')] == [('A','a'),('','reply a'),('B','b')]
     assert migrated.list_shared_messages('other') == []
     reopened = SQLiteSessionStore(path)
     assert reopened.list_shared_messages('bot') == migrated.list_shared_messages('bot')
     with sqlite3.connect(path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 3
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 5
 
 
 def test_tampered_owner_snapshot_is_rejected_before_llm_or_write(tmp_path):
@@ -269,7 +269,7 @@ def test_rotating_empty_window_does_not_duplicate_shared_carryover(tmp_path):
         engine.end_session(user_id=user,agent_id='bot')
     rows = store.list_shared_messages('bot')
     assert len(rows) == 2 and len({m.message_id for m in rows}) == 2
-    assert all(m.user_id == 'A' and m.context_only for m in rows)
+    assert all(m.user_id == ('A' if m.role == 'user' else '') and m.context_only for m in rows)
     drain(engine)
     assert len(backend.add_calls) == 1
 

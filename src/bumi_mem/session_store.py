@@ -28,7 +28,11 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class SQLiteSessionStore:
+from bumi_mem.turn_store import TurnStoreMixin
+from bumi_mem.context_store import ContextStoreMixin
+
+
+class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,7 +56,7 @@ class SQLiteSessionStore:
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 3:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 5:
                 raise RuntimeError("Database schema is newer than this Bumi version; refusing to downgrade")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
@@ -144,7 +148,31 @@ class SQLiteSessionStore:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_open_session_per_pair "
                          "ON sessions(user_id,agent_id) WHERE status='active'")
             # Never relabel live running work just because another reader starts.
-            conn.execute('PRAGMA user_version=3')
+            conn.execute("CREATE TABLE IF NOT EXISTS interaction_turns ("
+                         "turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id), "
+                         "user_id TEXT NOT NULL, agent_id TEXT NOT NULL, query TEXT NOT NULL, "
+                         "idempotency_key TEXT, status TEXT NOT NULL CHECK(status IN "
+                         "('preparing','awaiting_reply','completed','interrupted','cancelled','failed','expired')), "
+                         "expires_at REAL NOT NULL, created_at REAL NOT NULL, generation INTEGER NOT NULL, "
+                         "prompt_json TEXT, finish_payload TEXT, completion_json TEXT, UNIQUE(agent_id,idempotency_key))")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_pending_turn_per_agent "
+                         "ON interaction_turns(agent_id) WHERE status IN ('preparing','awaiting_reply')")
+            turn_columns = {r['name'] for r in conn.execute('PRAGMA table_info(interaction_turns)')}
+            if 'protocol' not in turn_columns:
+                conn.execute("ALTER TABLE interaction_turns ADD COLUMN protocol TEXT NOT NULL DEFAULT 'direct'")
+            conn.execute("CREATE TABLE IF NOT EXISTS context_requests ("
+                         "request_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, user_id TEXT NOT NULL, "
+                         "query TEXT, previous_ai_reply TEXT NOT NULL, idempotency_key TEXT, "
+                         "turn_id TEXT REFERENCES interaction_turns(turn_id), previous_turn_id TEXT, "
+                         "previous_reply_saved INTEGER NOT NULL, consolidation_status TEXT NOT NULL, "
+                         "state TEXT NOT NULL DEFAULT 'preparing', response_json TEXT, created_at REAL NOT NULL, "
+                         "UNIQUE(agent_id,idempotency_key))")
+            if conn.execute('PRAGMA user_version').fetchone()[0] < 5:
+                # An assistant speaks as the agent, not as a user. Sessions and
+                # old task snapshots still preserve extraction provenance.
+                conn.execute("UPDATE messages SET user_id='' WHERE role!='user'")
+                conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
+            conn.execute('PRAGMA user_version=5')
 
     @staticmethod
     def _session(row: sqlite3.Row | None) -> SessionRecord | None:
@@ -177,7 +205,7 @@ class SQLiteSessionStore:
             conn.execute('INSERT INTO messages(message_id,session_id,sequence_no,role,content,token_count,'
                          'context_only,source_session_id,created_at,user_id,agent_id) VALUES(?,?,?,?,?,?,1,?,?,?,?)',
                          (uuid4().hex, sid, index, message.role, message.content,
-                          message.token_count, message.session_id, now, message.user_id or user, message.agent_id or agent))
+                          message.token_count, message.session_id, now, (message.user_id or user) if message.role == 'user' else '', message.agent_id or agent))
         return sid
 
     def get_session(self, session_id: str) -> SessionRecord | None:
@@ -206,25 +234,33 @@ class SQLiteSessionStore:
 
     def append_message(self, session_id: str, *, role: str, content: str, token_count: int,
                        context_only: bool = False, source_session_id: str | None = None) -> MessageRecord:
+        with self._connect(write=True) as conn:
+            owner = conn.execute('SELECT agent_id FROM sessions WHERE session_id=?', (session_id,)).fetchone()
+            if owner is not None:
+                self._assert_agent_idle(conn, owner['agent_id'])
+            return self._append_message(conn, session_id, role=role, content=content, token_count=token_count,
+                                        context_only=context_only, source_session_id=source_session_id)
+
+    def _append_message(self, conn, session_id, *, role, content, token_count,
+                        context_only=False, source_session_id=None):
         content = content.strip()
         if not content:
             raise ValueError('message content cannot be empty')
-        with self._connect(write=True) as conn:
-            row = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            if row['status'] != 'active':
-                raise SessionBlockedError(f'session {session_id} is frozen; use the active session')
-            sequence = conn.execute('SELECT COALESCE(MAX(sequence_no),0)+1 FROM messages WHERE session_id=?',
-                                    (session_id,)).fetchone()[0]
-            mid = uuid4().hex
-            conn.execute('INSERT INTO messages(message_id,session_id,sequence_no,role,content,token_count,'
-                         'context_only,source_session_id,created_at,user_id,agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-                         (mid, session_id, sequence, role, content, max(0, token_count),
-                          int(context_only), source_session_id, utcnow(), row['user_id'], row['agent_id']))
-            conn.execute('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,?)',
-                         (row['agent_id'], mid, int(context_only)))
-            return self._message(conn.execute('SELECT * FROM messages WHERE message_id=?', (mid,)).fetchone())
+        row = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        if row['status'] != 'active':
+            raise SessionBlockedError(f'session {session_id} is frozen; use the active session')
+        sequence = conn.execute('SELECT COALESCE(MAX(sequence_no),0)+1 FROM messages WHERE session_id=?',
+                                (session_id,)).fetchone()[0]
+        mid = uuid4().hex
+        conn.execute('INSERT INTO messages(message_id,session_id,sequence_no,role,content,token_count,'
+                     'context_only,source_session_id,created_at,user_id,agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                     (mid, session_id, sequence, role, content, max(0, token_count),
+                      int(context_only), source_session_id, utcnow(), row['user_id'] if role == 'user' else '', row['agent_id']))
+        conn.execute('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,?)',
+                     (row['agent_id'], mid, int(context_only)))
+        return self._message(conn.execute('SELECT * FROM messages WHERE message_id=?', (mid,)).fetchone())
 
     def list_messages(self, session_id: str, *, include_context_only: bool = True) -> list[MessageRecord]:
         extra = '' if include_context_only else ' AND context_only=0'
@@ -304,30 +340,35 @@ class SQLiteSessionStore:
                       carryover_messages: int = 4, max_attempts: int = 3) -> ConsolidationSubmission:
         """Rotate the agent window and enqueue separate owner snapshots atomically."""
         with self._connect(write=True) as conn:
-            old = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
-            if old is None:
-                raise KeyError(session_id)
-            existing = conn.execute('SELECT * FROM memory_jobs WHERE session_id=?', (session_id,)).fetchone()
-            if existing:
-                return ConsolidationSubmission(existing['job_id'], session_id,
-                                               existing['new_session_id'], existing['status'])
-            if old['status'] != 'active':
-                raise SessionBlockedError('only the active session can rotate shared L1')
-            agent = old['agent_id']
-            active = conn.execute("SELECT session_id FROM sessions WHERE agent_id=? AND status='active'",
-                                  (agent,)).fetchall()
-            tail = conn.execute('SELECT message_id FROM shared_l1 WHERE agent_id=? '
-                                'ORDER BY position DESC LIMIT ?', (agent, carryover_messages)).fetchall()
-            receipts = {}
-            for row in active:
-                sid = row['session_id']
-                receipts[sid] = self._submit(conn, sid, reason=reason, settings=settings,
-                                             carryover_messages=carryover_messages,
-                                             max_attempts=max_attempts)
-            conn.execute('DELETE FROM shared_l1 WHERE agent_id=?', (agent,))
-            conn.executemany('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,1)',
-                             [(agent, row['message_id']) for row in reversed(tail)])
-            return receipts[session_id]
+            return self._submit_shared(conn, session_id, reason=reason, settings=settings,
+                                       carryover_messages=carryover_messages, max_attempts=max_attempts)
+
+    def _submit_shared(self, conn, session_id, *, reason, settings, carryover_messages=4, max_attempts=3):
+        old = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
+        if old is None:
+            raise KeyError(session_id)
+        existing = conn.execute('SELECT * FROM memory_jobs WHERE session_id=?', (session_id,)).fetchone()
+        if existing:
+            return ConsolidationSubmission(existing['job_id'], session_id,
+                                           existing['new_session_id'], existing['status'])
+        if old['status'] != 'active':
+            raise SessionBlockedError('only the active session can rotate shared L1')
+        agent = old['agent_id']
+        self._assert_agent_idle(conn, agent)
+        active = conn.execute("SELECT session_id FROM sessions WHERE agent_id=? AND status='active'",
+                              (agent,)).fetchall()
+        tail = conn.execute('SELECT message_id FROM shared_l1 WHERE agent_id=? '
+                            'ORDER BY position DESC LIMIT ?', (agent, carryover_messages)).fetchall()
+        receipts = {}
+        for row in active:
+            sid = row['session_id']
+            receipts[sid] = self._submit(conn, sid, reason=reason, settings=settings,
+                                         carryover_messages=carryover_messages,
+                                         max_attempts=max_attempts)
+        conn.execute('DELETE FROM shared_l1 WHERE agent_id=?', (agent,))
+        conn.executemany('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,1)',
+                         [(agent, row['message_id']) for row in reversed(tail)])
+        return receipts[session_id]
 
     def discard_shared(self, session_id: str) -> SessionRecord:
         """Explicit global discard for this agent only; already queued jobs survive."""
@@ -335,6 +376,7 @@ class SQLiteSessionStore:
             row = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
             if row is None or row['status'] != 'active':
                 raise SessionBlockedError('only the active session can be discarded')
+            self._assert_agent_idle(conn, row['agent_id'])
             conn.execute("UPDATE sessions SET status='discarded',closed_at=?,close_reason='manual_discard' "
                          "WHERE agent_id=? AND status='active'", (utcnow(), row['agent_id']))
             conn.execute('DELETE FROM shared_l1 WHERE agent_id=?', (row['agent_id'],))
@@ -387,6 +429,13 @@ class SQLiteSessionStore:
                          (now, user_id, agent_id))
             conn.execute("UPDATE sessions SET status='discarded',consolidation_status='cancelled' "
                          "WHERE user_id=? AND agent_id=? AND status IN ('processing','failed')", (user_id, agent_id))
+            conn.execute("UPDATE context_requests SET state='revoked',response_json=NULL "
+                         "WHERE user_id=? AND agent_id=?", (user_id, agent_id))
+            conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE user_id=? AND agent_id=?",
+                         (user_id, agent_id))
+            conn.execute("UPDATE interaction_turns SET status='cancelled' "
+                         "WHERE user_id=? AND agent_id=? AND protocol='direct' "
+                         "AND status IN ('preparing','awaiting_reply')", (user_id, agent_id))
             conn.execute('UPDATE messages SET memory_excluded=1 WHERE session_id IN '
                          '(SELECT session_id FROM sessions WHERE user_id=? AND agent_id=?)', (user_id, agent_id))
             conn.execute('INSERT INTO memory_jobs(job_id,kind,user_id,agent_id,generation,status,max_attempts,available_at,'
