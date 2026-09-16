@@ -1,3 +1,5 @@
+> 接口版本更新：单 HTTP 接口新增事务请求记录，最新主库 schema 为 v5。本文 v3 段落描述共享短期索引的迁移步骤，完整部署请参见 `../agent_api/README.md`。
+
 # 共享短期上下文，隔离长期记忆
 
 ## 适用边界
@@ -8,7 +10,7 @@
 
 ## 数据结构
 
-- `messages`：保存原始正文、role、user_id、agent_id 等。role=assistant 时 user_id 是回复对象，实际说话者是 agent_id。
+- `messages`：保存原始正文、role、user_id、agent_id 等。role=assistant 时 user_id 为空字符串，Prompt 不输出该字段，说话者只有 agent_id；后台依靠 session 关联了解整理来源。
 - `shared_l1`：按 agent_id 保存有序的 message_id 引用及 context_only。主键 position 为 SQLite 分配的顺序，不依赖时钟排序新消息。
 - `sessions`：仍按 user_id + agent_id 保留个人存储/整理会话；它不再决定前台能看见哪些短期消息。因此两位用户的 session_id 可以不同，但短期视图相同。
 - `memory_jobs` / `memory_chunks`：仍归属单一 user_id + agent_id，删除代际、租约、重试及写入回执规则保持不变。
@@ -23,7 +25,7 @@
 system: 当前身份是 B / bot；长期记忆只属于 B。
 user: [speaker {"user_id": "A", "agent_id": "bot", "speaker_role": "user"}]
       我刚才说周末想去公园。
-assistant: [speaker {"user_id": "A", "agent_id": "bot", "speaker_role": "assistant"}]
+assistant: [speaker {"agent_id": "bot", "speaker_role": "assistant"}]
            好，我们刚才在讨论周末去公园。
 user: [speaker {"user_id": "B", "agent_id": "bot", "speaker_role": "user"}]
       你刚刚说什么？

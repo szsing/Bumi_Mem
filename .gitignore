@@ -36,3 +36,7 @@ dist/
 
 # Local development environment
 .venv/
+
+# Real deployment environment files (examples end in .env.example)
+*.env
+*.service.lock

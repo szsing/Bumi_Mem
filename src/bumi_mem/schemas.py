@@ -24,8 +24,10 @@ class MessageRecord:
 
     @staticmethod
     def attributed_content(role: str, content: str, user_id: str, agent_id: str) -> str:
-        header = json.dumps({"user_id": user_id, "agent_id": agent_id,
-                             "speaker_role": role}, ensure_ascii=False)
+        speaker = {"agent_id": agent_id, "speaker_role": role}
+        if role == 'user':
+            speaker['user_id'] = user_id
+        header = json.dumps(speaker, ensure_ascii=False)
         return "[speaker " + header + "]\n" + content
 
     def to_shared_chat_message(self) -> dict[str, str]:
