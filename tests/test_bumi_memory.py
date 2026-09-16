@@ -95,7 +95,7 @@ def test_current_query_only_is_used_for_l3_search(tmp_path):
 def test_current_user_message_appears_once_in_prompt(tmp_path):
     engine, _, _, _, _ = make_engine(tmp_path)
     result = chat_turn(engine, '唯一的输入')
-    assert sum(m['content'] == '唯一的输入' for m in result.prompt_messages) == 1
+    assert sum(m['content'].split('\n', 1)[-1] == '唯一的输入' for m in result.prompt_messages) == 1
 
 
 def test_l3_failure_keeps_l1_and_reusable_l2(tmp_path):
@@ -162,7 +162,7 @@ def test_carryover_is_context_only_and_not_reconsolidated(tmp_path):
     receipt = submit(engine)
     assert all(m.context_only for m in store.list_messages(receipt.new_session_id))
     result = chat_turn(engine, '新消息')
-    assert any(m['content'] == '旧消息' for m in result.prompt_messages)
+    assert any(m['content'].split('\n', 1)[-1] == '旧消息' for m in result.prompt_messages)
     submit(engine)
     engine.worker.run_once()
     engine.worker.run_once()
@@ -210,7 +210,7 @@ def test_l1_current_statement_is_later_than_conflicting_l3(tmp_path):
     memory.search_results = [{'memory': '用户喜欢详细回答'}]
     result = chat_turn(engine, '今天请简短回答')
     assert '用户喜欢详细回答' in result.prompt_messages[0]['content']
-    assert result.prompt_messages[-1]['content'] == '今天请简短回答'
+    assert result.prompt_messages[-1]['content'].split('\n', 1)[-1] == '今天请简短回答'
 
 
 def test_new_on_empty_session_rotates_without_l3_call(tmp_path):

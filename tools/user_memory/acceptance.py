@@ -146,7 +146,7 @@ def verify(path,event='unspecified'):
             turn=engine.chat(user_id=uid,agent_id=AGENT,text=uid+'_PRIVATE_CURRENT')
             joined='\n'.join(m['content'] for m in turn.prompt_messages)
             for other in USERS:
-                if other!=uid and (other+'_PRIVATE_CURRENT' in joined or any(t in joined for t in USERS[other])):context_leaks.append(uid)
+                if other!=uid and any(t in turn.prompt_messages[0]['content'] for t in USERS[other]):context_leaks.append(uid)
             if turn.user_id!=uid:pollution.append('response binding')
         old=identity.snapshot();identity.bind('user_A' if old.user_id!='user_A' else 'user_B');delivered=[]
         assert not identity.deliver(old,delivered.append,'old private reply') and not delivered

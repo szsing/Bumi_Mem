@@ -1,3 +1,5 @@
+> 2026-09-16 更新：本文的“用户隔离”指长期记忆及个人整理任务。短期上下文现按 agent 共享并保留说话人归属，详见 `../shared_short_term/README.md`。历史 REPORT 反映旧版验收，不作为当前 L1 行为说明。
+
 # 本轮仅验收：恢复与 user_id 隔离
 
 ## 范围
@@ -15,7 +17,7 @@
 - `read_memory(user_id, agent_id, memory_id)`：知道别人的memory_id也不能读到其内容。
 - 既有 `search_long_term/get_memories/end_session/forget_all` 等入口均要求明确身份。真实适配器再次检查返回数据归属。
 - 元数据不能覆盖user_id/agent_id/id等归属字段。
-- 普通聊天原有后台整理保持原样；queued/pending或已保存会话，不等于已经成功写入LTM。
+- 普通聊天按 agent 的共享窗口触发后台整理，按用户分别保存快照；queued/pending或已保存会话，不等于已经成功写入LTM。
 
 部分写入或核验失败不会返回confirmed，也不会自动重放；本轮不承诺未知结果重试严格exactly-once。
 
@@ -23,7 +25,7 @@
 
 ```text
 --user-id user_A     显式模拟已由可信前端确认的身份
-/user user_B        切换；使用B自己的会话，不继承A的L1
+/user user_B        切换；共享本 agent 的 L1，但只检索 B 的 L3
 /logout             清除当前身份，不删除历史记忆
 /remember 我喜欢绿茶  明确写入并输出确认和memory_id
 /read <memory-id>   只读当前用户有归属的记录
@@ -31,7 +33,7 @@
 
 不提供user-id时默认未识别，memory-enabled CLI锁定长期记忆相关操作，不自动选择上次用户或demo_user。未识别短聊可由前端独立Chat通道提供，本轮不增加匿名持久会话。
 
-CLI只是开发控制台，不是声纹认证或安全的多人显示界面。生产前端必须先完成声纹/可信身份匹配，再传稳定user_id；user_id本身不是密码。用户切换时前端还应清理旧显示，并用 `UserIdentity` 票据在最终显示时拒绝迟到回复。当前CLI使用同一轻量检查保护回调。
+CLI只是开发控制台，不是声纹认证或安全的多人显示界面。生产前端必须先完成声纹/可信身份匹配，再传稳定user_id；user_id本身不是密码。共享现场对话允许保留显示；个人记忆管理结果仍须单独保护，并用 `UserIdentity` 票据在最终显示时拒绝迟到回复。当前CLI使用同一轻量检查保护回调。
 
 新的UserIdentity实例/重连从未绑定开始。记忆归属持久保存，不代表当前登录身份自动继承。
 
@@ -61,10 +63,10 @@ bash /home/legendre/data/ZhixingSun/Bumi_Mem/scripts/run_user_memory_acceptance.
 
 任何本轮的进程SIGKILL通过，都不能写成“真实断电已通过”。工具不含reboot、suspend、poweroff或sudo操作。硬盘损坏、错误的数据目录、外部手工篡改、未确认的中间写入不在本轮成功恢复的承诺范围内。
 
-已有磁盘数据不会自动重新绑定用户，未绑定/错误归属的遗留记录不会被塞给当前人。本轮不迁移旧库、不新增权限数据库。
+已有磁盘数据不会自动重新绑定用户，未绑定/错误归属的遗留记录不会被塞给当前人。主 SQLite 库升级到 v3 时回填消息归属并构建共享短期索引，不更改 L3 归属、不新增权限数据库。
 
 ## 兼容性说明
 
 原来直接使用session_id的`record_user_message`、`record_assistant_message`、`build_context`现在必须同时传入user_id和agent_id，并校验会话归属；仓库内调用点已同步调整。前端不要绕过带身份的服务接口直接访问底层store/SDK。
 
-用户切换前的终端显示不等于安全的前端消息历史：正式前端应清理旧显示，按身份票据过滤异步输出。声纹误识别和调用者伪造user_id不由字符串过滤自动解决，本轮只约定可信上游传入已确认的稳定ID。
+用户切换前的终端显示不等于安全的前端消息历史：正式前端应区分共享现场消息与个人记忆管理结果，按身份票据过滤异步输出。声纹误识别和调用者伪造user_id不由字符串过滤自动解决，本轮只约定可信上游传入已确认的稳定ID。

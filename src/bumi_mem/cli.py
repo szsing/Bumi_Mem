@@ -218,8 +218,8 @@ def _help() -> None:
                          核查 L3 后，显式允许重放结果不确定的分块（再次确认）
   /recall on|off         控制回答前的 L3 检索
   /debug on|off          显示或隐藏内部调试信息
-  /new                   保存整理任务并立即开始新会话
-  /discard               丢弃当前 L1，不影响之前已经提交的任务
+  /new                   轮转共享短期窗口，按用户分别保存整理任务
+  /discard               清空本 agent 的共享 L1，不影响已提交任务
   /forget-all            屏蔽当前 user/agent 的 L3，取消旧写入并后台清理
   /quit                  退出；save 只保证记录/任务落盘，不保证 L3 已整理完
 """)
@@ -274,7 +274,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
                 args.user_id = ticket.user_id
                 session = engine.get_or_create_session(user_id=ticket.user_id, agent_id=args.agent_id)
                 recall_enabled = True
-                print(f"当前用户已绑定：{ticket.user_id}；仅使用该用户会话 {session.session_id}")
+                print(f"当前用户已绑定：{ticket.user_id}；共享 agent={args.agent_id} 的短期上下文，长期记忆仅限当前用户")
                 continue
             if text == "/user":
                 print(f"当前 user-id: {args.user_id or '未识别'}；用法 /user <id>")
@@ -314,7 +314,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
             if text in ("/session", "/jobs"):
                 if text == "/session":
                     stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
-                    print(f"session={stats.session_id} status={stats.status} "
+                    print(f"owner-session={stats.session_id} shared-agent={args.agent_id} status={stats.status} "
                           f"messages={stats.effective_messages}/{args.max_messages} "
                           f"tokens={stats.effective_tokens}/{args.max_l1_tokens} carryover={stats.context_only_messages}")
                 _print_jobs(engine, args)
@@ -347,12 +347,12 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
             if text == "/new":
                 receipt = engine.end_session(user_id=args.user_id, agent_id=args.agent_id)
                 _print_submission(receipt, debug=debug)
-                print("已开始新会话；会话记录与整理任务已落盘，长期记忆仍待后台完成。")
+                print("已开始新会话；共享会话已按用户分别提交整理，长期记忆仍待后台完成。")
                 continue
             if text == "/discard":
-                if input("输入 DISCARD 确认放弃当前 L1（不撤销之前的后台任务）：").strip() == "DISCARD":
+                if input("输入 DISCARD 确认清空本 agent 所有用户的共享 L1（不撤销之前的后台任务）：").strip() == "DISCARD":
                     engine.discard_session(user_id=args.user_id, agent_id=args.agent_id)
-                    print("当前会话已丢弃，已开始新会话。")
+                    print("本 agent 的共享短期窗口已清空，已开始新会话。")
                 else:
                     print("已取消。")
                 continue
@@ -367,7 +367,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
             if text == "/quit":
                 stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
                 if stats.effective_messages:
-                    action = input("输入 save / discard / cancel（save 保存任务，下次启动可继续整理）：").strip().lower()
+                    action = input("输入 save / discard / cancel（save 按用户保存任务；discard 清空本 agent 所有用户的共享短期上下文）：").strip().lower()
                     if action == "save":
                         # Do not let the worker start the new quit-save job as we exit.
                         engine.worker.stop(timeout=0.0)

@@ -82,7 +82,7 @@ def test_metadata_cannot_override_user_binding():
     with pytest.raises(MemoryScopeError):adapter.add_session(user_id='A',agent_id='bot',messages=[],metadata={'user_id':'B'},prompt='')
 
 
-def test_user_switch_uses_different_l1_and_scoped_memory(tmp_path):
+def test_user_switch_shares_l1_but_keeps_scoped_memory(tmp_path):
     engine=make_engine(tmp_path,max_messages=100)
     engine.remember(user_id='A',agent_id='bot',contents=['A_ONLY_COFFEE'])
     engine.remember(user_id='B',agent_id='bot',contents=['B_ONLY_TEA'])
@@ -90,7 +90,9 @@ def test_user_switch_uses_different_l1_and_scoped_memory(tmp_path):
     b=engine.chat(user_id='B',agent_id='bot',text='B_ONLY_CONVERSATION')
     assert a.user_id=='A' and b.user_id=='B' and a.session_id!=b.session_id
     joined='\n'.join(x['content'] for x in b.prompt_messages)
-    assert 'A_ONLY_' not in joined and 'B_ONLY_' in joined
+    assert 'A_ONLY_CONVERSATION' in joined and 'B_ONLY_CONVERSATION' in joined
+    assert 'A_ONLY_COFFEE' not in joined and 'B_ONLY_TEA' in joined
+    assert '"user_id": "A"' in joined and '"user_id": "B"' in joined
 
 
 def test_pending_job_is_not_a_confirmed_memory_receipt(tmp_path):
@@ -126,7 +128,7 @@ def test_delayed_job_keeps_original_user_after_other_user_chats(tmp_path):
     assert started.wait(3)
     try:
         b=engine.chat(user_id='B',agent_id='bot',text='B_CURRENT')
-        assert b.user_id=='B' and all('A_PENDING_FACT' not in m['content'] for m in b.prompt_messages)
+        assert b.user_id=='B' and any('A_PENDING_FACT' in m['content'] for m in b.prompt_messages)
     finally:release.set()
     deadline=time.monotonic()+5
     while time.monotonic()<deadline:

@@ -33,3 +33,6 @@ __pycache__/
 htmlcov/
 build/
 dist/
+
+# Local development environment
+.venv/
