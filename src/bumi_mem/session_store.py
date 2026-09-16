@@ -1,8 +1,10 @@
 """SQLite L1/L2 storage and durable, leased background memory jobs.
 
 External model/vector calls never run inside a SQLite transaction. A session
-rotation and its job snapshot commit together. Only active sessions are unique
-per user/agent; frozen sessions can coexist with the new conversation.
+shared-window rotation and all owner job snapshots commit together. Per-user
+sessions remain private extraction/audit streams, while shared_l1 references form
+one chronological foreground context per agent. Frozen owner sessions can coexist
+with the new conversation.
 """
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -50,7 +52,7 @@ class SQLiteSessionStore:
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 2:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 3:
                 raise RuntimeError("Database schema is newer than this Bumi version; refusing to downgrade")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
@@ -117,6 +119,24 @@ class SQLiteSessionStore:
             columns = {r['name'] for r in conn.execute('PRAGMA table_info(messages)')}
             if 'memory_excluded' not in columns:
                 conn.execute('ALTER TABLE messages ADD COLUMN memory_excluded INTEGER NOT NULL DEFAULT 0')
+            # v3: immutable attribution plus a persisted per-agent shared window.
+            for name in ('user_id', 'agent_id'):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+                    conn.execute(f"UPDATE messages SET {name}=(SELECT {name} FROM sessions s "
+                                 "WHERE s.session_id=messages.session_id)")
+            conn.execute("CREATE TABLE IF NOT EXISTS shared_l1 ("
+                         "position INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, "
+                         "message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE, "
+                         "context_only INTEGER NOT NULL DEFAULT 0)")
+            conn.execute("CREATE INDEX IF NOT EXISTS shared_l1_agent ON shared_l1(agent_id,position)")
+            if conn.execute('PRAGMA user_version').fetchone()[0] < 3:
+                # Migrate only live windows, never resurrect discarded/frozen history.
+                # Carry-over copies retain their source identity and remain context-only.
+                conn.execute("INSERT OR IGNORE INTO shared_l1(agent_id,message_id,context_only) "
+                             "SELECT s.agent_id,m.message_id,m.context_only FROM messages m "
+                             "JOIN sessions s USING(session_id) WHERE s.status='active' "
+                             "ORDER BY m.created_at,m.rowid")
             # v0.1 included processing/failed, which blocked every new conversation.
             old = conn.execute("SELECT sql FROM sqlite_master WHERE name='one_open_session_per_pair'").fetchone()
             if old and 'processing' in old['sql']:
@@ -124,7 +144,7 @@ class SQLiteSessionStore:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_open_session_per_pair "
                          "ON sessions(user_id,agent_id) WHERE status='active'")
             # Never relabel live running work just because another reader starts.
-            conn.execute('PRAGMA user_version=2')
+            conn.execute('PRAGMA user_version=3')
 
     @staticmethod
     def _session(row: sqlite3.Row | None) -> SessionRecord | None:
@@ -155,9 +175,9 @@ class SQLiteSessionStore:
                      "VALUES(?,?,?,'active',?,?)", (sid, user, agent, now, now))
         for index, message in enumerate(carryover, 1):
             conn.execute('INSERT INTO messages(message_id,session_id,sequence_no,role,content,token_count,'
-                         'context_only,source_session_id,created_at) VALUES(?,?,?,?,?,?,1,?,?)',
+                         'context_only,source_session_id,created_at,user_id,agent_id) VALUES(?,?,?,?,?,?,1,?,?,?,?)',
                          (uuid4().hex, sid, index, message.role, message.content,
-                          message.token_count, message.session_id, now))
+                          message.token_count, message.session_id, now, message.user_id or user, message.agent_id or agent))
         return sid
 
     def get_session(self, session_id: str) -> SessionRecord | None:
@@ -190,7 +210,7 @@ class SQLiteSessionStore:
         if not content:
             raise ValueError('message content cannot be empty')
         with self._connect(write=True) as conn:
-            row = conn.execute('SELECT status FROM sessions WHERE session_id=?', (session_id,)).fetchone()
+            row = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
             if row is None:
                 raise KeyError(session_id)
             if row['status'] != 'active':
@@ -199,9 +219,11 @@ class SQLiteSessionStore:
                                     (session_id,)).fetchone()[0]
             mid = uuid4().hex
             conn.execute('INSERT INTO messages(message_id,session_id,sequence_no,role,content,token_count,'
-                         'context_only,source_session_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                         'context_only,source_session_id,created_at,user_id,agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                          (mid, session_id, sequence, role, content, max(0, token_count),
-                          int(context_only), source_session_id, utcnow()))
+                          int(context_only), source_session_id, utcnow(), row['user_id'], row['agent_id']))
+            conn.execute('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,?)',
+                         (row['agent_id'], mid, int(context_only)))
             return self._message(conn.execute('SELECT * FROM messages WHERE message_id=?', (mid,)).fetchone())
 
     def list_messages(self, session_id: str, *, include_context_only: bool = True) -> list[MessageRecord]:
@@ -226,38 +248,98 @@ class SQLiteSessionStore:
                carryover_messages: int = 4, max_attempts: int = 3, legacy: bool = False) -> ConsolidationSubmission:
         """Freeze, snapshot, enqueue and rotate in ONE transaction (no model calls)."""
         with self._connect(write=True) as conn:
-            existing = conn.execute('SELECT * FROM memory_jobs WHERE session_id=?', (session_id,)).fetchone()
-            if existing:
-                return ConsolidationSubmission(existing['job_id'], session_id, existing['new_session_id'], existing['status'])
+            return self._submit(conn, session_id, reason=reason, settings=settings,
+                                carryover_messages=carryover_messages, max_attempts=max_attempts, legacy=legacy)
+
+    def _submit(self, conn: sqlite3.Connection, session_id: str, *, reason: str,
+                settings: dict[str, Any], carryover_messages: int, max_attempts: int,
+                legacy: bool = False) -> ConsolidationSubmission:
+        existing = conn.execute('SELECT * FROM memory_jobs WHERE session_id=?', (session_id,)).fetchone()
+        if existing:
+            return ConsolidationSubmission(existing['job_id'], session_id, existing['new_session_id'], existing['status'])
+        old = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
+        if old is None:
+            raise KeyError(session_id)
+        if old['status'] != 'active' and not (legacy and old['status'] in ('processing', 'failed')):
+            raise SessionBlockedError(f'cannot submit {old["status"]} session')
+        rows = conn.execute('SELECT * FROM messages WHERE session_id=? AND context_only=0 ORDER BY sequence_no',
+                            (session_id,)).fetchall()
+        eligible = [self._message(r) for r in rows if not r['memory_excluded']]
+        tail = [self._message(r) for r in rows[-carryover_messages:]] if carryover_messages else []
+        scope = self._scope(conn, old['user_id'], old['agent_id'])
+        now, jid = utcnow(), 'session_' + session_id
+        state = 'queued' if eligible else 'succeeded'
+        error = None
+        if legacy and conn.execute("SELECT 1 FROM consolidation_runs WHERE session_id=? "
+                                   "AND status IN ('processing','success','failed') LIMIT 1", (session_id,)).fetchone():
+            state, error = 'failed', 'Legacy partial write: review L3 before explicitly allowing replay.'
+        conn.execute('UPDATE sessions SET status=?,closed_at=?,close_reason=?,consolidation_status=? WHERE session_id=?',
+                     ('consolidated' if not eligible else ('failed' if error else 'processing'),
+                      now, reason, 'skipped' if not eligible else state, session_id))
+        active = conn.execute("SELECT session_id FROM sessions WHERE user_id=? AND agent_id=? AND status='active'",
+                              (old['user_id'], old['agent_id'])).fetchone()
+        new_sid = active['session_id'] if active else self._insert_session(conn, old['user_id'], old['agent_id'], tail)
+        payload = json.dumps({'messages': [asdict(m) for m in eligible], 'settings': settings}, ensure_ascii=False)
+        conn.execute('INSERT INTO memory_jobs(job_id,kind,session_id,new_session_id,user_id,agent_id,generation,'
+                     'status,max_attempts,available_at,reason,payload_json,created_at,updated_at,last_error) '
+                     "VALUES(?,'consolidate',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (jid, session_id, new_sid, old['user_id'], old['agent_id'], scope['generation'], state,
+                      max_attempts, time.time(), reason, payload, now, now, error))
+        return ConsolidationSubmission(jid, session_id, new_sid, state)
+
+    def list_shared_messages(self, agent_id: str) -> list[MessageRecord]:
+        with self._connect() as conn:
+            rows = conn.execute('SELECT m.*,w.context_only AS shared_context_only '
+                                'FROM shared_l1 w JOIN messages m USING(message_id) '
+                                'WHERE w.agent_id=? ORDER BY w.position', (agent_id,)).fetchall()
+            return [replace(self._message(row), context_only=bool(row['shared_context_only'])) for row in rows]
+
+    def shared_stats(self, agent_id: str, *, session_id: str) -> SessionStats:
+        messages = self.list_shared_messages(agent_id)
+        real = [m for m in messages if not m.context_only]
+        return SessionStats(session_id, 'active', len(real), len(messages)-len(real),
+                            sum(m.token_count for m in real))
+
+    def submit_shared(self, session_id: str, *, reason: str, settings: dict[str, Any],
+                      carryover_messages: int = 4, max_attempts: int = 3) -> ConsolidationSubmission:
+        """Rotate the agent window and enqueue separate owner snapshots atomically."""
+        with self._connect(write=True) as conn:
             old = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
             if old is None:
                 raise KeyError(session_id)
-            if old['status'] != 'active' and not (legacy and old['status'] in ('processing', 'failed')):
-                raise SessionBlockedError(f'cannot submit {old["status"]} session')
-            rows = conn.execute('SELECT * FROM messages WHERE session_id=? AND context_only=0 ORDER BY sequence_no',
-                                (session_id,)).fetchall()
-            eligible = [self._message(r) for r in rows if not r['memory_excluded']]
-            tail = [self._message(r) for r in rows[-carryover_messages:]] if carryover_messages else []
-            scope = self._scope(conn, old['user_id'], old['agent_id'])
-            now, jid = utcnow(), 'session_' + session_id
-            state = 'queued' if eligible else 'succeeded'
-            error = None
-            if legacy and conn.execute("SELECT 1 FROM consolidation_runs WHERE session_id=? "
-                                       "AND status IN ('processing','success','failed') LIMIT 1", (session_id,)).fetchone():
-                state, error = 'failed', 'Legacy partial write: review L3 before explicitly allowing replay.'
-            conn.execute('UPDATE sessions SET status=?,closed_at=?,close_reason=?,consolidation_status=? WHERE session_id=?',
-                         ('consolidated' if not eligible else ('failed' if error else 'processing'),
-                          now, reason, 'skipped' if not eligible else state, session_id))
-            active = conn.execute("SELECT session_id FROM sessions WHERE user_id=? AND agent_id=? AND status='active'",
-                                  (old['user_id'], old['agent_id'])).fetchone()
-            new_sid = active['session_id'] if active else self._insert_session(conn, old['user_id'], old['agent_id'], tail)
-            payload = json.dumps({'messages': [asdict(m) for m in eligible], 'settings': settings}, ensure_ascii=False)
-            conn.execute('INSERT INTO memory_jobs(job_id,kind,session_id,new_session_id,user_id,agent_id,generation,'
-                         'status,max_attempts,available_at,reason,payload_json,created_at,updated_at,last_error) '
-                         "VALUES(?,'consolidate',?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                         (jid, session_id, new_sid, old['user_id'], old['agent_id'], scope['generation'], state,
-                          max_attempts, time.time(), reason, payload, now, now, error))
-            return ConsolidationSubmission(jid, session_id, new_sid, state)
+            existing = conn.execute('SELECT * FROM memory_jobs WHERE session_id=?', (session_id,)).fetchone()
+            if existing:
+                return ConsolidationSubmission(existing['job_id'], session_id,
+                                               existing['new_session_id'], existing['status'])
+            if old['status'] != 'active':
+                raise SessionBlockedError('only the active session can rotate shared L1')
+            agent = old['agent_id']
+            active = conn.execute("SELECT session_id FROM sessions WHERE agent_id=? AND status='active'",
+                                  (agent,)).fetchall()
+            tail = conn.execute('SELECT message_id FROM shared_l1 WHERE agent_id=? '
+                                'ORDER BY position DESC LIMIT ?', (agent, carryover_messages)).fetchall()
+            receipts = {}
+            for row in active:
+                sid = row['session_id']
+                receipts[sid] = self._submit(conn, sid, reason=reason, settings=settings,
+                                             carryover_messages=carryover_messages,
+                                             max_attempts=max_attempts)
+            conn.execute('DELETE FROM shared_l1 WHERE agent_id=?', (agent,))
+            conn.executemany('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,1)',
+                             [(agent, row['message_id']) for row in reversed(tail)])
+            return receipts[session_id]
+
+    def discard_shared(self, session_id: str) -> SessionRecord:
+        """Explicit global discard for this agent only; already queued jobs survive."""
+        with self._connect(write=True) as conn:
+            row = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
+            if row is None or row['status'] != 'active':
+                raise SessionBlockedError('only the active session can be discarded')
+            conn.execute("UPDATE sessions SET status='discarded',closed_at=?,close_reason='manual_discard' "
+                         "WHERE agent_id=? AND status='active'", (utcnow(), row['agent_id']))
+            conn.execute('DELETE FROM shared_l1 WHERE agent_id=?', (row['agent_id'],))
+            sid = self._insert_session(conn, row['user_id'], row['agent_id'])
+        return self.get_session(sid)
 
     def legacy_sessions(self) -> list[SessionRecord]:
         with self._connect() as conn:

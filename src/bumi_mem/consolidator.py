@@ -75,7 +75,7 @@ class SessionConsolidator:
         return chunks
 
     def submit(self, session_id: str, *, reason: str) -> ConsolidationSubmission:
-        return self.store.submit(session_id, reason=reason, settings=self._settings(),
+        return self.store.submit_shared(session_id, reason=reason, settings=self._settings(),
                                  carryover_messages=self.config.carryover_messages,
                                  max_attempts=self.config.max_attempts)
 
@@ -102,6 +102,11 @@ class SessionConsolidator:
                                     retry_delay=0, retryable=False)
                 return
             messages = [MessageRecord(**m) for m in payload['messages']]
+            if any((m.user_id and m.user_id != job.user_id) or
+                   (m.agent_id and m.agent_id != job.agent_id) for m in messages):
+                self.store.fail_job(job.job_id, owner, 'Foreign speaker in owner snapshot',
+                                    retry_delay=0, retryable=False)
+                return
             session = self.store.get_session(job.session_id)
             if session.summary_status not in ('success', 'fallback'):
                 try:

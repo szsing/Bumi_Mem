@@ -58,7 +58,7 @@ class BumiMemory:
         self.context_builder = ContextBuilder(max_messages=self.config.max_messages,
                                                max_l1_tokens=self.config.max_l1_tokens)
         self._locks_guard = threading.Lock()
-        self._turn_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._turn_locks: dict[str, threading.RLock] = {}
         self._warmup_lock = threading.Lock()
         self._warmup_elapsed_ms: float | None = None
         self._closed = False
@@ -69,8 +69,10 @@ class BumiMemory:
 
     def _pair_lock(self, user_id: str, agent_id: str) -> threading.RLock:
         require_pair(user_id, agent_id)
+        # Same-agent users share L1: keep each user/assistant turn and rotation
+        # contiguous. Different agents can still run independently.
         with self._locks_guard:
-            return self._turn_locks.setdefault((user_id, agent_id), threading.RLock())
+            return self._turn_locks.setdefault(agent_id, threading.RLock())
 
     def start(self) -> float | None:
         if self._closed:
@@ -134,12 +136,14 @@ class BumiMemory:
     def record_user_message(self, session_id: str, text: str, *, user_id: str, agent_id: str) -> MessageRecord:
         self._owned_session(session_id, user_id, agent_id)
         return self.store.append_message(session_id, role='user', content=text,
-                                         token_count=self.chat_token_counter.count_text(text) + 4)
+                                         token_count=self.chat_token_counter.count_text(
+                                             MessageRecord.attributed_content('user', text, user_id, agent_id)) + 4)
 
     def record_assistant_message(self, session_id: str, text: str, *, user_id: str, agent_id: str) -> MessageRecord:
         self._owned_session(session_id, user_id, agent_id)
         return self.store.append_message(session_id, role='assistant', content=text,
-                                         token_count=self.chat_token_counter.count_text(text) + 4)
+                                         token_count=self.chat_token_counter.count_text(
+                                             MessageRecord.attributed_content('assistant', text, user_id, agent_id)) + 4)
 
     def search_long_term(self, *, user_id: str, agent_id: str, query: str) -> list[dict[str, Any]]:
         require_pair(user_id, agent_id)
@@ -157,7 +161,8 @@ class BumiMemory:
     def build_context(self, *, session_id: str, recalled: list[dict[str, Any]], user_id: str, agent_id: str) -> list[dict[str, str]]:
         self._owned_session(session_id, user_id, agent_id)
         self._scoped_results(recalled, user_id, agent_id)
-        return self.context_builder.build(recalled=recalled, l1_messages=self.store.list_messages(session_id))
+        return self.context_builder.build(recalled=recalled, l1_messages=self.store.list_shared_messages(agent_id),
+                                          current_user_id=user_id, current_agent_id=agent_id)
 
     def chat(self, *, user_id: str, agent_id: str, text: str, recall_enabled: bool = True,
              on_answer: Callable[[str], None] | None = None) -> TurnResult:
@@ -184,7 +189,7 @@ class BumiMemory:
             self.record_assistant_message(session.session_id, answer, user_id=user_id, agent_id=agent_id)
             if on_answer is not None:
                 on_answer(answer)
-            stats = self.store.stats(session.session_id)
+            stats = self.store.shared_stats(agent_id, session_id=session.session_id)
             reason = ('message_limit' if stats.effective_messages >= self.config.max_messages else
                       'token_limit' if stats.effective_tokens >= self.config.max_l1_tokens else None)
             receipt = self.consolidator.submit(session.session_id, reason=reason) if reason else None
@@ -206,11 +211,11 @@ class BumiMemory:
     def discard_session(self, *, user_id: str, agent_id: str) -> SessionRecord:
         with self._pair_lock(user_id, agent_id):
             session = self.get_or_create_session(user_id=user_id, agent_id=agent_id)
-            return self.store.discard_and_create(session.session_id)
+            return self.store.discard_shared(session.session_id)
 
     def session_stats(self, *, user_id: str, agent_id: str) -> SessionStats:
         session = self.get_or_create_session(user_id=user_id, agent_id=agent_id)
-        return self.store.stats(session.session_id)
+        return self.store.shared_stats(agent_id, session_id=session.session_id)
 
     def get_memories(self, *, user_id: str, agent_id: str) -> list[dict[str, Any]]:
         require_pair(user_id, agent_id)

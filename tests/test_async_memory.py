@@ -54,7 +54,7 @@ def test_real_background_write_does_not_block_next_chat(tmp_path):
         assert result.answer and result.active_session_id == receipt.new_session_id
         assert result.recall_status == 'unavailable'
         assert result.recalled == []
-        assert any(m['content'] == '上一段' for m in result.prompt_messages)
+        assert any(m['content'].split('\n', 1)[-1] == '上一段' for m in result.prompt_messages)
         assert store.get_job(receipt.job_id).status == 'running'
     finally:
         memory.release.set()

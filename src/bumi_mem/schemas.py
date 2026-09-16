@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +19,18 @@ class MessageRecord:
     source_session_id: str | None = None
     created_at: str = ""
     consolidated_at: str | None = None
+    user_id: str = ""
+    agent_id: str = ""
+
+    @staticmethod
+    def attributed_content(role: str, content: str, user_id: str, agent_id: str) -> str:
+        header = json.dumps({"user_id": user_id, "agent_id": agent_id,
+                             "speaker_role": role}, ensure_ascii=False)
+        return "[speaker " + header + "]\n" + content
+
+    def to_shared_chat_message(self) -> dict[str, str]:
+        return {"role": self.role, "content": self.attributed_content(
+            self.role, self.content, self.user_id, self.agent_id)}
 
     def to_chat_message(self) -> dict[str, str]:
         return {"role": self.role, "content": self.content}
