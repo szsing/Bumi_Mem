@@ -31,6 +31,22 @@ class BumiMemoryClient:
         result.raise_for_status()
         return result.json()
 
+    def agent_request(self, payload: dict) -> dict:
+        """Send prepare/complete/agent_event; persist payload unchanged before retry."""
+        if payload.get('operation') not in {'prepare', 'complete', 'agent_event', 'pending'}:
+            raise ValueError('expected an explicit Agent operation')
+        result = self._http.post('/v1/memory/context', json=payload)
+        result.raise_for_status()
+        return result.json()
+
+    def prepare_turn(self, *, client_turn_id: str, query: str, user_id: str | None = None,
+                     speaker: dict | None = None, occurred_at: str | None = None) -> dict:
+        return self.agent_request(_prepare_payload(client_turn_id, query, user_id, speaker, occurred_at))
+
+    def complete_turn(self, *, turn_id: str, status: str, reply: str = '',
+                      speech: dict | None = None, occurred_at: str | None = None) -> dict:
+        return self.agent_request(_complete_payload(turn_id, status, reply, speech, occurred_at))
+
     def close(self):
         self._http.close()
 
@@ -63,6 +79,22 @@ class AsyncBumiMemoryClient:
         result.raise_for_status()
         return result.json()
 
+    async def agent_request(self, payload: dict) -> dict:
+        """Never retry a 409 as a new operation or silently reassign a turn."""
+        if payload.get('operation') not in {'prepare', 'complete', 'agent_event', 'pending'}:
+            raise ValueError('expected an explicit Agent operation')
+        result = await self._http.post('/v1/memory/context', json=payload)
+        result.raise_for_status()
+        return result.json()
+
+    async def prepare_turn(self, *, client_turn_id: str, query: str, user_id: str | None = None,
+                           speaker: dict | None = None, occurred_at: str | None = None) -> dict:
+        return await self.agent_request(_prepare_payload(client_turn_id, query, user_id, speaker, occurred_at))
+
+    async def complete_turn(self, *, turn_id: str, status: str, reply: str = '',
+                            speech: dict | None = None, occurred_at: str | None = None) -> dict:
+        return await self.agent_request(_complete_payload(turn_id, status, reply, speech, occurred_at))
+
     async def close(self):
         await self._http.aclose()
 
@@ -71,6 +103,18 @@ class AsyncBumiMemoryClient:
 
     async def __aexit__(self, *args):
         await self.close()
+
+
+def _prepare_payload(client_turn_id, query, user_id, speaker, occurred_at):
+    body = {'operation': 'prepare', 'client_turn_id': client_turn_id, 'query': query}
+    body.update({k: v for k, v in {'user_id': user_id, 'speaker': speaker, 'occurred_at': occurred_at}.items() if v is not None})
+    return body
+
+
+def _complete_payload(turn_id, status, reply, speech, occurred_at):
+    body = {'operation': 'complete', 'turn_id': turn_id, 'status': status, 'reply': reply}
+    body.update({k: v for k, v in {'speech': speech, 'occurred_at': occurred_at}.items() if v is not None})
+    return body
 
 
 def main():

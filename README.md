@@ -2,9 +2,13 @@
 
 ## Agent 部门接入（单接口 HTTP 服务）
 
+**v0.4 已按实际 `bumi-agent`（Pipecat 1.8.0）增加显式协议。** 同一 URL 使用 `operation=prepare/complete/agent_event/pending`，通过明确 turn_id 提交结算输出，支持独立欢迎语和 stop/sleep 事件；`memory_context` 用于补充 Agent 自有工具历史，不能覆盖它。新 Agent 请先阅读 **[实际代码接入说明](docs/bumi_agent_integration/README.md)**。Agent 仓库本身尚未接线。
+
+下面的三字段请求保留为旧 exchange 兼容方式，不能与新协议混用同一待结束轮次。
+
 唯一业务接口 `POST /v1/memory/context`，接收 `user_id`、`previous_ai_reply`、`query`：先补存上一轮 agent 回复，再保存当前用户问题并返回完整 messages。第一轮回复为空；结束时 query=null 可补存最后回复。回答模型由对方调用，后台摘要和长期提取继续由我们负责。
 
-用户发言带 user_id；AI 发言只有 agent_id，不标为某个用户的发言。服务端固定 agent_id，保留共享 L1 与个人 L3 隔离。完整协议、重试规则、配置和部署见 **docs/agent_api/README.md**；旧双业务路由已移除。主 SQLite 升级为 v6，部署旧库前请备份。
+用户发言带 user_id；AI 发言只有 agent_id，不标为某个用户的发言。服务端固定 agent_id，保留共享 L1 与个人 L3 隔离。完整协议、重试规则、配置和部署见 **docs/agent_api/README.md**；旧双业务路由已移除。主 SQLite 升级为 v7，部署旧库前请备份。
 
 ## 当前短期 / 长期记忆边界
 
@@ -27,7 +31,7 @@
 - 之前的 typed 模块保留，但不作为本轮入口。
 
 
-Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型。v0.3 在持久化后台整理基础上增加共享引用、时间来源和已确认状态，当前实现：
+Bumi_Mem 是一个基于 Mem0 v2.0.20 的陪伴机器人分层记忆框架原型。v0.4 在共享引用、时间来源和已确认状态基础上增加显式 Agent 轮次协议，当前实现：
 
 - **L1 共享会话记忆**：SQLite 持久化，同 agent 共用最多 20 条有效消息、8,000 token；
 - **L2 会话摘要**：会话边界生成，仅用于存档、调试和审计；

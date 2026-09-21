@@ -1,3 +1,5 @@
+> v0.4 adds schema 7 and an explicit Agent turn/event protocol; the v0.3 memory semantics below remain. See `../bumi_agent_integration/README.md` for the actual Pipecat 1.8 Agent integration.
+
 # Companion memory contract (v0.3, SQLite schema 6)
 
 Implemented against the product decisions confirmed on 2026-09-21. This document describes the current main Bumi/Mem0 path, **not** automatic integration of the separate `typed` library.

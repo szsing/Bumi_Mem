@@ -34,9 +34,10 @@ from bumi_mem.shared_memory import SharedMemoryStoreMixin
 from bumi_mem.semantic_state import SemanticStateStoreMixin
 from bumi_mem.identity import is_guest
 from bumi_mem.event_time import message_time
+from bumi_mem.agent_store import AgentStoreMixin
 
 
-class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMixin, SemanticStateStoreMixin):
+class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMixin, SemanticStateStoreMixin, AgentStoreMixin):
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +61,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 6:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 7:
                 raise RuntimeError("Database schema is newer than this Bumi version; refusing to downgrade")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
@@ -195,7 +196,8 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
             if conn.execute('PRAGMA user_version').fetchone()[0] < 6:
                 conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
                 conn.execute("UPDATE context_requests SET response_json=NULL WHERE state!='revoked'")
-            conn.execute('PRAGMA user_version=6')
+            self.create_agent_tables(conn)
+            conn.execute('PRAGMA user_version=7')
 
     @staticmethod
     def _session(row: sqlite3.Row | None) -> SessionRecord | None:

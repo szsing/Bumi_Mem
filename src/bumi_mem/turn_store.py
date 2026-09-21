@@ -102,10 +102,12 @@ class TurnStoreMixin:
                                      max_messages=max_messages, max_l1_tokens=max_l1_tokens)
 
     def _finish_turn(self, conn, *, turn_id, agent_id, reply, status, token_count, settings,
-                     max_messages, max_l1_tokens, occurred_at=None):
+                     max_messages, max_l1_tokens, occurred_at=None, reply_metadata=None, notice_tokens=0):
         payload_data = {'status': status, 'reply': reply}
         if occurred_at is not None:
             payload_data['occurred_at'] = occurred_at
+        if reply_metadata is not None:
+            payload_data['speech'] = reply_metadata
         payload = json.dumps(payload_data, ensure_ascii=False, sort_keys=True)
         row = conn.execute('SELECT * FROM interaction_turns WHERE turn_id=? AND agent_id=?',
                            (turn_id, agent_id)).fetchone()
@@ -117,7 +119,7 @@ class TurnStoreMixin:
             return json.loads(row['completion_json'])
         if row['status'] not in ACTIVE or (row['protocol'] == 'direct' and row['expires_at'] <= time.time()):
             raise TurnConflict('turn_not_active')
-        if row['status'] == 'preparing' and status in ('completed', 'interrupted'):
+        if row['status'] == 'preparing' and (status in ('completed', 'interrupted') or reply):
             raise TurnConflict('prompt_not_ready')
         session = conn.execute('SELECT status FROM sessions WHERE session_id=?', (row['session_id'],)).fetchone()
         if session is None or session['status'] != 'active':
@@ -127,10 +129,17 @@ class TurnStoreMixin:
             conn.execute('UPDATE interaction_turns SET reply_message_id=? WHERE turn_id=?', (message.message_id, turn_id))
             scope = self._scope(conn, row['user_id'], agent_id)
             if (scope['generation'] != row['generation'] or
-                    row['context_epoch'] != self._context_epoch(conn, agent_id)):
+                    row['context_epoch'] != self._context_epoch(conn, agent_id) or
+                    (reply_metadata is not None and (not reply_metadata['alignment_covers_output'] or status != 'completed'))):
                 # Preserve spoken agent text in shared L1 after forget-all, but
                 # do not let a delayed answer resurrect the deleted user's L3.
                 conn.execute('UPDATE messages SET memory_excluded=1 WHERE message_id=?', (message.message_id,))
+        if reply_metadata is not None and not reply_metadata['alignment_covers_output']:
+            # An empty aligned prefix is NOT evidence that the robot was silent.
+            notice = self._append_message(conn, row['session_id'], role='system',
+                content=self.speech_notice(reply_metadata, turn_id=turn_id), token_count=notice_tokens,
+                context_only=True, occurred_at=occurred_at)
+            conn.execute('UPDATE messages SET memory_excluded=1 WHERE message_id=?', (notice.message_id,))
         # Release the turn within this same transaction, prior to shared rotation.
         conn.execute('UPDATE interaction_turns SET status=? WHERE turn_id=?', (status, turn_id))
         stats = conn.execute('SELECT COUNT(*) AS n,COALESCE(SUM(m.token_count),0) AS tokens '
@@ -168,6 +177,6 @@ class TurnStoreMixin:
     @staticmethod
     def _assert_agent_idle(conn, agent_id):
         if conn.execute("SELECT 1 FROM interaction_turns WHERE agent_id=? "
-                        "AND status IN ('preparing','awaiting_reply') AND (protocol='context' OR expires_at>?)",
+                        "AND status IN ('preparing','awaiting_reply') AND (protocol!='direct' OR expires_at>?)",
                         (agent_id, time.time())).fetchone():
             raise TurnConflict('agent_busy')
