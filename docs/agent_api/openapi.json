@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Bumi Agent Memory API",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "paths": {
     "/health/live": {
@@ -167,6 +167,30 @@
             ],
             "title": "Query",
             "description": "Current user query; null flushes previous output without a new turn"
+          },
+          "query_occurred_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query Occurred At"
+          },
+          "previous_reply_occurred_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Reply Occurred At"
           }
         },
         "additionalProperties": false,
@@ -179,6 +203,11 @@
       },
       "ContextResponse": {
         "properties": {
+          "core_write": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Core Write"
+          },
           "request_id": {
             "type": "string",
             "title": "Request Id"

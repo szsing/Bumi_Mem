@@ -4,6 +4,31 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+TEMPORAL_EXTRACTION_INSTRUCTIONS = """
+Time provenance rules (also override any backend/global observation date):
+- Ignore the global observation date, current date, and consolidation date for
+  source facts. Use each message's original observed_at offset timestamp and
+  source_message_id in its [source] header. Missing anchors remain unknown.
+- The body normalizes simple yesterday/today/tomorrow (昨天/今天/明天) using that
+  message's local calendar day; original_content retains the original wording.
+  These are two views of one message, not two observations or new facts.
+- For supported simple day references, store the absolute date together with
+  original wording and source anchor, not a bare relative day.
+- Preserve source anchors and original relative wording for qualifying memories.
+  Recently/最近 is vague: retain its observed_at anchor, invent no date or deadline.
+- Normalization is not evidence that an event happened: preserve questions,
+  quotations, hypothetical language, plans and speaker attribution. Quoted day
+  words may refer to the quoted speaker's unknown time; do not assert a normalized
+  quoted date without independent support. Never convert assistant facts to user
+  facts. Existing question/quote filtering still applies.
+- Only state an event date when the qualifying source explicitly supports it.
+  Do not assign an event_date to every memory or treat observed_at, stored
+  created_at, or updated_at as an event time. updated_at is a record update time.
+- Chunk source_message_ids/source_messages describe extraction inputs, not proof
+  that every resulting memory is supported by every message in the chunk.
+- Synthetic shared L3 references are recall context, never new extraction evidence.
+""".strip()
+
 MEMORY_EXTRACTION_INSTRUCTIONS = """
 Only store durable memories explicitly grounded in this completed session.
 Use these prefixes in every stored memory: [用户事实], [用户偏好], [用户边界],
@@ -19,14 +44,17 @@ Rules:
   weather, one-off clothing, generic assistant knowledge, recommendations, routine
   reassurance, or unsupported inference.
 - Do not convert assistant suggestions into user facts.
-- Do not store ordinary assistant replies.
+- Do not store ordinary assistant replies. Ordinary assistant turns are context,
+  never independent evidence of user facts, even when they restate or normalize
+  a user claim. Only the qualifying explicit promises and acknowledged shared
+  events described above may support assistant/shared memories.
 - This snapshot contains only the target user's own turns and the assistant's
   replies to them, not the full shared room conversation. A quote, question about
   another speaker, or an assistant retelling another user's facts is not a fact
   about the target user. Never transfer those facts to the target user.
 - Preserve the user's language and distinguish different people and entities.
 - If nothing qualifies, create no memory.
-""".strip()
+""".strip() + "\n\n" + TEMPORAL_EXTRACTION_INSTRUCTIONS
 
 SUMMARY_SYSTEM_PROMPT = """
 You create a concise L2 session summary for a companion memory system. Summarize
@@ -65,7 +93,25 @@ def summary_messages(messages: Sequence[dict[str, str]]) -> list[dict[str, str]]
 
 
 def memory_text(item: dict[str, Any]) -> str:
-    return str(item.get("memory", item.get("text", item.get("data", "")))).strip()
+    text = str(item.get("memory", item.get("text", item.get("data", "")))).strip()
+    if not text:
+        return text
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    times = []
+    for key, label in (("observed_at", "source observed_at"),
+                       ("event_date", "event_date"), ("event_at", "event_at"),
+                       ("updated_at", "record updated_at (not event time)")):
+        value = item.get(key) or metadata.get(key)
+        if value:
+            times.append(f"{label}={value}")
+    sources = metadata.get("source_messages")
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict) and source.get("observed_at"):
+                times.append(f"input source {source.get('source_message_id', 'unknown')} "
+                             f"observed_at={source['observed_at']}")
+    return text + (" [" + "; ".join(times) + "]" if times else "")
 
 
 def chat_system_prompt(recalled: Sequence[dict[str, Any]]) -> str:

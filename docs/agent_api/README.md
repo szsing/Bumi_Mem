@@ -1,8 +1,10 @@
+> v0.3 / schema 6：门控后的 L3 引用进入共享 L1，新增陌生身份、时间来源与 core_write。详细行为以 [陪伴记忆契约](../companion_memory/README.md) 为准。
+
 # 单接口记忆服务：Agent 接入与部署
 
 对外仅保留一个业务接口：`POST /v1/memory/context`。旧 `/v1/memory/prompt`、`/v1/memory/reply` 路由已移除。健康检查、在线文档不是额外的对话业务接口。
 
-## 1. 请求：三个业务字段
+## 1. 请求：三个必需业务含义与两个可选时间字段
 
 ```http
 POST /v1/memory/context
@@ -21,7 +23,7 @@ Content-Type: application/json
 - previous_ai_reply：上一轮 agent 实际输出的回答。第一轮为 null 或空字符串。
 - query：本轮用户问题；传 null 表示只补存最后一条 AI 回复，不开始新问题。
 - agent_id：固定在服务端 BUMI_AGENT_ID，不要求每次传，也不允许请求体覆盖。
-- Idempotency-Key：可选请求头，但可靠接入应使用稳定请求 ID。网络重试必须保持相同 key 和三个字段。不要用 query 文本作 key，也不要为一次重试生成新 key。
+- Idempotency-Key：可选请求头，但可靠接入应使用稳定请求 ID。网络重试必须保持相同 key 和完整请求字段（包括可选时间）。不要用 query 文本作 key，也不要为一次重试生成新 key。
 
 服务凭证只给受信任 Agent 后端，不是终端用户认证；我们不提供声纹验证。一个 agent_id 表示一个共享现场。不同独立测试现场使用不同 agent_id 和不同数据目录。
 
@@ -50,6 +52,13 @@ A 的 user_id 已经在上次请求保存，本次不重复写 A 的问题，也
 
 内部 session_id/轮次关联仍保留，用来判断后台整理的上下文来源。它不代表 AI 的说话人是某个用户。例如 A 说喜欢绿茶、B 说喜欢咖啡，仍分别提取到 A/B 的 L3；不会因为当前请求是 B 就把整段现场内容写到 B。
 
+### 可选时间与陌生身份
+
+- `query_occurred_at` / `previous_reply_occurred_at`：带偏移的 ISO 8601 原始发言时间；缺省使用服务器接收时间，不声称知道真实播放时刻。不要在重试时生成新时间。
+- `user_id="__guest__"`：陌生/未确认身份，只参与共享 L1，不调用个人 L3，也不生成该类别的长期记忆。
+- `core_write.status`：`persisted` 才可确认对应变更长期保存；`not_requested`/`failed` 不能说“已长期记住”。旧通用 L3 的 queued 回执不变。
+- 409 `shared_memory_context_changed`：缓存已被删除/更正撤销，禁止继续使用旧 Prompt。
+
 ## 3. 响应示例
 
 B 的请求：
@@ -70,7 +79,7 @@ B 的请求：
   "user_id": "user_B",
   "agent_id": "agent_001",
   "messages": [
-    {"role":"system","content":"记忆使用规则、当前身份 user_B、仅 user_B 的长期记忆……"},
+    {"role":"system","content":"记忆使用规则、当前身份 user_B、当前 user_B 的核心状态、带所有者标签的共享 L3 引用……"},
     {"role":"user","content":"[speaker {\"agent_id\": \"agent_001\", \"speaker_role\": \"user\", \"user_id\": \"user_A\"}]\n周末我想去公园。"},
     {"role":"assistant","content":"[speaker {\"agent_id\": \"agent_001\", \"speaker_role\": \"assistant\"}]\n去公园不错，可以提前看看天气。"},
     {"role":"user","content":"[speaker {\"agent_id\": \"agent_001\", \"speaker_role\": \"user\", \"user_id\": \"user_B\"}]\n你刚刚说什么？"}
@@ -82,7 +91,7 @@ B 的请求：
 }
 ```
 
-messages 已经包含当前 query，不要再次追加或叠加一套重复聊天历史。记忆 system 不包含 CLI 的 Bumi 人设；对方保留自己的人设、工具规则和正在执行的工具上下文。每轮替换旧的个人 L3 块，包括本轮 L3 为空的情况，不能残留上一用户的私有记忆。
+messages 已经包含当前 query，不要再次追加或叠加一套重复聊天历史。记忆 system 不包含 CLI 的 Bumi 人设；对方保留自己的人设、工具规则和正在执行的工具上下文。每轮替换服务返回的记忆上下文，不要自行保留已过期的引用。当前用户核心块按用户隔离；已发布的 L3 引用是共享现场资料，可保留其他所有者的明确标签。
 
 - recall_status：ok/unavailable/deleting/disabled；只补存时为 not_requested。
 - consolidation_status：not_triggered/queued/succeeded；是接收时的整理提交状态，不是后台完成通知。queued 不等于 L3 已保存成功。
@@ -123,9 +132,9 @@ messages 已经包含当前 query，不要再次追加或叠加一套重复聊�
 
 共享 L1 默认合计 20 条有效消息（约 10 轮），轮转后最多保留 4 条 carry-over（约 2 轮）。在补齐上一轮 AI 回复后先检查边界，再保存当前 query。后台按个人原始发言及对应对话片段分开提取，不重复整理 carry-over。
 
-AI 已说出的内容属于共享现场：如果它说出了 A 的私有信息，B 也可以在 L1 看到；原始 L3 检索数组不进入 shared_l1。不能同时承诺共享现场回答和这些回答的跨用户保密。
+AI 已说出的内容属于共享现场：如果它说出了 A 的私有信息，B 也可以在 L1 看到；通过所属用户门控的 L3 结果存为绑定当前轮的 shared_memory_refs，并随共享 L1 一起呈现。不能同时承诺共享现场回答和这些回答的跨用户保密。
 
-forget-all 仍只清理个人 L3，并撤销该用户缓存的个人 Prompt。对于单接口，等待补存的 AI 仍可写入公共短期记录，但删除前轮次的迟到 AI 消息标为不可再次提取，避免复活已删除的长期记忆。该行为不新增对外删除接口，管理操作继续通过内部接口进行。
+forget-all 清理个人 L3 和新增的核心/状态记忆，撤销该用户发布的引用，并使同 agent 下可能含该引用的其他用户缓存 Prompt 失效。对于单接口，等待补存的 AI 仍可写入公共短期记录，但删除前轮次的迟到 AI 消息标为不可再次提取，避免复活已删除的长期记忆。该行为不新增对外删除接口，管理操作继续通过内部接口进行。
 
 ## 7. 配置及服务器启动
 
@@ -221,9 +230,9 @@ query 最多 16000 字符；previous_ai_reply 最多 64000 字符；身份/key �
 
 ## 10. 主库升级与验证范围
 
-主库升级为 v5：新增 context_requests 幂等事务记录、内部轮次 protocol 字段，并将非用户消息的 user_id 清为空字符串；原 session 关联、L3 归属与历史任务快照不改写。v2/v3/v4 库均通过已有增量迁移路径升级。旧版本的缓存 Prompt 在迁移时失效，避免返回旧 AI 用户标记。
+主库升级为 v6：在原 v5 的 context_requests、protocol 和机器人身份迁移基础上，新增共享记忆引用、来源撤回、核心/状态版本、上下文 epoch，以及原消息关联和可选时间字段。原会话、发言、L3 所有者与任务快照不改写。v2/v3/v4/v5 通过增量迁移升级；旧缓存 Prompt 失效后按新契约重建。
 
-升级前停服务并备份完整 SQLite 数据（注意 WAL），回滚应恢复备份，不能用旧代码直接打开 v5。对话和幂等审计记录暂未自动清理；正在使用的 Prompt 缓存含个人记忆，需要保护数据库并制定保留期限。
+升级前停服务并备份完整 SQLite 数据（注意 WAL），回滚应恢复备份，不能用旧代码直接打开 v6。对话和幂等审计记录暂未自动清理；正在使用的 Prompt 缓存含个人记忆，需要保护数据库并制定保留期限。
 
 本地测试用真实 SQLite、FastAPI 测试客户端和模拟模型后端；不等于真实 GPU、模型准确率、Pipecat 语音或断电验收。运行：
 

@@ -35,7 +35,7 @@ def test_single_endpoint_first_query_does_not_invent_ai_or_call_answer_model(har
     assert result.status_code == 200, result.text
     body = result.json()
     assert set(body) == {'request_id','user_id','agent_id','messages','has_prompt',
-                         'previous_reply_saved','recall_status','consolidation_status'}
+                         'previous_reply_saved','recall_status','consolidation_status','core_write'}
     assert body['has_prompt'] and not body['previous_reply_saved']
     assert body['consolidation_status'] == 'not_triggered'
     assert 'A_PRIVATE' in body['messages'][0]['content']
@@ -63,12 +63,16 @@ def test_A_then_B_agent_reply_has_only_agent_identity_and_B_has_private_L3(harne
     assert [(m.user_id,m.agent_id,m.content) for m in store.list_shared_messages('bot')] == [
         ('A','bot','A_PUBLIC'),('','bot','AGENT_PUBLIC'),('B','bot','你刚刚说什么？')]
     messages = result['messages']
-    assert 'B_PRIVATE' in messages[0]['content'] and 'A_PRIVATE' not in str(messages)
+    direct_context, shared_context = messages[0]['content'].split('[共享 L3 引用 / shared memory references]\n', 1)
+    assert 'A_PRIVATE' not in direct_context
+    refs = json.loads(shared_context.split('\n', 1)[0])
+    assert any(r['owner_user_id'] == 'A' and r['memory'] == 'A_PRIVATE' for r in refs)
+    assert any(r['owner_user_id'] == 'B' and r['memory'] == 'B_PRIVATE' for r in refs)
     assert 'A_PUBLIC' in messages[1]['content']
     header = messages[2]['content'].split('\n',1)[0]
     assert '"agent_id": "bot"' in header and '"speaker_role": "assistant"' in header
     assert 'user_id' not in header and 'reply_to' not in header
-    assert memory.search_calls[-1]['user_id'] == 'B'
+    assert [call['user_id'] for call in memory.search_calls] == ['A', 'B']
 
 
 def test_exchange_retry_never_duplicates_previous_reply_or_current_query(harness):
@@ -145,7 +149,7 @@ def test_rotation_happens_after_previous_reply_before_current_query(harness):
     assert len(summary.calls) == len(memory.add_calls) == 2
     assert [call['user_id'] for call in memory.add_calls] == ['A','B']
     for call in memory.add_calls:
-        assert [m['content'] for m in call['messages']] == [call['user_id']+'_FACT',call['user_id']+'_ANSWER']
+        assert [m['content'].split('\n', 1)[1] for m in call['messages']] == [call['user_id']+'_FACT',call['user_id']+'_ANSWER']
     assert not store.list_jobs(user_id='C',agent_id='bot')
 
 
@@ -268,7 +272,10 @@ def test_openapi_contains_one_business_endpoint_and_health_ready(harness):
     schema=client.get('/openapi.json').json()
     assert [path for path in schema['paths'] if path.startswith('/v1/')] == ['/v1/memory/context']
     properties=schema['components']['schemas']['ContextRequest']['properties']
-    assert set(properties) == {'user_id','previous_ai_reply','query'}
+    assert set(properties) == {'user_id','previous_ai_reply','query',
+                               'query_occurred_at','previous_reply_occurred_at'}
+    required = schema['components']['schemas']['ContextRequest'].get('required', [])
+    assert 'query_occurred_at' not in required and 'previous_reply_occurred_at' not in required
     assert KEY not in json.dumps(schema)
     assert client.get('/health/live').status_code == 200
     assert client.get('/health/ready').json() == {'status':'ready','warmed_up':True}
@@ -291,7 +298,7 @@ def test_migrate_v4_speaker_identity_without_changing_extraction_owner(tmp_path)
     drain(new)
     assert memory.add_calls[0]['user_id'] == 'A'
     with sqlite3.connect(store.path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 6
 
 
 def test_sync_and_async_clients_only_use_context_route():

@@ -5,6 +5,21 @@ from uuid import uuid4
 from .schemas import IdentityRequiredError
 
 
+GUEST_USER_ID = "__guest__"
+
+
+def is_guest(user_id: str) -> bool:
+    """One reserved unknown-speaker category, never a persistent person."""
+    return user_id == GUEST_USER_ID
+
+
+def require_person(user_id: str) -> str:
+    require_id(user_id)
+    if is_guest(user_id):
+        raise IdentityRequiredError('guest identity has no personal long-term memory')
+    return user_id
+
+
 def require_id(value, label='user_id'):
     if not isinstance(value, str) or not value or value != value.strip() or len(value) > 128 or not value.isprintable():
         raise IdentityRequiredError(f'{label} must be an explicit nonempty stable ID')

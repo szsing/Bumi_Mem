@@ -162,7 +162,8 @@ def test_crash_during_write_requires_explicit_replay(tmp_path):
     chat_turn(engine)
     receipt = submit(engine)
     job = store.claim_job('dead-process', lease_seconds=30)
-    store.ensure_chunks(job.job_id, job.owner, [[{'role':'user','content':'maybe already written'}]])
+    source = json.loads(job.payload_json)['messages'][0]
+    store.ensure_chunks(job.job_id, job.owner, [[{'role': source['role'], 'content': source['content']}]])
     chunk = store.chunks(job.job_id)[0]
     store.set_chunk(job.job_id, job.owner, chunk['chunk_id'], status='writing')
     with store._connect(write=True) as conn:
@@ -176,6 +177,11 @@ def test_crash_during_write_requires_explicit_replay(tmp_path):
     engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
     engine.worker.run_once()
     assert store.get_job(job.job_id).status == 'succeeded'
+    assert len(memory.add_calls) == 1
+    replayed = memory.add_calls[0]['messages'][0]
+    assert replayed['source_message_id'] == source['message_id']
+    assert replayed['observed_at'] == source['created_at']
+    assert replayed['content'].split('\n', 1)[1] == source['content']
 
 
 def test_unknown_write_exception_is_not_blindly_retried(tmp_path):

@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from bumi_mem.temporal import normalize_relative_dates
+
 
 @dataclass(slots=True, frozen=True)
 class MessageRecord:
@@ -23,16 +25,40 @@ class MessageRecord:
     agent_id: str = ""
 
     @staticmethod
-    def attributed_content(role: str, content: str, user_id: str, agent_id: str) -> str:
+    def attributed_content(role: str, content: str, user_id: str, agent_id: str,
+                           created_at: str | None = None) -> str:
         speaker = {"agent_id": agent_id, "speaker_role": role}
+        if created_at is not None:
+            speaker["created_at"] = created_at
         if role == 'user':
+            # Local import: identity's validation errors are defined in this module.
+            from bumi_mem.identity import is_guest
+
             speaker['user_id'] = user_id
+            if is_guest(user_id):
+                speaker['identity_status'] = 'unconfirmed'
         header = json.dumps(speaker, ensure_ascii=False)
         return "[speaker " + header + "]\n" + content
 
     def to_shared_chat_message(self) -> dict[str, str]:
         return {"role": self.role, "content": self.attributed_content(
-            self.role, self.content, self.user_id, self.agent_id)}
+            self.role, self.content, self.user_id, self.agent_id, self.created_at)}
+
+    def to_extraction_message(self) -> dict[str, str]:
+        """Render a derived view without changing the API's original message."""
+        normalized = normalize_relative_dates(self.content, self.created_at)
+        source = {"source_message_id": self.message_id, "observed_at": self.created_at,
+                  "speaker_role": self.role, "agent_id": self.agent_id,
+                  "original_content": normalized.original_text}
+        if self.role == "user":
+            from bumi_mem.identity import is_guest
+
+            source["user_id"] = self.user_id
+            if is_guest(self.user_id):
+                source["identity_status"] = "unconfirmed"
+        return {"role": self.role,
+                "content": "[source " + json.dumps(source, ensure_ascii=False) + "]\n" + normalized.text,
+                "observed_at": self.created_at, "source_message_id": self.message_id}
 
     def to_chat_message(self) -> dict[str, str]:
         return {"role": self.role, "content": self.content}

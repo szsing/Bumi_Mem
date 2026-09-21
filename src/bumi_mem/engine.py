@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -13,7 +14,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from bumi_mem.identity import require_pair, require_id
+from bumi_mem.identity import require_pair, require_id, require_person, is_guest
+from bumi_mem.semantic_state import memory_conflicts
+from bumi_mem.event_time import message_time
+from bumi_mem.temporal import normalize_relative_dates
 from bumi_mem.turn_store import TurnConflict
 from bumi_mem.schemas import MemoryWriteReceipt, SavedMemory, MemoryWriteUncertainError, SessionBlockedError, MemoryScopeError
 from bumi_mem.consolidator import SessionConsolidator
@@ -37,6 +41,7 @@ class BumiMemoryConfig:
     search_threshold: float = 0.1
     max_answer_tokens: int = 512
     memory_read_timeout: float = 0.2
+    explicit_recall_timeout: float = 1.0
     memory_warmup_enabled: bool = True
     memory_warmup_timeout: float = 120.0
     memory_warmup_query: str = "记忆系统预热"
@@ -140,33 +145,51 @@ class BumiMemory:
         self._owned_session(session_id, user_id, agent_id)
         return self.store.append_message(session_id, role='user', content=text,
                                          token_count=self.chat_token_counter.count_text(
-                                             MessageRecord.attributed_content('user', text, user_id, agent_id)) + 4)
+                                             MessageRecord.attributed_content('user', text, user_id, agent_id, message_time())) + 4)
 
     def record_assistant_message(self, session_id: str, text: str, *, user_id: str, agent_id: str) -> MessageRecord:
         self._owned_session(session_id, user_id, agent_id)
         return self.store.append_message(session_id, role='assistant', content=text,
                                          token_count=self.chat_token_counter.count_text(
-                                             MessageRecord.attributed_content('assistant', text, user_id, agent_id)) + 4)
+                                             MessageRecord.attributed_content('assistant', text, user_id, agent_id, message_time())) + 4)
 
-    def search_long_term(self, *, user_id: str, agent_id: str, query: str) -> list[dict[str, Any]]:
+    def search_long_term(self, *, user_id: str, agent_id: str, query: str, read_timeout: float | None = None) -> list[dict[str, Any]]:
         require_pair(user_id, agent_id)
+        if is_guest(user_id):
+            return []
         before = self.store.read_scope(user_id, agent_id)
         if before[1]:
             return []
-        rows = self.long_term.search(user_id=user_id, agent_id=agent_id, query=query,
-                                     top_k=self.config.top_k, threshold=self.config.search_threshold)
+        search_args = dict(user_id=user_id, agent_id=agent_id, query=query,
+                           top_k=self.config.top_k, threshold=self.config.search_threshold)
+        rows = (self.long_term.search(**search_args) if read_timeout is None else
+                self.long_term.search_with_timeout(timeout=read_timeout, **search_args))
         # Deletion may have been requested while the read was executing. Drop
         # stale rows before inspecting them so they can never enter user context.
         if self.store.read_scope(user_id, agent_id) != before:
             return []
-        return self._scoped_results(rows, user_id, agent_id)
+        rows = self._scoped_results(rows, user_id, agent_id)
+        rows = self.store.filter_memory_rows(rows, user_id=user_id, agent_id=agent_id)
+        current = self.store.semantic_context(user_id=user_id, agent_id=agent_id)
+        historical = bool(re.search(r'以前|过去|曾经|当时|去年|原来|\bpreviously\b|\bused to\b|\bin the past\b', query, re.I))
+        result = []
+        for row in rows:
+            conflict = memory_conflicts(str(row.get('memory', '')), current)
+            if conflict and not historical:
+                continue
+            result.append(dict(row, fact_status='historical_superseded') if conflict else row)
+        return result
 
     def build_context(self, *, session_id: str, recalled: list[dict[str, Any]], user_id: str, agent_id: str,
-                      memory_only: bool = False) -> list[dict[str, str]]:
+                      memory_only: bool = False, core_rows=None, core_write=None, history_rows=None) -> list[dict[str, str]]:
         self._owned_session(session_id, user_id, agent_id)
         self._scoped_results(recalled, user_id, agent_id)
-        return self.context_builder.build(recalled=recalled, l1_messages=self.store.list_shared_messages(agent_id),
-                                          current_user_id=user_id, current_agent_id=agent_id, memory_only=memory_only)
+        l1 = self.store.list_shared_messages(agent_id)
+        selected = self.context_builder.select_l1(l1)
+        refs = self.store.shared_memory_refs(agent_id, selected_message_ids=[m.message_id for m in selected])
+        return self.context_builder.build(recalled=recalled, l1_messages=l1,
+                                          current_user_id=user_id, current_agent_id=agent_id, memory_only=memory_only,
+                                          shared_refs=refs, core_rows=core_rows or [], core_write=core_write, history_rows=history_rows or [])
 
     def prepare_prompt(self, *, user_id: str, agent_id: str, query: str,
                        idempotency_key: str | None = None, ttl_seconds: float = 300.0,
@@ -186,7 +209,7 @@ class BumiMemory:
             turn = self.store.reserve_turn(
                 user_id=user_id, agent_id=agent_id, query=query,
                 token_count=self.chat_token_counter.count_text(
-                    MessageRecord.attributed_content('user', query, user_id, agent_id)) + 4,
+                    MessageRecord.attributed_content('user', query, user_id, agent_id, message_time())) + 4,
                 idempotency_key=idempotency_key, ttl_seconds=ttl_seconds,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
@@ -198,25 +221,72 @@ class BumiMemory:
         if self.store.read_scope(user_id, agent_id)[0] != turn['generation']:
             raise TurnConflict('memory_scope_changed')
         if turn['prompt_json']:
+            if turn['context_epoch'] != self.store.context_epoch(agent_id):
+                raise TurnConflict('shared_memory_context_changed')
             return json.loads(turn['prompt_json'])
+        core_write = {'status': 'not_requested'}
+        core_rows = []
+        if not is_guest(user_id):
+            try:
+                source = next((m for m in self.store.list_messages(turn['session_id'])
+                               if m.message_id == turn['source_message_id']), None)
+                if source is None:
+                    raise RuntimeError('original turn evidence is missing')
+                core_write = self.store.apply_semantic_turn(
+                    user_id=user_id, agent_id=agent_id, source_message_id=source.message_id,
+                    text=source.content, observed_at=source.created_at, generation=turn['generation'])
+                core_rows = self.store.semantic_context(user_id=user_id, agent_id=agent_id)
+            except Exception as exc:
+                logger.warning('semantic memory unavailable: %s', type(exc).__name__)
+                core_write = {'status': 'failed', 'reason': 'persistence_not_confirmed'}
+                # A rejected new key must not erase unrelated established boundaries.
+                try:
+                    core_rows = self.store.semantic_context(user_id=user_id, agent_id=agent_id)
+                except Exception:
+                    core_rows = []
+        epoch = self.store.context_epoch(agent_id)
+        if not is_guest(user_id):
+            try:
+                core_rows = self.store.semantic_context(user_id, agent_id)
+            except Exception:
+                core_rows = []
+                core_write = {'status': 'failed', 'reason': 'core_read_unavailable'}
+        history_rows = []
+        if not is_guest(user_id) and re.search(r'以前|过去|曾经|当时|原来|\bpreviously\b|\bused to\b', query, re.I):
+            try:
+                history_rows = self.store.semantic_history(user_id, agent_id)
+            except Exception:
+                logger.warning('semantic history unavailable')
         recalled: list[dict[str, Any]] = []
         recall_status = 'disabled'
-        if recall_enabled:
+        if recall_enabled and not is_guest(user_id):
             if self.store.reads_blocked(user_id, agent_id):
                 recall_status = 'deleting'
             else:
                 try:
-                    recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=query)
+                    explicit_recall = bool(re.search(r'还记得|记不记得|回忆|上次.{0,20}(说|聊|提)|\bremember\b|\blast time\b', query, re.I))
+                    recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=query,
+                        read_timeout=self.config.explicit_recall_timeout if explicit_recall else None)
                     recall_status = 'ok'
                 except Exception as exc:
                     logger.debug('L3 unavailable: %s', type(exc).__name__)
                     recall_status = 'unavailable'
-        messages = self.build_context(session_id=turn['session_id'], recalled=recalled,
-                                      user_id=user_id, agent_id=agent_id, memory_only=memory_only)
-        return self.store.save_turn_prompt(turn['turn_id'], messages=messages, recall_status=recall_status, recalled=recalled)
+        if recalled:
+            self.store.attach_memory_refs(user_id=user_id, agent_id=agent_id,
+                                          anchor_message_id=turn['source_message_id'], rows=recalled,
+                                          generation=turn['generation'],
+                                          visible_message_ids={m.message_id for m in self.context_builder.select_l1(
+                                              self.store.list_shared_messages(agent_id))})
+        # Successful recall is now represented by owner-labelled shared references.
+        messages = self.build_context(session_id=turn['session_id'], recalled=[],
+                                      user_id=user_id, agent_id=agent_id, memory_only=memory_only,
+                                      core_rows=core_rows, core_write=core_write, history_rows=history_rows)
+        return self.store.save_turn_prompt(turn['turn_id'], messages=messages, recall_status=recall_status,
+                                           recalled=recalled, core_write=core_write, expected_epoch=epoch)
 
     def process_context(self, *, user_id: str, agent_id: str, previous_ai_reply: str | None,
-                        query: str | None, idempotency_key: str | None = None) -> dict[str, Any]:
+                        query: str | None, idempotency_key: str | None = None,
+                        query_occurred_at: str | None = None, previous_reply_occurred_at: str | None = None) -> dict[str, Any]:
         """Single external call: append previous agent speech, then prepare current context."""
         if self._closed:
             raise RuntimeError('memory engine is closed')
@@ -229,25 +299,39 @@ class BumiMemory:
             require_id(idempotency_key, 'Idempotency-Key')
         query = query.strip() if query is not None else None
         previous_ai_reply = (previous_ai_reply or '').strip()
+        query_occurred_at = message_time(query_occurred_at) if query_occurred_at is not None else None
+        previous_reply_occurred_at = message_time(previous_reply_occurred_at) if previous_reply_occurred_at is not None else None
+        if query is None and query_occurred_at is not None:
+            raise ValueError('query timestamp requires a query')
+        if not previous_ai_reply and previous_reply_occurred_at is not None:
+            raise ValueError('reply timestamp requires a nonempty reply')
         with self._pair_lock(user_id, agent_id):
             request = self.store.begin_context_request(
                 user_id=user_id, agent_id=agent_id, query=query, previous_ai_reply=previous_ai_reply,
+                query_occurred_at=query_occurred_at, previous_reply_occurred_at=previous_reply_occurred_at,
                 idempotency_key=idempotency_key,
                 query_tokens=self.chat_token_counter.count_text(
-                    MessageRecord.attributed_content('user', query or '', user_id, agent_id)) + 4,
+                    MessageRecord.attributed_content('user', query or '', user_id, agent_id, query_occurred_at or message_time())) + 4,
                 reply_tokens=self.chat_token_counter.count_text(
-                    MessageRecord.attributed_content('assistant', previous_ai_reply, '', agent_id)) + 4,
+                    MessageRecord.attributed_content('assistant', previous_ai_reply, '', agent_id, previous_reply_occurred_at or message_time())) + 4,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
             self.worker.wake()
             if request['response_json']:
                 return json.loads(request['response_json'])
+            if request['previous_turn_id']:
+                self._record_spoken_promise(request['previous_turn_id'], agent_id)
             messages, recall_status = [], 'not_requested'
+            core_write = {'status': 'not_requested'}
+            epoch = self.store.context_epoch(agent_id)
             if request['turn_id']:
                 turn = self.store.get_turn(request['turn_id'], agent_id)
                 prepared = self._prompt_for_turn(turn)
                 messages, recall_status = prepared['messages'], prepared['recall_status']
-            return self.store.save_context_response(request['request_id'], messages=messages, recall_status=recall_status)
+                core_write = prepared['core_write']
+                epoch = self.store.get_turn(request['turn_id'], agent_id)['context_epoch']
+            return self.store.save_context_response(request['request_id'], messages=messages, recall_status=recall_status,
+                                                     core_write=core_write, expected_epoch=epoch)
 
 
     def record_reply(self, *, turn_id: str, agent_id: str, reply: str | None = None,
@@ -271,10 +355,11 @@ class BumiMemory:
             result = self.store.finish_turn(
                 turn_id=turn_id, agent_id=agent_id, reply=reply, status=status,
                 token_count=self.chat_token_counter.count_text(
-                    MessageRecord.attributed_content('assistant', reply, turn['user_id'], agent_id)) + 4,
+                    MessageRecord.attributed_content('assistant', reply, turn['user_id'], agent_id, message_time())) + 4,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
             self.worker.wake()
+            self._record_spoken_promise(turn['turn_id'], agent_id)
             return result
 
     def chat(self, *, user_id: str, agent_id: str, text: str, recall_enabled: bool = True,
@@ -323,6 +408,7 @@ class BumiMemory:
         return self.store.shared_stats(agent_id, session_id=session.session_id)
 
     def get_memories(self, *, user_id: str, agent_id: str) -> list[dict[str, Any]]:
+        require_person(user_id)
         require_pair(user_id, agent_id)
         before = self.store.read_scope(user_id, agent_id)
         if before[1]:
@@ -330,9 +416,10 @@ class BumiMemory:
         rows = self.long_term.get_all(user_id=user_id, agent_id=agent_id)
         if self.store.read_scope(user_id, agent_id) != before:
             return []
-        return self._scoped_results(rows, user_id, agent_id)
+        return self.store.filter_memory_rows(self._scoped_results(rows, user_id, agent_id), user_id=user_id, agent_id=agent_id)
 
     def forget_all(self, *, user_id: str, agent_id: str) -> MemoryJob:
+        require_person(user_id)
         with self._pair_lock(user_id, agent_id):
             job = self.store.request_forget(user_id=user_id, agent_id=agent_id,
                                            max_attempts=self.consolidator.config.max_attempts)
@@ -340,11 +427,13 @@ class BumiMemory:
             return job
 
     def memory_jobs(self, *, user_id: str, agent_id: str) -> list[MemoryJob]:
+        require_person(user_id)
         require_pair(user_id, agent_id)
         return self.store.list_jobs(user_id=user_id, agent_id=agent_id)
 
     def retry_memory_job(self, job_id: str, *, user_id: str, agent_id: str,
                          allow_replay: bool = False) -> MemoryJob:
+        require_person(user_id)
         require_pair(user_id, agent_id)
         job = self.store.retry_job(job_id, user_id=user_id, agent_id=agent_id,
                                   max_attempts=self.consolidator.config.max_attempts, allow_replay=allow_replay)
@@ -352,20 +441,25 @@ class BumiMemory:
         return job
 
 
-    def remember(self, *, user_id: str, agent_id: str, contents: list[str]) -> MemoryWriteReceipt:
+    def remember(self, *, user_id: str, agent_id: str, contents: list[str], observed_at: str | None = None) -> MemoryWriteReceipt:
         """Confirm explicitly supplied long-term records only after scoped read-back.
 
         Ordinary queued consolidation remains pending until that job completes.
         This method does not use an LLM or change retrieval/model settings.
         """
+        require_person(user_id)
         if isinstance(contents, (str, bytes)) or not contents or any(not isinstance(x, str) or not x.strip() for x in contents):
             raise ValueError('contents must contain nonempty memory strings')
+        observed_at = message_time(observed_at)
+        original_contents = list(contents)
+        contents = [normalize_relative_dates(x.strip(), observed_at).text for x in contents]
         with self._pair_lock(user_id, agent_id):
             before = self.store.read_scope(user_id, agent_id)
             if before[1]:
                 raise SessionBlockedError('deletion is pending; no new memory confirmation')
             rows = self.long_term.remember(user_id=user_id, agent_id=agent_id, contents=contents,
-                                          metadata={'source':'explicit_memory','write_batch_id':uuid4().hex,'memory_generation':before[0]})
+                                          metadata={'source':'explicit_memory','write_batch_id':uuid4().hex,'memory_generation':before[0],
+                                                    'observed_at': observed_at, 'original_contents': original_contents})
             if self.store.read_scope(user_id, agent_id) != before or len(rows) != len(contents):
                 raise MemoryWriteUncertainError('scope or write state changed before confirmation')
             if any(x.get('user_id') != user_id or x.get('agent_id') != agent_id for x in rows):
@@ -376,6 +470,7 @@ class BumiMemory:
             return MemoryWriteReceipt(user_id, agent_id, records, datetime.now(timezone.utc).isoformat(), before[0])
 
     def read_memory(self, *, user_id: str, agent_id: str, memory_id: str) -> dict[str, Any] | None:
+        require_person(user_id)
         require_pair(user_id, agent_id)
         before = self.store.read_scope(user_id, agent_id)
         if before[1]:
@@ -387,4 +482,32 @@ class BumiMemory:
             self._scoped_results([row], user_id, agent_id)
             if row.get("id") != memory_id:
                 raise MemoryScopeError("backend returned a different memory ID")
+        if row is not None and not self.store.filter_memory_rows([row], user_id=user_id, agent_id=agent_id):
+            return None
         return row
+
+    def forget_memory(self, *, user_id: str, agent_id: str, memory_id: str) -> dict[str, Any]:
+        """Source-aware logical deletion. Use forget_all for backend physical erasure."""
+        require_person(user_id)
+        with self._pair_lock(user_id, agent_id):
+            row = self.read_memory(user_id=user_id, agent_id=agent_id, memory_id=memory_id)
+            if row is None:
+                return {'status': 'not_found', 'memory_id': memory_id}
+            return self.store.request_forget_memory(user_id=user_id, agent_id=agent_id, memory=row)
+
+    def _record_spoken_promise(self, turn_id: str, agent_id: str) -> None:
+        turn = self.store.get_turn(turn_id, agent_id)
+        if is_guest(turn['user_id']) or not turn.get('reply_message_id'):
+            return
+        # Never promote a delayed response based on a revoked prompt to new evidence.
+        with self.store._connect() as conn:
+            source = conn.execute('SELECT * FROM messages WHERE message_id=? AND memory_excluded=0',
+                                  (turn['reply_message_id'],)).fetchone()
+        if source is None:
+            return
+        try:
+            receipt = self.store.record_assistant_promise(
+                user_id=turn['user_id'], agent_id=agent_id, source_message_id=source['message_id'],
+                text=source['content'], observed_at=source['created_at'], generation=turn['generation'])
+        except Exception as exc:
+            logger.warning('spoken promise not confirmed: %s', type(exc).__name__)

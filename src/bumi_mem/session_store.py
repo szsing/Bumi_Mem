@@ -30,9 +30,13 @@ def utcnow() -> str:
 
 from bumi_mem.turn_store import TurnStoreMixin
 from bumi_mem.context_store import ContextStoreMixin
+from bumi_mem.shared_memory import SharedMemoryStoreMixin
+from bumi_mem.semantic_state import SemanticStateStoreMixin
+from bumi_mem.identity import is_guest
+from bumi_mem.event_time import message_time
 
 
-class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
+class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMixin, SemanticStateStoreMixin):
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +60,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 5:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 6:
                 raise RuntimeError("Database schema is newer than this Bumi version; refusing to downgrade")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
@@ -172,7 +176,26 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
                 # old task snapshots still preserve extraction provenance.
                 conn.execute("UPDATE messages SET user_id='' WHERE role!='user'")
                 conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
-            conn.execute('PRAGMA user_version=5')
+            # v6: source-linked shared recall, semantic state and cross-user cache revocation.
+            self.create_shared_memory_tables(conn)
+            self.create_semantic_tables(conn)
+            for table, additions in {
+                'interaction_turns': [('source_message_id', 'TEXT'), ('reply_message_id', 'TEXT'), ('context_epoch', 'INTEGER NOT NULL DEFAULT 0')],
+                'context_requests': [('context_epoch', 'INTEGER NOT NULL DEFAULT 0'), ('query_occurred_at', 'TEXT'), ('previous_reply_occurred_at', 'TEXT')],
+            }.items():
+                existing_columns = {r['name'] for r in conn.execute(f'PRAGMA table_info({table})')}
+                for name, definition in additions:
+                    if name not in existing_columns:
+                        conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+            # A v5 pending turn can safely recover its original user evidence.
+            conn.execute("UPDATE interaction_turns SET source_message_id=(SELECT message_id FROM messages m "
+                         "WHERE m.session_id=interaction_turns.session_id AND m.role='user' "
+                         "AND m.content=interaction_turns.query ORDER BY m.sequence_no DESC LIMIT 1) "
+                         "WHERE source_message_id IS NULL")
+            if conn.execute('PRAGMA user_version').fetchone()[0] < 6:
+                conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
+                conn.execute("UPDATE context_requests SET response_json=NULL WHERE state!='revoked'")
+            conn.execute('PRAGMA user_version=6')
 
     @staticmethod
     def _session(row: sqlite3.Row | None) -> SessionRecord | None:
@@ -242,7 +265,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
                                         context_only=context_only, source_session_id=source_session_id)
 
     def _append_message(self, conn, session_id, *, role, content, token_count,
-                        context_only=False, source_session_id=None):
+                        context_only=False, source_session_id=None, occurred_at=None):
         content = content.strip()
         if not content:
             raise ValueError('message content cannot be empty')
@@ -257,7 +280,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
         conn.execute('INSERT INTO messages(message_id,session_id,sequence_no,role,content,token_count,'
                      'context_only,source_session_id,created_at,user_id,agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                      (mid, session_id, sequence, role, content, max(0, token_count),
-                      int(context_only), source_session_id, utcnow(), row['user_id'] if role == 'user' else '', row['agent_id']))
+                      int(context_only), source_session_id, message_time(occurred_at), row['user_id'] if role == 'user' else '', row['agent_id']))
         conn.execute('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,?)',
                      (row['agent_id'], mid, int(context_only)))
         return self._message(conn.execute('SELECT * FROM messages WHERE message_id=?', (mid,)).fetchone())
@@ -300,7 +323,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
             raise SessionBlockedError(f'cannot submit {old["status"]} session')
         rows = conn.execute('SELECT * FROM messages WHERE session_id=? AND context_only=0 ORDER BY sequence_no',
                             (session_id,)).fetchall()
-        eligible = [self._message(r) for r in rows if not r['memory_excluded']]
+        eligible = [] if is_guest(old['user_id']) else [self._message(r) for r in rows if not r['memory_excluded']]
         tail = [self._message(r) for r in rows[-carryover_messages:]] if carryover_messages else []
         scope = self._scope(conn, old['user_id'], old['agent_id'])
         now, jid = utcnow(), 'session_' + session_id
@@ -368,6 +391,8 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
         conn.execute('DELETE FROM shared_l1 WHERE agent_id=?', (agent,))
         conn.executemany('INSERT INTO shared_l1(agent_id,message_id,context_only) VALUES(?,?,1)',
                          [(agent, row['message_id']) for row in reversed(tail)])
+        conn.execute('DELETE FROM shared_memory_refs WHERE agent_id=? AND anchor_message_id NOT IN '
+                     '(SELECT message_id FROM shared_l1 WHERE agent_id=?)', (agent, agent))
         return receipts[session_id]
 
     def discard_shared(self, session_id: str) -> SessionRecord:
@@ -436,6 +461,9 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin):
             conn.execute("UPDATE interaction_turns SET status='cancelled' "
                          "WHERE user_id=? AND agent_id=? AND protocol='direct' "
                          "AND status IN ('preparing','awaiting_reply')", (user_id, agent_id))
+            conn.execute("UPDATE shared_memory_refs SET status='deleted' WHERE user_id=? AND agent_id=?", (user_id, agent_id))
+            self.invalidate_semantic_scope(conn, user_id, agent_id)
+            self._bump_context_epoch(conn, agent_id)
             conn.execute('UPDATE messages SET memory_excluded=1 WHERE session_id IN '
                          '(SELECT session_id FROM sessions WHERE user_id=? AND agent_id=?)', (user_id, agent_id))
             conn.execute('INSERT INTO memory_jobs(job_id,kind,user_id,agent_id,generation,status,max_attempts,available_at,'

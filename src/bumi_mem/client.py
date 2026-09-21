@@ -17,11 +17,17 @@ class BumiMemoryClient:
                                   timeout=timeout, transport=transport)
 
     def get_context(self, user_id: str, query: str | None, *, previous_ai_reply: str | None = None,
-                    idempotency_key: str | None = None) -> dict:
+                    idempotency_key: str | None = None, query_occurred_at: str | None = None,
+                    previous_reply_occurred_at: str | None = None) -> dict:
         """Supply the same key/body on retry. query=None only flushes the last AI reply."""
+        body = {'user_id': user_id, 'previous_ai_reply': previous_ai_reply, 'query': query}
+        if query_occurred_at is not None:
+            body['query_occurred_at'] = query_occurred_at
+        if previous_reply_occurred_at is not None:
+            body['previous_reply_occurred_at'] = previous_reply_occurred_at
         result = self._http.post('/v1/memory/context',
                                  headers={'Idempotency-Key': idempotency_key or uuid4().hex},
-                                 json={'user_id': user_id, 'previous_ai_reply': previous_ai_reply, 'query': query})
+                                 json=body)
         result.raise_for_status()
         return result.json()
 
@@ -44,10 +50,16 @@ class AsyncBumiMemoryClient:
                                        timeout=timeout, transport=transport)
 
     async def get_context(self, user_id: str, query: str | None, *, previous_ai_reply: str | None = None,
-                          idempotency_key: str | None = None) -> dict:
+                          idempotency_key: str | None = None, query_occurred_at: str | None = None,
+                    previous_reply_occurred_at: str | None = None) -> dict:
+        body = {'user_id': user_id, 'previous_ai_reply': previous_ai_reply, 'query': query}
+        if query_occurred_at is not None:
+            body['query_occurred_at'] = query_occurred_at
+        if previous_reply_occurred_at is not None:
+            body['previous_reply_occurred_at'] = previous_reply_occurred_at
         result = await self._http.post('/v1/memory/context',
                                        headers={'Idempotency-Key': idempotency_key or uuid4().hex},
-                                       json={'user_id': user_id, 'previous_ai_reply': previous_ai_reply, 'query': query})
+                                       json=body)
         result.raise_for_status()
         return result.json()
 
