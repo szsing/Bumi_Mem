@@ -166,7 +166,7 @@ def test_carryover_is_context_only_and_not_reconsolidated(tmp_path):
     submit(engine)
     engine.worker.run_once()
     engine.worker.run_once()
-    assert [m['content'] for m in memory.add_calls[1]['messages'] if m['role'] == 'user'] == ['新消息']
+    assert [m['content'].split('\n', 1)[1] for m in memory.add_calls[1]['messages'] if m['role'] == 'user'] == ['新消息']
 
 
 def test_discard_never_writes_l3_and_has_no_carryover(tmp_path):

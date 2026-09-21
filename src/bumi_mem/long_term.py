@@ -189,11 +189,12 @@ class Mem0LongTermMemory:
 
         try:
             result = self.memory.add(
-                list(messages), user_id=user_id, agent_id=agent_id,
-                # Mem0 keeps its own last-message extraction cache. A public
-                # run_id namespace prevents pre-forget cache from being reused.
-                run_id=(f"bumi-generation-{int(metadata['memory_generation'])}"
-                        if int(metadata.get('memory_generation', 0)) > 0 else None),
+                [{"role": m["role"], "content": m["content"]} for m in messages], user_id=user_id, agent_id=agent_id,
+                # Isolate each evidence chunk as well as deletion generation.
+                # Otherwise a targeted deletion could be resurrected by the SDK's
+                # previous-input cache under a NEW chunk's unrelated source IDs.
+                run_id=(f"bumi-generation-{int(metadata.get('memory_generation', 0))}"
+                        f"-chunk-{metadata.get('consolidation_id') or uuid4().hex}"),
                 metadata=dict(metadata), prompt=prompt, infer=True,
             )
         except LLMError as exc:
@@ -342,9 +343,11 @@ class FakeLongTermMemory:
         if self.fail_add_count > 0:
             self.fail_add_count -= 1
             raise RetryableMemoryError("fake Mem0 failure")
-        user_texts = [item["content"] for item in messages if item.get("role") == "user"]
+        # The fake mirrors the extractor's text view, not its provenance header.
+        user_texts = [item["content"].split("\n", 1)[-1] if item["content"].startswith("[source ") else item["content"]
+                      for item in messages if item.get("role") == "user"]
         text = " | ".join(user_texts) or "session memory"
-        event = {"id": f"fake-{len(self.add_calls)}", "event": "ADD", "memory": text}
+        event = {"id": f"fake-{len(self.add_calls)}", "event": "ADD", "memory": text, "metadata": dict(metadata)}
         self.memories.setdefault((user_id, agent_id), []).append(event)
         return [event]
 

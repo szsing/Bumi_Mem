@@ -12,9 +12,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from filelock import FileLock, Timeout
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from bumi_mem.identity import require_id
+from bumi_mem.event_time import message_time
 from bumi_mem.schemas import IdentityRequiredError
 from bumi_mem.service_settings import ServiceSettings, build_service_engine
 from bumi_mem.turn_store import TurnConflict, TurnNotFound
@@ -29,6 +30,22 @@ class ContextRequest(BaseModel):
                                          description='Previous agent output; null/empty means no output')
     query: str | None = Field(max_length=16000,
                               description='Current user query; null flushes previous output without a new turn')
+
+    query_occurred_at: str | None = Field(default=None, max_length=64)
+    previous_reply_occurred_at: str | None = Field(default=None, max_length=64)
+
+    @field_validator('query_occurred_at', 'previous_reply_occurred_at')
+    @classmethod
+    def validate_time(cls, value):
+        return message_time(value) if value is not None else None
+
+    @model_validator(mode='after')
+    def validate_time_pairing(self):
+        if self.query is None and self.query_occurred_at is not None:
+            raise ValueError('query timestamp requires a query')
+        if not (self.previous_ai_reply or '').strip() and self.previous_reply_occurred_at is not None:
+            raise ValueError('reply timestamp requires a nonempty reply')
+        return self
 
     @field_validator('user_id')
     @classmethod
@@ -52,6 +69,7 @@ class ChatMessage(BaseModel):
 
 
 class ContextResponse(BaseModel):
+    core_write: dict = Field(default_factory=lambda: {'status': 'not_requested'})
     request_id: str
     user_id: str
     agent_id: str
@@ -119,7 +137,7 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             finally:
                 lock.release()
 
-    app = FastAPI(title='Bumi Agent Memory API', version='1.0.0', lifespan=lifespan)
+    app = FastAPI(title='Bumi Agent Memory API', version='1.1.0', lifespan=lifespan)
     app.state.ready = False
     app.add_middleware(RequestBodyLimit)
     bearer = HTTPBearer(auto_error=False)
@@ -171,7 +189,8 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
         config = request.app.state.settings
         return request.app.state.engine.process_context(
             user_id=body.user_id, agent_id=config.agent_id, query=body.query,
-            previous_ai_reply=body.previous_ai_reply, idempotency_key=idempotency_key)
+            previous_ai_reply=body.previous_ai_reply, idempotency_key=idempotency_key,
+            query_occurred_at=body.query_occurred_at, previous_reply_occurred_at=body.previous_reply_occurred_at)
 
     return app
 

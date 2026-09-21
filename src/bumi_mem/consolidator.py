@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
 from bumi_mem.long_term import LongTermMemory
-from bumi_mem.prompts import MEMORY_EXTRACTION_INSTRUCTIONS, summary_messages
+from bumi_mem.identity import is_guest
+from bumi_mem.prompts import MEMORY_EXTRACTION_INSTRUCTIONS, TEMPORAL_EXTRACTION_INSTRUCTIONS, summary_messages
 from bumi_mem.providers import TextProvider
 from bumi_mem.schemas import (
     ConsolidationSubmission, JobCancelledError, MemoryJob, MessageRecord,
@@ -51,7 +52,40 @@ class SessionConsolidator:
 
     @staticmethod
     def _chat_messages(messages: Sequence[MessageRecord]) -> list[dict[str, str]]:
-        return [m.to_chat_message() for m in messages]
+        return [m.to_extraction_message() for m in messages
+                if not m.context_only and m.role in ("user", "assistant")]
+
+    @staticmethod
+    def _restore_extraction_chunks(
+        chunks: Sequence[dict[str, Any]], sources: Sequence[MessageRecord],
+    ) -> list[list[dict[str, str]]]:
+        """Recover pending pre-provenance chunks from their immutable snapshot.
+
+        Match in source order (including successful chunks and duplicate text).
+        Never synthesize an anchor from a job or guess for an unmatched message.
+        """
+        cursor = 0
+        restored = []
+        for chunk in chunks:
+            records = []
+            for rendered in json.loads(chunk['messages_json']):
+                found = None
+                while cursor < len(sources):
+                    source = sources[cursor]
+                    cursor += 1
+                    if rendered.get('source_message_id'):
+                        matches = rendered['source_message_id'] == source.message_id
+                    else:
+                        matches = (rendered.get('role') == source.role and
+                                   rendered.get('content') == source.content)
+                    if matches:
+                        found = source
+                        break
+                if found is None:
+                    raise MemoryWriteUncertainError('Persisted extraction message has no original source anchor; explicit source repair required')
+                records.append(found)
+            restored.append(SessionConsolidator._chat_messages(records))
+        return restored
 
     def _local_chunks(self, messages: Sequence[MessageRecord], *, token_limit: int | None = None) -> list[list[MessageRecord]]:
         limit = self.config.local_chunk_tokens if token_limit is None else token_limit
@@ -64,7 +98,8 @@ class SessionConsolidator:
         chunk: list[MessageRecord] = []
         tokens = 0
         for turn in rounds:
-            size = sum(self.memory_token_counter.count_text(m.content) + 4 for m in turn)
+            size = sum(self.memory_token_counter.count_text(m.to_extraction_message()["content"]) + 4
+                       for m in turn)
             if chunk and tokens + size > limit:
                 chunks.append(chunk)
                 chunk, tokens = [], 0
@@ -95,13 +130,19 @@ class SessionConsolidator:
                 self.long_term.delete_all(user_id=job.user_id, agent_id=job.agent_id)
                 self.store.finish_job(job.job_id, owner)
                 return
+            if is_guest(job.user_id):
+                self.store.finish_job(job.job_id, owner)
+                return
             payload = json.loads(job.payload_json)
             settings = payload['settings']
             if settings['provider'] != self.memory_provider_name or settings['summary_model'] != self.summary_provider.config.model:
                 self.store.fail_job(job.job_id, owner, 'Provider/model differs from submitted job; restore configuration before retry.',
                                     retry_delay=0, retryable=False)
                 return
-            messages = [MessageRecord(**m) for m in payload['messages']]
+            sources = [MessageRecord(**m) for m in payload['messages']]
+            messages = sources
+            # Carryover and synthetic recall context are never fresh L3 evidence.
+            messages = [m for m in messages if not m.context_only and m.role in ('user', 'assistant')]
             if any((m.user_id and m.user_id != job.user_id) or
                    (m.agent_id and m.agent_id != job.agent_id) for m in messages):
                 self.store.fail_job(job.job_id, owner, 'Foreign speaker in owner snapshot',
@@ -125,24 +166,36 @@ class SessionConsolidator:
                                                 summary=f'会话包含 {user_count} 条用户消息和 {assistant_count} 条机器人消息',
                                                 provider=self.summary_provider.name, status='fallback', error=str(exc))
             chunks = (self._local_chunks(messages, token_limit=settings['local_chunk_tokens'])
-                      if settings['provider'] == 'local' else [messages])
+                      if settings['provider'] == 'local' else ([messages] if messages else []))
             self.store.ensure_chunks(job.job_id, owner, [self._chat_messages(c) for c in chunks])
             persisted = self.store.chunks(job.job_id)
-            for chunk in persisted:
+            restored = self._restore_extraction_chunks(persisted, sources)
+            for chunk, extraction_messages in zip(persisted, restored):
                 self.store.assert_current(job.job_id, owner)
                 if chunk['status'] == 'succeeded':
                     continue
                 if chunk['status'] != 'pending':
                     raise MemoryWriteUncertainError('chunk write outcome unknown; explicit replay required')
+                if not extraction_messages:
+                    self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='succeeded', events=[])
+                    continue
                 self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='writing')
                 metadata = {'source': 'l1_session', 'session_id': job.session_id,
                             'consolidation_id': chunk['chunk_id'], 'consolidation_attempt': job.attempts,
                             'chunk_index': chunk['chunk_index'], 'chunk_count': len(persisted),
                             'job_id': job.job_id, 'memory_generation': job.generation}
+                metadata['source_message_ids'] = [m['source_message_id'] for m in extraction_messages
+                                                  if m.get('source_message_id')]
+                metadata['source_messages'] = [
+                    {'source_message_id': m['source_message_id'], 'observed_at': m.get('observed_at', '')}
+                    for m in extraction_messages if m.get('source_message_id')]
+                prompt = settings['extraction_prompt']
+                if TEMPORAL_EXTRACTION_INSTRUCTIONS not in prompt:
+                    prompt += '\n\n' + TEMPORAL_EXTRACTION_INSTRUCTIONS
                 try:
                     events = self.long_term.add_session(user_id=job.user_id, agent_id=job.agent_id,
-                                                       messages=json.loads(chunk['messages_json']), metadata=metadata,
-                                                       prompt=settings['extraction_prompt'])
+                                                       messages=extraction_messages, metadata=metadata,
+                                                       prompt=prompt)
                 except RetryableMemoryError as exc:
                     self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='pending', error=str(exc))
                     raise

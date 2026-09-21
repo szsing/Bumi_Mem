@@ -71,9 +71,9 @@ def test_adapter_changes_extraction_cache_namespace_after_forget(tmp_path, sdk):
     raw, _ = sdk
     a = adapter(tmp_path)
     write(a, 3)
-    assert raw.last_add['run_id'] == 'bumi-generation-3'
+    assert raw.last_add['run_id'].startswith('bumi-generation-3-chunk-')
     write(a, 4)
-    assert raw.last_add['run_id'] == 'bumi-generation-4'
+    assert raw.last_add['run_id'].startswith('bumi-generation-4-chunk-')
     assert raw.last_add['infer'] is True
 
 

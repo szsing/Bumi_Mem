@@ -23,6 +23,7 @@ class ServiceSettings:
     embed_device: str = 'auto'
     collection_name: str = 'bumi_mem_l3'
     read_timeout: float = 0.2
+    explicit_recall_timeout: float = 1.0
     warmup_timeout: float = 120.0
     max_messages: int = 20
     max_l1_tokens: int = 8000
@@ -36,6 +37,8 @@ class ServiceSettings:
     retry_base_seconds: float = 5.0
 
     def __post_init__(self):
+        if not math.isfinite(self.explicit_recall_timeout) or self.explicit_recall_timeout <= 0:
+            raise ValueError('explicit recall timeout must be positive and finite')
         object.__setattr__(self, 'data_dir', Path(self.data_dir).expanduser().resolve())
         object.__setattr__(self, 'embed_model_path', Path(self.embed_model_path).expanduser().resolve())
         require_id(self.agent_id, 'agent_id')
@@ -86,6 +89,7 @@ class ServiceSettings:
             embed_device=os.getenv('MEM0_EMBED_DEVICE', 'auto'),
             collection_name=os.getenv('BUMI_COLLECTION_NAME', 'bumi_mem_l3'),
             read_timeout=float(os.getenv('BUMI_MEMORY_READ_TIMEOUT', '0.2')),
+            explicit_recall_timeout=float(os.getenv('BUMI_EXPLICIT_RECALL_TIMEOUT', '1.0')),
             warmup_timeout=float(os.getenv('BUMI_MEMORY_WARMUP_TIMEOUT', '120')),
             max_messages=int(os.getenv('BUMI_MAX_MESSAGES', '20')),
             max_l1_tokens=int(os.getenv('BUMI_MAX_L1_TOKENS', '8000')),
@@ -139,4 +143,5 @@ def build_service_engine(settings: ServiceSettings):
                                              max_l1_tokens=settings.max_l1_tokens, top_k=settings.top_k,
                                              search_threshold=settings.search_threshold,
                                              memory_read_timeout=settings.read_timeout,
+                                             explicit_recall_timeout=settings.explicit_recall_timeout,
                                              memory_warmup_timeout=settings.warmup_timeout))

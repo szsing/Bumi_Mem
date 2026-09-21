@@ -1,4 +1,4 @@
-> 接口版本更新：单 HTTP 接口新增事务请求记录，最新主库 schema 为 v5。本文 v3 段落描述共享短期索引的迁移步骤，完整部署请参见 `../agent_api/README.md`。
+> 接口版本更新：单 HTTP 接口新增事务请求记录，最新主库 schema 为 v6。本文 v3 段落描述共享短期索引的迁移步骤，完整部署请参见 `../agent_api/README.md`。
 
 # 共享短期上下文，隔离长期记忆
 
@@ -6,9 +6,11 @@
 
 同一个 SQLite 数据库、同一个 agent_id 代表一处共享现场。不同 user_id 进入同一现场时，看到同一短期消息序列。不同 agent_id 不共享；不同进程/设备要共享同一现场不能简单指向同一个 Qdrant 本地目录。当前仍是单应用进程、单 engine 持有 SDK 的部署方式，不提供跨进程对话锁或分布式会话。
 
-没有增加匿名用户：未提供可信 user_id 的聊天请求仍拒绝，启动预热仍与真实用户无关。
+未提供 user_id 的请求仍拒绝；可信上游可使用保留 ID `__guest__` 表示所有未确认说话人。该类别只访问共享 L1，不访问或生成个人 L3。启动预热仍与真实用户无关。
 
 ## 数据结构
+
+新增 `shared_memory_refs` 绑定真实用户消息，保存门控后的 L3 引用；引用不作为发言、不进入抽取快照，随锚点退出并支持更正/删除失效。完整 v0.3 契约见 `../companion_memory/README.md`。
 
 - `messages`：保存原始正文、role、user_id、agent_id 等。role=assistant 时 user_id 为空字符串，Prompt 不输出该字段，说话者只有 agent_id；后台依靠 session 关联了解整理来源。
 - `shared_l1`：按 agent_id 保存有序的 message_id 引用及 context_only。主键 position 为 SQLite 分配的顺序，不依赖时钟排序新消息。
@@ -22,7 +24,7 @@
 当前请求来自 B，历史中 A 刚和 bot 对话：
 
 ```text
-system: 当前身份是 B / bot；长期记忆只属于 B。
+system: 当前身份是 B / bot；核心状态只属于 B；已通过所有者门控的 L3 引用按所有者标签共享。
 user: [speaker {"user_id": "A", "agent_id": "bot", "speaker_role": "user"}]
       我刚才说周末想去公园。
 assistant: [speaker {"agent_id": "bot", "speaker_role": "assistant"}]

@@ -35,7 +35,7 @@ class TurnStoreMixin:
                                       max_messages=max_messages, max_l1_tokens=max_l1_tokens)
 
     def _reserve_turn(self, conn, *, user_id, agent_id, query, token_count, idempotency_key,
-                      ttl_seconds, settings, max_messages, max_l1_tokens, protocol='direct'):
+                      ttl_seconds, settings, max_messages, max_l1_tokens, protocol='direct', occurred_at=None):
         now = time.time()
         conn.execute("UPDATE interaction_turns SET status='expired',prompt_json=NULL "
                      "WHERE agent_id=? AND protocol='direct' AND status IN ('preparing','awaiting_reply') AND expires_at<=?",
@@ -65,7 +65,7 @@ class TurnStoreMixin:
                                           carryover_messages=settings['carryover_messages'],
                                           max_attempts=settings['max_attempts'])
             sid = receipt.new_session_id
-        self._append_message(conn, sid, role='user', content=query, token_count=token_count)
+        source = self._append_message(conn, sid, role='user', content=query, token_count=token_count, occurred_at=occurred_at)
         scope = self._scope(conn, user_id, agent_id)
         turn_id = 'turn_' + uuid4().hex
         conn.execute('INSERT INTO interaction_turns(turn_id,session_id,user_id,agent_id,query,'
@@ -73,9 +73,10 @@ class TurnStoreMixin:
                      "VALUES(?,?,?,?,?,?,'preparing',?,?,?,?)",
                      (turn_id, sid, user_id, agent_id, query, idempotency_key,
                       now + ttl_seconds, now, scope['generation'], protocol))
+        conn.execute('UPDATE interaction_turns SET source_message_id=? WHERE turn_id=?', (source.message_id, turn_id))
         return dict(conn.execute('SELECT * FROM interaction_turns WHERE turn_id=?', (turn_id,)).fetchone())
 
-    def save_turn_prompt(self, turn_id, *, messages, recall_status, recalled):
+    def save_turn_prompt(self, turn_id, *, messages, recall_status, recalled, core_write=None, expected_epoch=None):
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM interaction_turns WHERE turn_id=?', (turn_id,)).fetchone()
             if not row or row['status'] not in ACTIVE or (row['protocol'] == 'direct' and row['expires_at'] <= time.time()):
@@ -83,11 +84,14 @@ class TurnStoreMixin:
             scope = self._scope(conn, row['user_id'], row['agent_id'])
             if scope['generation'] != row['generation']:
                 raise TurnConflict('memory_scope_changed')
+            epoch = self._context_epoch(conn, row['agent_id'])
+            if expected_epoch is not None and expected_epoch != epoch:
+                raise TurnConflict('shared_memory_context_changed')
             response = {'turn_id': turn_id, 'user_id': row['user_id'], 'agent_id': row['agent_id'],
                         'messages': messages, 'recall_status': recall_status, 'expires_at': row['expires_at'],
-                        'recalled': recalled}
-            conn.execute("UPDATE interaction_turns SET status='awaiting_reply',prompt_json=? WHERE turn_id=?",
-                         (json.dumps(response, ensure_ascii=False), turn_id))
+                        'recalled': recalled, 'core_write': core_write or {'status': 'not_requested'}}
+            conn.execute("UPDATE interaction_turns SET status='awaiting_reply',prompt_json=?,context_epoch=? WHERE turn_id=?",
+                         (json.dumps(response, ensure_ascii=False), epoch, turn_id))
             return response
 
     def finish_turn(self, *, turn_id, agent_id, reply, status, token_count, settings,
@@ -98,8 +102,11 @@ class TurnStoreMixin:
                                      max_messages=max_messages, max_l1_tokens=max_l1_tokens)
 
     def _finish_turn(self, conn, *, turn_id, agent_id, reply, status, token_count, settings,
-                     max_messages, max_l1_tokens):
-        payload = json.dumps({'status': status, 'reply': reply}, ensure_ascii=False, sort_keys=True)
+                     max_messages, max_l1_tokens, occurred_at=None):
+        payload_data = {'status': status, 'reply': reply}
+        if occurred_at is not None:
+            payload_data['occurred_at'] = occurred_at
+        payload = json.dumps(payload_data, ensure_ascii=False, sort_keys=True)
         row = conn.execute('SELECT * FROM interaction_turns WHERE turn_id=? AND agent_id=?',
                            (turn_id, agent_id)).fetchone()
         if not row:
@@ -116,9 +123,11 @@ class TurnStoreMixin:
         if session is None or session['status'] != 'active':
             raise TurnConflict('session_changed')
         if reply:
-            message = self._append_message(conn, row['session_id'], role='assistant', content=reply, token_count=token_count)
+            message = self._append_message(conn, row['session_id'], role='assistant', content=reply, token_count=token_count, occurred_at=occurred_at)
+            conn.execute('UPDATE interaction_turns SET reply_message_id=? WHERE turn_id=?', (message.message_id, turn_id))
             scope = self._scope(conn, row['user_id'], agent_id)
-            if scope['generation'] != row['generation']:
+            if (scope['generation'] != row['generation'] or
+                    row['context_epoch'] != self._context_epoch(conn, agent_id)):
                 # Preserve spoken agent text in shared L1 after forget-all, but
                 # do not let a delayed answer resurrect the deleted user's L3.
                 conn.execute('UPDATE messages SET memory_excluded=1 WHERE message_id=?', (message.message_id,))

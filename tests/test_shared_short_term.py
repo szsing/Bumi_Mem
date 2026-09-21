@@ -34,7 +34,10 @@ def test_b_sees_a_and_agent_speech_but_only_b_private_l3(tmp_path):
     b = chat(engine, 'B', '你刚刚说什么')
     prompt = b.prompt_messages
     assert 'B_PRIVATE_L3' in prompt[0]['content']
-    assert 'A_PRIVATE_L3' not in '\n'.join(m['content'] for m in prompt)
+    refs = json.loads(prompt[0]['content'].split('[共享 L3 引用 / shared memory references]\n', 1)[1].split('\n', 1)[0])
+    assert any(r['owner_user_id'] == 'A' and r['memory'] == 'A_PRIVATE_L3' for r in refs)
+    assert [r['memory'] for r in b.recalled] == ['B_PRIVATE_L3']
+    assert 'A_PRIVATE_L3' not in prompt[0]['content'].split('[共享 L3 引用 / shared memory references]', 1)[0]
     assert [m['role'] for m in prompt[1:]] == ['user', 'assistant', 'user']
     assert '我刚说了一句话' in prompt[1]['content']
     assert '刚才回答了A' in prompt[2]['content']
@@ -75,7 +78,7 @@ def test_twenty_message_boundary_is_global_and_owner_jobs_are_separate(tmp_path)
     assert all(store.get_job(j.job_id).status == 'succeeded' for j in jobs)
     for call in backend.add_calls:
         expected = range(0,10,2) if call['user_id'] == 'A' else range(1,10,2)
-        assert [m['content'] for m in call['messages'] if m['role']=='user'] == [f'FACT_{i}' for i in expected]
+        assert [m['content'].split('\n', 1)[1] for m in call['messages'] if m['role']=='user'] == [f'FACT_{i}' for i in expected]
 
 
 def test_carryover_shared_after_restart_and_not_reextracted(tmp_path):
@@ -92,7 +95,7 @@ def test_carryover_shared_after_restart_and_not_reextracted(tmp_path):
     drain(restored)
     calls = [call for call in backend.add_calls if call['user_id']=='C']
     assert len(calls) == 1
-    assert [m['content'] for m in calls[0]['messages'] if m['role']=='user'] == ['NEW_C']
+    assert [m['content'].split('\n', 1)[1] for m in calls[0]['messages'] if m['role']=='user'] == ['NEW_C']
     assert len([c for c in backend.add_calls if c['user_id']=='A']) == 1
     assert len([c for c in backend.add_calls if c['user_id']=='B']) == 1
 
@@ -202,7 +205,7 @@ def test_migrate_v2_backfills_speaker_and_only_imports_live_window_once(tmp_path
     reopened = SQLiteSessionStore(path)
     assert reopened.list_shared_messages('bot') == migrated.list_shared_messages('bot')
     with sqlite3.connect(path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 6
 
 
 def test_tampered_owner_snapshot_is_rejected_before_llm_or_write(tmp_path):

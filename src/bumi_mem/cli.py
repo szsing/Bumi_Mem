@@ -220,6 +220,8 @@ def _help() -> None:
   /debug on|off          显示或隐藏内部调试信息
   /new                   轮转共享短期窗口，按用户分别保存整理任务
   /discard               清空本 agent 的共享 L1，不影响已提交任务
+  /forget <memory-id>     按来源撤回单条记忆（逻辑删除；旧库无来源时使用 /forget-all）
+  /core                  查看自己的已确认核心/状态记忆
   /forget-all            屏蔽当前 user/agent 的 L3，取消旧写入并后台清理
   /quit                  退出；save 只保证记录/任务落盘，不保证 L3 已整理完
 """)
@@ -295,6 +297,18 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
                 saved = engine.remember(user_id=ticket.user_id, agent_id=args.agent_id,
                                         contents=[text.removeprefix("/remember ")])
                 identity.deliver(ticket, print, f"已确认长期保存：user_id={saved.user_id}，memory_id={','.join(x.memory_id for x in saved.records)}")
+                continue
+            if text == "/core":
+                from bumi_mem.identity import require_person
+                require_person(args.user_id)
+                print(engine.store.semantic_context(args.user_id, args.agent_id))
+                continue
+            if text.startswith("/forget "):
+                memory_id = text.removeprefix("/forget ").strip()
+                if input(f"输入 DELETE 确认撤回记忆 {memory_id!r} 及其来源引用：").strip() == "DELETE":
+                    print(engine.forget_memory(user_id=args.user_id, agent_id=args.agent_id, memory_id=memory_id))
+                else:
+                    print("已取消。")
                 continue
             if text.startswith("/read "):
                 row = engine.read_memory(user_id=args.user_id, agent_id=args.agent_id,
