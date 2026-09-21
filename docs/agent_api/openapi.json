@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Bumi Agent Memory API",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "paths": {
     "/health/live": {
@@ -79,7 +79,24 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ContextRequest"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ContextRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentPrepareRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentCompleteRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentEventRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentPendingRequest"
+                  }
+                ],
+                "title": "Body"
               }
             }
           }
@@ -90,7 +107,24 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ContextResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ContextResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentPrepareResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentCompleteResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentEventResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentPendingResponse"
+                    }
+                  ],
+                  "title": "Response Context V1 Memory Context Post"
                 }
               }
             }
@@ -111,6 +145,476 @@
   },
   "components": {
     "schemas": {
+      "AgentChatMessage": {
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "system",
+              "user",
+              "assistant"
+            ],
+            "title": "Role"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "AgentChatMessage"
+      },
+      "AgentCompleteRequest": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "complete",
+            "title": "Operation"
+          },
+          "turn_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Turn Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "interrupted",
+              "cancelled",
+              "failed"
+            ],
+            "title": "Status"
+          },
+          "reply": {
+            "type": "string",
+            "maxLength": 64000,
+            "title": "Reply",
+            "default": ""
+          },
+          "occurred_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurred At"
+          },
+          "speech": {
+            "$ref": "#/components/schemas/SpeechEvidence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "operation",
+          "turn_id",
+          "status"
+        ],
+        "title": "AgentCompleteRequest"
+      },
+      "AgentCompleteResponse": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "complete",
+            "title": "Operation",
+            "default": "complete"
+          },
+          "turn_id": {
+            "type": "string",
+            "title": "Turn Id"
+          },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "interrupted",
+              "cancelled",
+              "failed"
+            ],
+            "title": "Status"
+          },
+          "has_prompt": {
+            "type": "boolean",
+            "const": false,
+            "title": "Has Prompt",
+            "default": false
+          },
+          "reply_saved": {
+            "type": "boolean",
+            "title": "Reply Saved"
+          },
+          "transcript_complete": {
+            "type": "boolean",
+            "title": "Transcript Complete"
+          },
+          "consolidation_status": {
+            "type": "string",
+            "enum": [
+              "not_triggered",
+              "queued",
+              "succeeded"
+            ],
+            "title": "Consolidation Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "turn_id",
+          "user_id",
+          "agent_id",
+          "status",
+          "reply_saved",
+          "transcript_complete",
+          "consolidation_status"
+        ],
+        "title": "AgentCompleteResponse"
+      },
+      "AgentEventRequest": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "agent_event",
+            "title": "Operation"
+          },
+          "event_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Event Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "speech",
+              "local_control"
+            ],
+            "title": "Kind"
+          },
+          "occurred_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurred At"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "speech": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeechEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LocalControlEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "operation",
+          "event_id",
+          "kind"
+        ],
+        "title": "AgentEventRequest"
+      },
+      "AgentEventResponse": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "agent_event",
+            "title": "Operation",
+            "default": "agent_event"
+          },
+          "event_id": {
+            "type": "string",
+            "title": "Event Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "speech",
+              "local_control"
+            ],
+            "title": "Kind"
+          },
+          "message_id": {
+            "type": "string",
+            "title": "Message Id"
+          },
+          "has_prompt": {
+            "type": "boolean",
+            "const": false,
+            "title": "Has Prompt",
+            "default": false
+          },
+          "saved": {
+            "type": "boolean",
+            "const": true,
+            "title": "Saved",
+            "default": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "event_id",
+          "agent_id",
+          "kind",
+          "message_id"
+        ],
+        "title": "AgentEventResponse"
+      },
+      "AgentPendingRequest": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "pending",
+            "title": "Operation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "operation"
+        ],
+        "title": "AgentPendingRequest"
+      },
+      "AgentPendingResponse": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "pending",
+            "title": "Operation",
+            "default": "pending"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "has_prompt": {
+            "type": "boolean",
+            "const": false,
+            "title": "Has Prompt",
+            "default": false
+          },
+          "pending": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingAgentTurn"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "agent_id",
+          "pending"
+        ],
+        "title": "AgentPendingResponse"
+      },
+      "AgentPrepareRequest": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "prepare",
+            "title": "Operation"
+          },
+          "client_turn_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Turn Id"
+          },
+          "query": {
+            "type": "string",
+            "maxLength": 16000,
+            "minLength": 1,
+            "title": "Query"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeakerIdentityInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "occurred_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurred At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "operation",
+          "client_turn_id",
+          "query"
+        ],
+        "title": "AgentPrepareRequest"
+      },
+      "AgentPrepareResponse": {
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "prepare",
+            "title": "Operation",
+            "default": "prepare"
+          },
+          "turn_id": {
+            "type": "string",
+            "title": "Turn Id"
+          },
+          "client_turn_id": {
+            "type": "string",
+            "title": "Client Turn Id"
+          },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "source_message_id": {
+            "type": "string",
+            "title": "Source Message Id"
+          },
+          "occurred_at": {
+            "type": "string",
+            "title": "Occurred At"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/AgentChatMessage"
+            },
+            "type": "array",
+            "title": "Messages"
+          },
+          "memory_context": {
+            "items": {
+              "$ref": "#/components/schemas/MemorySupplement"
+            },
+            "type": "array",
+            "title": "Memory Context"
+          },
+          "has_prompt": {
+            "type": "boolean",
+            "const": true,
+            "title": "Has Prompt",
+            "default": true
+          },
+          "recall_status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable",
+              "deleting",
+              "disabled"
+            ],
+            "title": "Recall Status"
+          },
+          "core_write": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Core Write"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "turn_id",
+          "client_turn_id",
+          "user_id",
+          "agent_id",
+          "source_message_id",
+          "occurred_at",
+          "messages",
+          "memory_context",
+          "recall_status",
+          "core_write"
+        ],
+        "title": "AgentPrepareResponse"
+      },
       "ChatMessage": {
         "properties": {
           "role": {
@@ -281,6 +785,229 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "LocalControlEvent": {
+        "properties": {
+          "command": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "sleep"
+            ],
+            "title": "Command"
+          },
+          "user_text": {
+            "type": "string",
+            "maxLength": 4000,
+            "title": "User Text",
+            "default": ""
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "user_requested_stop",
+              "user_requested_sleep"
+            ],
+            "title": "Reason"
+          },
+          "result": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Result"
+          },
+          "feedback_status": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Feedback Status"
+          },
+          "llm_followup": {
+            "type": "boolean",
+            "const": false,
+            "title": "Llm Followup",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "command",
+          "reason",
+          "result",
+          "feedback_status"
+        ],
+        "title": "LocalControlEvent"
+      },
+      "MemorySupplement": {
+        "properties": {
+          "role": {
+            "type": "string",
+            "const": "system",
+            "title": "Role",
+            "default": "system"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "title": "MemorySupplement"
+      },
+      "PendingAgentTurn": {
+        "properties": {
+          "turn_id": {
+            "type": "string",
+            "title": "Turn Id"
+          },
+          "client_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Turn Id"
+          },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "protocol": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "context",
+              "direct"
+            ],
+            "title": "Protocol"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "preparing",
+              "awaiting_reply"
+            ],
+            "title": "Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "turn_id",
+          "client_turn_id",
+          "user_id",
+          "protocol",
+          "status"
+        ],
+        "title": "PendingAgentTurn"
+      },
+      "SpeakerIdentityInput": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "matched",
+              "unknown",
+              "timeout",
+              "unavailable",
+              "insufficient_audio",
+              "disabled"
+            ],
+            "title": "Status"
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "SpeakerIdentityInput"
+      },
+      "SpeechEvidence": {
+        "properties": {
+          "delivery_basis": {
+            "type": "string",
+            "enum": [
+              "dds_successful_publish",
+              "text_only",
+              "unknown"
+            ],
+            "title": "Delivery Basis",
+            "default": "text_only"
+          },
+          "alignment_covers_output": {
+            "type": "boolean",
+            "title": "Alignment Covers Output",
+            "default": true
+          },
+          "alignment_status": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Alignment Status",
+            "default": "text_only"
+          },
+          "output_samples": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Samples"
+          },
+          "sample_rate": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 384000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Rate"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SpeechEvidence",
+        "description": "Text coverage of published output, NOT a physical loudspeaker acknowledgement."
       },
       "ValidationError": {
         "properties": {

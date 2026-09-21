@@ -19,6 +19,11 @@ from bumi_mem.event_time import message_time
 from bumi_mem.schemas import IdentityRequiredError
 from bumi_mem.service_settings import ServiceSettings, build_service_engine
 from bumi_mem.turn_store import TurnConflict, TurnNotFound
+from bumi_mem.agent_protocol import (
+    AgentPrepareRequest, AgentCompleteRequest, AgentEventRequest,
+    AgentPrepareResponse, AgentCompleteResponse, AgentEventResponse,
+    AgentPendingRequest, AgentPendingResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +142,7 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             finally:
                 lock.release()
 
-    app = FastAPI(title='Bumi Agent Memory API', version='1.1.0', lifespan=lifespan)
+    app = FastAPI(title='Bumi Agent Memory API', version='1.2.0', lifespan=lifespan)
     app.state.ready = False
     app.add_middleware(RequestBodyLimit)
     bearer = HTTPBearer(auto_error=False)
@@ -183,11 +188,21 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             raise HTTPException(503, detail={'code': 'not_ready'})
         return {'status': 'ready', 'warmed_up': request.app.state.engine._warmup_elapsed_ms is not None}
 
-    @app.post('/v1/memory/context', response_model=ContextResponse, dependencies=[Depends(authorize)], tags=['memory'])
-    def context(body: ContextRequest, request: Request,
+    @app.post('/v1/memory/context', response_model=ContextResponse | AgentPrepareResponse | AgentCompleteResponse | AgentEventResponse | AgentPendingResponse, dependencies=[Depends(authorize)], tags=['memory'])
+    def context(body: ContextRequest | AgentPrepareRequest | AgentCompleteRequest | AgentEventRequest | AgentPendingRequest, request: Request,
                 idempotency_key: Annotated[str | None, Header(alias='Idempotency-Key', max_length=128)] = None):
         config = request.app.state.settings
-        return request.app.state.engine.process_context(
+        engine = request.app.state.engine
+        if isinstance(body, AgentPendingRequest):
+            return dict(operation='pending', agent_id=config.agent_id, has_prompt=False,
+                        pending=engine.store.pending_agent_turn(config.agent_id))
+        if isinstance(body, AgentPrepareRequest):
+            return engine.prepare_agent(request=body, agent_id=config.agent_id)
+        if isinstance(body, AgentCompleteRequest):
+            return engine.complete_agent(request=body, agent_id=config.agent_id)
+        if isinstance(body, AgentEventRequest):
+            return engine.record_agent_event(request=body, agent_id=config.agent_id)
+        return engine.process_context(
             user_id=body.user_id, agent_id=config.agent_id, query=body.query,
             previous_ai_reply=body.previous_ai_reply, idempotency_key=idempotency_key,
             query_occurred_at=body.query_occurred_at, previous_reply_occurred_at=body.previous_reply_occurred_at)

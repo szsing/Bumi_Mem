@@ -1,4 +1,6 @@
-> v0.3 / schema 6：门控后的 L3 引用进入共享 L1，新增陌生身份、时间来源与 core_write。详细行为以 [陪伴记忆契约](../companion_memory/README.md) 为准。
+> **v0.4 新 Agent 入口：** 同一 URL 新增 operation=prepare/complete/agent_event/pending；详见 [实际 bumi-agent 接入](../bumi_agent_integration/README.md)。下面旧 exchange 的三个业务字段保持兼容，不代表新 Agent 应继续用“上一轮回复”隐式关联。当前 schema 7。
+
+> 记忆内容沿用 v0.3 契约：门控后的 L3 引用进入共享 L1，包含陌生身份、时间来源与 core_write；当前数据库是 schema 7。详细记忆语义见 [陪伴记忆契约](../companion_memory/README.md)。
 
 # 单接口记忆服务：Agent 接入与部署
 
@@ -230,9 +232,9 @@ query 最多 16000 字符；previous_ai_reply 最多 64000 字符；身份/key �
 
 ## 10. 主库升级与验证范围
 
-主库升级为 v6：在原 v5 的 context_requests、protocol 和机器人身份迁移基础上，新增共享记忆引用、来源撤回、核心/状态版本、上下文 epoch，以及原消息关联和可选时间字段。原会话、发言、L3 所有者与任务快照不改写。v2/v3/v4/v5 通过增量迁移升级；旧缓存 Prompt 失效后按新契约重建。
+v6 的历史迁移：在原 v5 的 context_requests、protocol 和机器人身份迁移基础上，新增共享记忆引用、来源撤回、核心/状态版本、上下文 epoch，以及原消息关联和可选时间字段。原会话、发言、L3 所有者与任务快照不改写。v2/v3/v4/v5 通过增量迁移升级；旧缓存 Prompt 失效后按新契约重建。
 
-升级前停服务并备份完整 SQLite 数据（注意 WAL），回滚应恢复备份，不能用旧代码直接打开 v6。对话和幂等审计记录暂未自动清理；正在使用的 Prompt 缓存含个人记忆，需要保护数据库并制定保留期限。
+升级前停服务并备份完整 SQLite 数据（注意 WAL），回滚应恢复备份，不能用旧代码直接打开 v7。对话和幂等审计记录暂未自动清理；正在使用的 Prompt 缓存含个人记忆，需要保护数据库并制定保留期限。
 
 本地测试用真实 SQLite、FastAPI 测试客户端和模拟模型后端；不等于真实 GPU、模型准确率、Pipecat 语音或断电验收。运行：
 

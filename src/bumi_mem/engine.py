@@ -18,6 +18,7 @@ from bumi_mem.identity import require_pair, require_id, require_person, is_guest
 from bumi_mem.semantic_state import memory_conflicts
 from bumi_mem.event_time import message_time
 from bumi_mem.temporal import normalize_relative_dates
+from bumi_mem.agent_engine import AgentEngineMixin
 from bumi_mem.turn_store import TurnConflict
 from bumi_mem.schemas import MemoryWriteReceipt, SavedMemory, MemoryWriteUncertainError, SessionBlockedError, MemoryScopeError
 from bumi_mem.consolidator import SessionConsolidator
@@ -47,7 +48,7 @@ class BumiMemoryConfig:
     memory_warmup_query: str = "记忆系统预热"
 
 
-class BumiMemory:
+class BumiMemory(AgentEngineMixin):
     def __init__(self, *, store: SQLiteSessionStore, long_term: LongTermMemory,
                  chat_provider: TextProvider | None, consolidator: SessionConsolidator,
                  chat_token_counter: TokenCounter, config: BumiMemoryConfig | None = None,
