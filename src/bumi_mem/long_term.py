@@ -94,6 +94,8 @@ class Mem0AdapterConfig:
 
 class Mem0LongTermMemory:
     def __init__(self, llm: ProviderConfig, config: Mem0AdapterConfig) -> None:
+        from bumi_mem.providers import ensure_explicit_mem0_route
+        ensure_explicit_mem0_route()
         from mem0 import Memory
 
         self.provider_name = llm.provider
@@ -137,6 +139,10 @@ class Mem0LongTermMemory:
                 },
             }
         )
+
+        if llm.thinking_mode is not None:
+            from bumi_mem.providers import bind_provider_request_options
+            self.memory.llm.generate_response = bind_provider_request_options(self.memory.llm.generate_response, llm)
 
     def warmup(self, *, query: str) -> None:
         warmup_mem0_backend(self.memory, query=query)

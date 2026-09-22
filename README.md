@@ -1,5 +1,9 @@
 # Bumi_Mem
 
+## 服务器启动（0.4.1）
+
+按实际服务器目录部署见 **[服务器启动与 Agent 连接](docs/deployment/README.md)**。新增交互配置与预检脚本；DeepSeek 记忆摘要/抽取默认使用 `deepseek-flash` 并关闭思考模式，不改变 Agent 的回答模型或 API 1.2.0 协议。配置和两种密钥保存在 Git 目录外。
+
 ## Agent 部门接入（单接口 HTTP 服务）
 
 **v0.4 已按实际 `bumi-agent`（Pipecat 1.8.0）增加显式协议。** 同一 URL 使用 `operation=prepare/complete/agent_event/pending`，通过明确 turn_id 提交结算输出，支持独立欢迎语和 stop/sleep 事件；`memory_context` 用于补充 Agent 自有工具历史，不能覆盖它。新 Agent 请先阅读 **[实际代码接入说明](docs/bumi_agent_integration/README.md)**。Agent 仓库本身尚未接线。
