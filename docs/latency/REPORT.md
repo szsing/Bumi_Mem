@@ -4,22 +4,27 @@
 |---|---|
 | 任务 | Memory-B1-S4「定义记忆读写 API 与延迟预算」（链 A 并行分支） |
 | 验收指标 | 检索 P90 ≤ 60ms（#7）；串行关键路径只计最后的上下文拼装，≤ 20ms |
-| 测试日期 | 2026-09-22 |
+| 测试日期 | 2026-09-22 ~ 09-23 |
 | 执行人 | 张冉 |
 | 被测版本 | Bumi_Mem `6315aaf`（main，schema 7 / v0.4 Agent API）、mem0 2.0.20 |
 | 压测脚本 | `tools/latency/latency_bench.py`（等价于本机 `~/.local/bin/bumi-latency-bench`） |
-| 结论 | **检索 P90 ≤ 60ms：本次 CPU 测试环境未通过**（本机有 8×H20，但测试 venv 是 CPU 版 PyTorch）；**串行拼装 ≤ 20ms：通过**（P90 16.6ms） |
+| 结论 | **检索 P90 ≤ 60ms：仍未通过，但 GPU 复测后已接近**：300 条 P90 **64.9ms**（超预算部分全部来自实体加成）、5000 条 P90 **221.7ms**（瓶颈转为 Qdrant local client）；**串行拼装 ≤ 20ms：通过**（P90 14.5 / 15.5ms） |
 
-> 一句话结论：本次压测跑在 **CPU 版 PyTorch + Qdrant local client** 上：本机其实有 **8×NVIDIA H20**
-> （见 §2.1），但测试环境 `~/.venvs/bumi` 装的是 `torch 2.8.0+cpu`，`MEM0_EMBED_DEVICE=auto` 因此
-> 回退 CPU。该形态下完整检索 P90 在 300 条语料为 **156.8ms**、5000 条为 **393.2ms**，达不到 60ms。
-> 把检索改成“基于流式识别前缀提前发起”只能把它移出串行路径、不阻塞回答，**不能降低检索本身的
-> 绝对时延**；而本次单次稠密查询编码 P90 已经是 64.4ms（CPU 编码），仅这一项就超预算。
-> 60ms 是否达标必须先在 CUDA 环境复测；工程上还需要服务端 Qdrant/HNSW 索引和实体加成移出
-> 首轮热路径，这些都要在目标部署环境复测后才能判定。
+> 一句话结论：目标部署形态是 **H20 + GPU 编码**，本报告先给 CPU 基线，再给 2026-09-23 的 GPU 复测
+> （`~/.venvs/bumi-cuda`，torch 2.8.0+cu128，`CUDA_VISIBLE_DEVICES=4`，`--embed-device cuda`）。
+> 完整检索 P90 从 CPU 的 156.8 / 393.2ms 降到 **64.9ms（300 条）** 与 **221.7ms（5000 条）**：
 >
-> 串行关键路径（一轮总时长减去检索）实测 P50 15.4ms、**P90 16.6ms**（n=8），满足 ≤20ms 预算；
-> 但进程启动后的第一轮是 33.3ms（冷启动），需要预热或单列豁免。
+> - **300 条已经很接近达标**：不含实体加成的查询 P90 只有 **41.5ms**，超预算的全部来自**实体加成**
+>   （含实体分组 P90 66.2ms；实体加成本身 GPU 下 24.2ms，是一次额外的批量编码）。
+> - **5000 条仍差得远**：瓶颈已经不在编码，而是 **Qdrant local client 的精确扫描**（稠密路 P90 89.6ms +
+>   BM25 路 82.5ms），与 GPU 无关，必须换 Qdrant Server/HNSW。
+> - 串行关键路径 P90 **14.5ms（300 条）/ 15.5ms（5000 条）**，满足 ≤20ms；首轮冷启动 25–26ms 仍需预热或豁免。
+>
+> 结论：GPU 解决了“编码”这一项（P90 64.4→23.1ms），剩下两个互相独立的否决项——**实体加成**
+> 和**本地 Qdrant**——要在验收前各自解决；提前发起只能把检索移出串行路径，不能替代这两个修复。
+>
+> CPU 基线（`~/.venvs/bumi`，torch 2.8.0+cpu）保留在 §3.1–3.6：完整检索 P90 156.8ms（300 条）/
+> 393.2ms（5000 条），串行 P90 16.6 / 16.7ms。
 
 ---
 
@@ -61,8 +66,8 @@ t_serial = max(0, t_retrieval - t_lead) + t_assembly
 
 | 编号 | 指标 | 预算 | 本次结果 |
 |---|---|---|---|
-| B1 | L3 检索（预取分支，目标部署/目标规模） | P90 ≤ 60ms | 本次 CPU 环境未通过（见 §3）；CUDA 环境待复测 |
-| B2 | 串行上下文拼装（ASR 终稿 → memory_context） | P90 ≤ 20ms | 通过：16.6ms（首轮冷启动 33.3ms 待处理） |
+| B1 | L3 检索（预取分支，目标部署/目标规模） | P90 ≤ 60ms | 未通过：CPU 156.8 / 393.2ms；GPU 64.9ms（300 条）/ 221.7ms（5000 条），见 §3.7 |
+| B2 | 串行上下文拼装（ASR 终稿 → memory_context） | P90 ≤ 20ms | 通过：CPU 16.6ms、GPU 14.5ms（首轮冷启动 25–33ms 待处理） |
 | B3 | L1 当前轮落库（`reserve_turn`） | P90 ≤ 10ms | 通过：2.3ms |
 | B4 | Prompt 持久化（`save_turn_prompt`） | P90 ≤ 10ms | 通过：1.2ms |
 | B5 | L3 整理/抽取 | 异步，不进串行预算 | 未测（后台任务） |
@@ -79,7 +84,7 @@ t_serial = max(0, t_retrieval - t_lead) + t_assembly
 | 项目 | 值 |
 |---|---|
 | 机器 | Linux，180 逻辑 CPU，1929 GiB 内存 |
-| GPU | 本机有 **8×NVIDIA H20**（97.8 GiB/卡，驱动 580.178.04，CUDA 13.0）；但测试环境 `~/.venvs/bumi` 是 `torch 2.8.0+cpu`，`torch.cuda.is_available()==False`，`MEM0_EMBED_DEVICE=auto` 回退 CPU。**本次压测未使用 GPU** |
+| GPU | 本机有 **8×NVIDIA H20**（97.8 GiB/卡，驱动 580.178.04，CUDA 13.0）。CPU 基线用 `~/.venvs/bumi`（`torch 2.8.0+cpu`，`auto` 回退 CPU）；**GPU 复测用 `~/.venvs/bumi-cuda`（`torch 2.8.0+cu128`，`CUDA_VISIBLE_DEVICES=4`，`--embed-device cuda`）**，见 §3.7 |
 | Python | 3.10.12（`~/.venvs/bumi`） |
 | 记忆栈 | mem0 2.0.20，Qwen3-Embedding-0.6B（1024 维，本地文件），spaCy 词形还原/实体抽取，fastembed `Qdrant/bm25` |
 | 向量库 | **Qdrant local client**（`QdrantClient(path=...)`，单进程锁，非 Qdrant Server/HNSW） |
@@ -134,6 +139,9 @@ torch 下会静默回退）。
 
 ## 3. 测试结果
 
+§3.1–3.6 是 **CPU 基线**（`~/.venvs/bumi`，torch 2.8.0+cpu）；**GPU（H20）复测在 §3.7**，
+表结构与口径完全一致，可直接对照。
+
 原始数据：
 
 - `mem0-runtime/logs/latency-final-300.json` / `.txt`（300 条，8 查询 × 20 次 + 引擎前台）
@@ -141,6 +149,8 @@ torch 下会静默回退）。
 - `mem0-runtime/logs/latency-final-5000.json` / `.txt`（5000 条，8 查询 × 20 次 + 引擎前台）
 - `mem0-runtime/logs/latency-final-5000-assembly.json` / `.txt`（5000 条，串行拼装分解）
 - `mem0-runtime/logs/latency-qdrant-scale.json` / `.txt`（Qdrant 本地检索规模伸缩）
+- §3.7 GPU：`mem0-runtime/logs/latency-gpu-300*.json|txt`、`latency-gpu-5000*.json|txt`、
+  `latency-qdrant-scale-gpu.json|txt`
 
 ### 3.1 总检索时延（`memory.search`，n=160）
 
@@ -265,6 +275,62 @@ HNSW 服务端索引。这条曲线意味着：**即使编码变成 0ms，本地
 写入侧结论：L1 当前轮事务（`reserve_turn`）P90 2.3ms、Prompt 持久化 P90 1.2ms，均远低于 10ms
 预算；L3 批写入是离线/异步整理路径，不属于回答关键路径，当前吞吐约 735–800 条/秒（本地 client）。
 
+### 3.7 GPU（H20）复测
+
+环境：`~/.venvs/bumi-cuda`（`torch 2.8.0+cu128`）、`CUDA_VISIBLE_DEVICES=4`、`--embed-device cuda`；
+其余（合成语料、8 条查询、`top_k=5`、Qdrant local client）与 §3.1–3.6 完全一致。原始 JSON 带
+`environment` 块，可直接核对 `torch_cuda_available=true`、`resolved_embed_device=cuda`、
+`torch_cuda_devices=['NVIDIA H20']`、`torch_version=2.8.0+cu128`。
+
+原始数据：`latency-gpu-300.json|txt`、`latency-gpu-300-assembly.json|txt`、
+`latency-gpu-5000.json|txt`、`latency-gpu-5000-assembly.json|txt`、`latency-qdrant-scale-gpu.json|txt`。
+
+总检索时延（`memory.search`，n=160，单位 ms）：
+
+| 语料 | 均值 | 中位 | **P90** | 最大 |
+|---|---:|---:|---:|---:|
+| 300 | 52.8 | 60.6 | **64.9** | 76.0 |
+| 5000 | 210.8 | 215.2 | **221.7** | 419.8 |
+
+分阶段（P90，单位 ms）：
+
+| 阶段 | 300 条 | 5000 条 |
+|---|---:|---:|
+| spaCy 词形还原 | 1.9 | 2.3 |
+| spaCy 实体抽取 | 4.2 | 4.7 |
+| **稠密查询编码（Qwen3，GPU）** | **23.1** | **24.0** |
+| 语义路 Qdrant 检索 | 7.1 | 89.6 |
+| BM25 路检索 | 5.3 | 82.5 |
+| **实体加成检索** | **24.2** | 25.0 |
+| **总计** | **64.9** | **221.7** |
+
+CPU → GPU 对照（P90，单位 ms）：
+
+| 项目 | CPU（`bumi`） | GPU（`bumi-cuda`） | 变化 |
+|---|---:|---:|---|
+| 稠密查询编码，300 条 | 64.4 | 23.1 | −64% |
+| 实体加成，300 条 | 66.5 | 24.2 | −64% |
+| 总检索，300 条 | 156.8 | **64.9** | −59% |
+| 总检索，5000 条 | 393.2 | **221.7** | −44% |
+| 串行拼装 P90（300 / 5000） | 16.6 / 16.7 | **14.5 / 15.5** | 略降 |
+
+300 条按是否触发实体加成分组：不含实体加成 P90 **41.5ms（已达标）**，含实体加成 P90 **66.2ms
+（超预算）**。即 300 条这一档的超预算**完全来自实体加成的第二次编码**。
+
+引擎前台路径（0.2s 截止）：
+
+| 语料 | `prepare_prompt` 单轮（ms） | 超过截止 | `recall_status` |
+|---|---|---:|---|
+| 300 | 68.1 / 53.6 / 52.3 / 75.7 | 0/4 | `ok`×4 |
+| 5000 | 234.7 / 219.6 / 220.5 / 224.1 | 4/4 | `unavailable`×4 |
+
+串行分解（5s 等待上限，n=8）：检索 P50 56.5 / P90 73.2（300 条）、242.8 / 250.7（5000 条）；
+**串行 P50 14.2 / P90 14.5（300 条）、14.7 / 15.5（5000 条）**；首轮冷启动 25.4 / 26.1ms。
+
+GPU 环境下的 Qdrant local 规模探针（随机向量，30 次查询，P90）：300→5.9ms、1000→17.1ms、
+3000→49.3ms、10000→171.8ms；同机早前一次运行是 9.2 / 25.5 / 72.6 / 253.4ms，说明这台共享机器本身
+有约 ±30% 的 run-to-run 抖动，但**线性增长、“本地 client 无 HNSW”的结论不变**。
+
 ---
 
 ## 4. 分析
@@ -279,7 +345,8 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 - 本地 Qdrant 让“规模”成为第二个独立否决项；
 - 实体加成让“含实体查询”成为第三个否决项。
 
-三项互相独立，必须分别解决，不能靠“提前发起”一起绕过。
+三项互相独立，必须分别解决，不能靠“提前发起”一起绕过。GPU 复测（§3.7）后编码这一项已解决，
+剩余的实体加成与本地 Qdrant 两项见 §4.3。
 
 ### 4.2 提前发起能买到什么、买不到什么
 
@@ -298,16 +365,17 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 在当前 150–500ms 的检索上，提前发起既买不到 60ms 达标，也买不到串行 ≤20ms（会退化成“等检索”）。
 另外，前缀与终稿不一致时的缓存复用规则必须单独定义（见附录 B），否则会返回基于半句话的错误候选。
 
-### 4.3 为什么目标形态有希望
+### 4.3 GPU 复测后的差距（实测，不再是估算）
 
-- `docs/stage0/REPORT.md`：CUDA FP16 单条编码 P95 约 10.3ms，CPU 同口径 53–216ms；常驻 GPU 编码
-  能把最大单项从 64ms 降到约 10ms。
-- 服务端 Qdrant(HNSW) + `user_id/agent_id` payload 索引可把单路检索与规模解耦；本地 client 的
-  ~25ms/1000 向量线性扫描不适用于生产规模。
-- 实体加成（P90 66.5ms）本质是第二次编码 + 实体库检索；把它并入同一次前向、后置到下一轮，
-  或只在低置信时触发，可以从 P90 里去掉。
+GPU 复测把问题切成两个互不依赖的剩余项：
 
-以上都是**待验证的设计判断**，不是本次测量结论；必须在目标部署用同样口径复测。
+| 规模 | 剩余瓶颈 | 证据 | 修复方向 |
+|---|---|---|---|
+| 300 条 | **实体加成** | 无实体查询 P90 41.5ms（达标），含实体查询 66.2ms；实体加成自身 P90 24.2ms，是第二次编码 | 并入同一次前向 / 后置到下一轮 / 低置信才触发；或复用查询向量 |
+| 5000 条 | **Qdrant local client** | 稠密路 P90 89.6ms + BM25 路 82.5ms，编码只占 24ms | 换 Qdrant Server + HNSW + payload 索引 |
+
+另外，`docs/stage0/REPORT.md` 的独立探针（CUDA FP16 单条编码 P95 约 10.3ms）说明编码还有进一步压缩空间
+（本次 23.1ms 含批处理与框架开销），但**它已经不是当前的限制项**，继续优化编码不会让 5000 条达标。
 
 ---
 
@@ -315,23 +383,24 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 
 ### 5.1 结论
 
-1. **检索 P90 ≤60ms 在本次 CPU 环境未通过。** 本次 CPU 版 PyTorch + 本地 Qdrant 环境下，300 条 P90
-   156.8ms，5000 条 P90 393.2ms；不含实体加成的查询分组 P90 也已 76.7ms，含实体加成 157.7ms。
-2. **串行关键路径 ≤20ms 通过（有保留）。** 检索之外的串行拼装 P90 16.6/16.7ms（n=8）；
-   首轮冷启动 33.3ms，需预热或豁免；样本量小，需要扩到 ≥50 轮回归。
-3. **当前形态不应上线直接面对 60ms 验收。** 5000 条时前台 0.2s 截止已 4/4 降级。
-4. **60ms 是部署形态指标，不是纯代码指标。** 需要 GPU 编码、Qdrant server/HNSW、实体加成优化三者到位后重测。
-5. **结论有环境局限。** 本机有 8×H20，但本次压测用的是 CPU 版 PyTorch；“未通过”只针对该 CPU 形态，
-   不能代表 CUDA 部署。本报告已按“本次测试环境”口径修正，GPU 复测是下一优先级。
+1. **GPU 编码解决了最大单项。** 稠密编码 P90 64.4→23.1ms；300 条完整检索 P90 156.8→**64.9ms**，
+   5000 条 393.2→**221.7ms**。
+2. **检索 P90 ≤60ms 仍未通过，且两个规模的瓶颈不同。**
+   - 300 条差在**实体加成**：无实体 P90 41.5ms（达标），含实体 66.2ms，超预算部分全部来自那次额外编码。
+   - 5000 条差在**Qdrant local client**：稠密 89.6 + BM25 82.5ms 的精确扫描，编码已不是主因。
+3. **串行关键路径 ≤20ms 通过（有保留）。** GPU 下 P90 14.5（300 条）/15.5ms（5000 条），n=8；
+   首轮冷启动 25–26ms 需预热或豁免；样本量小，需要扩到 ≥50 轮回归。
+4. **5000 条前台 0.2s 截止仍 4/4 降级**（`recall_status=unavailable`），当前形态不应直接面对 60ms 验收。
+5. **60ms 是部署形态指标。** GPU 已就位，剩余两项（实体加成、Qdrant Server/HNSW）各自解决后即可复测判定。
 
 ### 5.2 整改建议
 
 | 优先级 | 事项 | 验收标准 |
 |---|---|---|
-| P0 | 常驻 GPU/专用编码服务（FP16 或等价），编码进入目标批量/线程模型 | 目标规模下单条查询编码 P90 ≤15ms |
-| P0 | Qdrant Server + HNSW + payload 索引；本地 client 仅限开发/小数据 | ≥10k 向量、带 `user_id/agent_id` 过滤，单路 P90 ≤15ms |
-| P0 | 实体加成移出首轮热路径：并入同一批前向、后置到下一轮，或低置信才触发 | 含实体查询与不含实体查询的检索 P90 差 ≤10ms |
-| P1 | 一次查询只编码一次，复用查询向量做实体库检索 | 实体类查询不再出现第二次 50–65ms 编码 |
+| P0 | Qdrant Server + HNSW + payload 索引；本地 client 仅限开发/小数据 | ≥10k 向量、带 `user_id/agent_id` 过滤，单路 P90 ≤15ms（当前 89.6ms） |
+| P0 | 实体加成移出首轮热路径：并入同一批前向、后置到下一轮，或低置信才触发 | 含实体与不含实体查询的检索 P90 差 ≤10ms（当前 41.5 vs 66.2ms） |
+| P0 | GPU 部署固化：`--embed-device cuda` + fail-fast 不回退；观测实际 device | `resolved_embed_device=cuda`、编码 P90 ≤25ms（已达成 23.1ms） |
+| P1 | 一次查询只编码一次，复用查询向量做实体库检索 | 实体类查询不再出现第二次 24ms（GPU）编码 |
 | P1 | 实现流式前缀预取契约（附录 B）并打点 | 预取 P90 ≤60ms；命中率/陈旧重算率可观测；预取失败不影响 prepare |
 | P1 | 串行拼装回归：把 `--assembly` 纳入部署验收/CI | 排除首轮后串行 P90 ≤20ms，样本 ≥50 轮 |
 | P1 | 扩展预热：覆盖 BM25、spaCy、实体编码器与首轮 Qdrant | ready 之后第一轮不再出现 32ms 串行 / 1.3s 首查 |
@@ -341,11 +410,13 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 
 ## 6. 限制与未验证项
 
-本报告能**否决本次测试的 CPU 形态**，但**不能证明目标部署已达标**：
+GPU 复测已把结论推进到“编码不再是瓶颈”，但**仍不能证明目标部署已达标**：
 
-- 本次压测用的是 `~/.venvs/bumi` 的 **CPU 版 PyTorch**，不是目标部署形态；本机虽有 8×H20 但未启用
-  CUDA，GPU 编码数据引用自 `docs/stage0/REPORT.md` 的另一台机器，口径不同。
-- 向量库是 Qdrant local client，不是服务端 HNSW/payload 索引。
+- GPU 复测是**单卡（H20，`CUDA_VISIBLE_DEVICES=4`）、单进程、无并发**；多用户并发下的编码排队未测。
+- CPU 基线与 GPU 复测用了两个 venv（`bumi` = torch+cpu，`bumi-cuda` = torch+cu128），
+  依赖版本除 torch 外来自同一份 freeze；GPU 只测了 `--embed-device cuda` 一条路径，
+  没有对比半精度/量化/`torch.compile` 等变体。
+- 向量库在两组测试里都是 **Qdrant local client**，不是服务端 HNSW/payload 索引；5000 条的结论主要受它支配。
 - 合成语料 + 8 条固定查询，不是真实记忆分布；300/5000 条远小于生产规模。
 - 串行分解 n=8，样本偏小；首轮冷启动与稳态混在一起，需要用 ≥50 轮、排除首轮的统计复测。
 - 不含 HTTP/Pydantic/JSON 序列化/反向代理、ASR、声纹、DDS 播放和回答模型；这些是另外的指标。
@@ -359,30 +430,43 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 ## 7. 复现
 
 ```bash
-# 0. 依赖：仓库 pyproject 的 runtime；本机用 ~/.venvs/bumi，脚本会自动 re-exec
+# 0a. CPU 基线：依赖仓库 pyproject 的 runtime；脚本会自动 re-exec 到 ~/.venvs/bumi
+# 0b. GPU 复测：先建独立环境（不改 CPU 基线）
+/usr/bin/python3 -m venv ~/.venvs/bumi-cuda
+TMPDIR=~/.tmp/pip-tmp ~/.venvs/bumi-cuda/bin/pip install \
+  --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0
+TMPDIR=~/.tmp/pip-tmp ~/.venvs/bumi-cuda/bin/pip install -r <(原 venv 的 pip freeze，去掉 torch 行)
+TMPDIR=~/.tmp/pip-tmp ~/.venvs/bumi-cuda/bin/pip install --no-deps -e ~/git/Bumi_Mem
+# 注意：pip 的 TMPDIR 必须在 /data1 上；本机 / 只有 20G，默认 /tmp 会被 2GB 的 torch 写满
+# 跑 GPU 时统一加前缀（选一张空闲卡，并把 clash 的 socks 代理去掉）
+export GPU_PREFIX="env -u ALL_PROXY -u all_proxy CUDA_VISIBLE_DEVICES=4 MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python"
+
 # 1. 300 条：冷启动 / 写入 / 分阶段检索 / 引擎前台
-tools/latency/latency_bench.py --corpus 300 --repeats 20 --with-engine \
+$GPU_PREFIX tools/latency/latency_bench.py --corpus 300 --repeats 20 --with-engine --embed-device cuda \
   --data-root ~/mem0-runtime/latency-bench-final300 \
-  --json ~/mem0-runtime/logs/latency-final-300.json
+  --json ~/mem0-runtime/logs/latency-gpu-300.json
 
 # 2. 串行拼装分解（必须独立进程：本地 Qdrant 单实例锁）
-tools/latency/latency_bench.py --assembly \
-  --data-root ~/mem0-runtime/latency-bench-final300 --assembly-read-timeout 5.0 \
-  --json ~/mem0-runtime/logs/latency-final-300-assembly.json
+$GPU_PREFIX tools/latency/latency_bench.py --assembly --embed-device cuda \
+  --data-root ~/mem0-runtime/latency-bench-gpu300 --assembly-read-timeout 5.0 \
+  --json ~/mem0-runtime/logs/latency-gpu-300-assembly.json
 
 # 3. 5000 条规模复测（同 1、2，换 data-root）
-tools/latency/latency_bench.py --corpus 5000 --repeats 20 --with-engine \
-  --data-root ~/mem0-runtime/latency-bench-final5000 \
-  --json ~/mem0-runtime/logs/latency-final-5000.json
-tools/latency/latency_bench.py --assembly \
-  --data-root ~/mem0-runtime/latency-bench-final5000 --assembly-read-timeout 5.0 \
-  --json ~/mem0-runtime/logs/latency-final-5000-assembly.json
+$GPU_PREFIX tools/latency/latency_bench.py --corpus 5000 --repeats 20 --with-engine --embed-device cuda \
+  --data-root ~/mem0-runtime/latency-bench-gpu5000 \
+  --json ~/mem0-runtime/logs/latency-gpu-5000.json
+$GPU_PREFIX tools/latency/latency_bench.py --assembly --embed-device cuda \
+  --data-root ~/mem0-runtime/latency-bench-gpu5000 --assembly-read-timeout 5.0 \
+  --json ~/mem0-runtime/logs/latency-gpu-5000-assembly.json
 
 # 4. Qdrant 本地 client 规模伸缩探针（随机向量，只测存储层）
-tools/latency/latency_bench.py --scale-probe 300,1000,3000,10000 \
-  --data-root ~/mem0-runtime/latency-scale-qdrant \
-  --json ~/mem0-runtime/logs/latency-qdrant-scale.json
+$GPU_PREFIX tools/latency/latency_bench.py --scale-probe 300,1000,3000,10000 \
+  --data-root ~/mem0-runtime/latency-scale-qdrant-gpu \
+  --json ~/mem0-runtime/logs/latency-qdrant-scale-gpu.json
 ```
+
+CPU 基线把 `$GPU_PREFIX` 换成 `MEM0_PYTHON=$HOME/.venvs/bumi/bin/python`、去掉 `--embed-device cuda`
+并把 `--data-root/--json` 换回 `*-final*` 即可。
 
 注：脚本在解释器退出时可能打印一行 `terminate called without an active exception`，发生在 JSON 落盘之后，
 不影响计时与结果；如影响采集可重定向 stderr。
