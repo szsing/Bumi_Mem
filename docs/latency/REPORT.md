@@ -90,6 +90,26 @@ Qwen3-Embedding 单条编码 P95 约 **10.3ms**（32/128/256 tokens），同批 
 53.0 / 115.6 / 215.6ms。该数据只能作为量级参考，不是本机复测结果。**本机 H20 的 GPU 编码指标尚未
 测量**：要判定 GPU 路径能否达标，需要在装有 CUDA 版 PyTorch 的环境用同一脚本复测，这是本次首要补测项。
 
+#### 2.1.1 环境证据在哪里
+
+脚本每次运行都会在最前面打印 `⓪ 环境证据`，并把同一份结构写进 JSON 的 `environment` 字段，
+验收时不需要翻日志猜环境：
+
+| 字段 | 含义 | 本次取值（示例） |
+|---|---|---|
+| `hostname` / `platform` / `logical_cpus` | 宿主 | `AIC-C01-H20-n01` / `Linux-5.15...` / 180 |
+| `python_executable` | 实际解释器 | `/data1/zhangran/.venvs/bumi/bin/python` |
+| `MEM0_EMBED_DEVICE_env` / `requested_embed_device` / `resolved_embed_device` | 环境变量、请求与实际生效的编码设备 | `auto` / `auto` / **`cpu`** |
+| `torch_version` / `torch_cuda_build` / `torch_cuda_available` / `torch_cuda_device_count` / `torch_cuda_devices` | torch 与 CUDA 证据 | `2.8.0+cpu` / `None` / **`False`** / 0 / 缺省 |
+| `embed_model` | 编码模型路径 | `.../Qwen3-Embedding-0.6B` |
+| `vector_backend` / `vector_store_collection` | 向量库形态与集合 | `qdrant-local-path` / `bumi_latency_bench` |
+| `config.corpus` / `config.unique_corpus` | 请求语料条数 / 实际唯一向量数 | 5000 / 5000 |
+| `environment.warmup` | 冷启动是否走完 | `memory_construct_ms`、`bm25_available`、`first_search_ms`、`first_search_hits`，引擎路径另有 `engine_warmup_ms` |
+
+判定 GPU 是否真的生效，必须同时看 `torch_cuda_available=true`、`resolved_embed_device=cuda`
+和 `torch_cuda_devices` 非空；只写 `MEM0_EMBED_DEVICE=cuda` 不代表真的用了 GPU（`auto` 在 CPU 版
+torch 下会静默回退）。
+
 ### 2.2 语料、查询与采样
 
 - 合成语料：300 条与 5000 条唯一文本（`point_id` 按文本去重，实际向量条数=语料条数）。
@@ -366,6 +386,10 @@ tools/latency/latency_bench.py --scale-probe 300,1000,3000,10000 \
 
 注：脚本在解释器退出时可能打印一行 `terminate called without an active exception`，发生在 JSON 落盘之后，
 不影响计时与结果；如影响采集可重定向 stderr。
+
+注：如果运行 shell 导出了 `ALL_PROXY=socks5://…`（clash 默认会设置），mem0 在初始化时构造 OpenAI
+客户端会因缺少 `httpx[socks]` 直接报 `ImportError: Using SOCKS proxy...`。运行前 `unset ALL_PROXY all_proxy`
+或 `pip install "httpx[socks]"`，否则压测和服务都会起不来。
 
 ---
 

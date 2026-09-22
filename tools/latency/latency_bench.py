@@ -247,7 +247,67 @@ def load_secrets() -> None:
 # --------------------------------------------------------------------------- #
 # 各阶段测量
 # --------------------------------------------------------------------------- #
-def measure_cold_start(ltm, data_dir: Path, recorder: Recorder, query: str) -> None:
+def collect_environment(requested_device: str, resolved_device: str, data_dir: Path,
+                        *, vector_backend: str | None = None, collection_name: str | None = None,
+                        embed_model: str | None = None) -> dict[str, object]:
+    """把验收需要的硬件/软件/后端证据固化成结构化字段，避免只留在 stdout。"""
+    import platform
+
+    if vector_backend is None:
+        vector_backend = "qdrant-local-path" if (data_dir / "qdrant").exists() else "unknown"
+    env: dict[str, object] = {
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python_version": sys.version.split()[0],
+        "python_executable": sys.executable,
+        "logical_cpus": os.cpu_count(),
+        "requested_embed_device": requested_device,
+        "resolved_embed_device": resolved_device,
+        "MEM0_EMBED_DEVICE_env": os.environ.get("MEM0_EMBED_DEVICE"),
+        "vector_backend": vector_backend,
+        "data_dir": str(data_dir),
+    }
+    if collection_name:
+        env["vector_store_collection"] = collection_name
+    if embed_model:
+        env["embed_model"] = embed_model
+    try:
+        import torch
+
+        env["torch_version"] = torch.__version__
+        env["torch_cuda_build"] = torch.version.cuda
+        env["torch_cuda_available"] = bool(torch.cuda.is_available())
+        env["torch_cuda_device_count"] = torch.cuda.device_count()
+        if torch.cuda.is_available():
+            env["torch_cuda_devices"] = [torch.cuda.get_device_name(index)
+                                         for index in range(torch.cuda.device_count())]
+    except Exception as exc:  # noqa: BLE001 - 证据缺失也要留痕，不能静默
+        env["torch_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        import mem0
+
+        env["mem0_version"] = getattr(mem0, "__version__", "unknown")
+    except Exception:  # noqa: BLE001
+        pass
+    return env
+
+
+def print_environment(env: dict[str, object]) -> None:
+    print("=" * 66)
+    print("⓪ 环境证据（验收口径，同时写入 JSON 的 environment 字段）")
+    for key in ("hostname", "platform", "python_version", "python_executable", "logical_cpus",
+                "requested_embed_device", "resolved_embed_device", "MEM0_EMBED_DEVICE_env",
+                "torch_version", "torch_cuda_build", "torch_cuda_available",
+                "torch_cuda_device_count", "torch_cuda_devices", "torch_error",
+                "mem0_version", "embed_model", "vector_backend", "vector_store_collection",
+                "data_dir"):
+        if key in env:
+            print(f"{key:<28}: {env[key]}")
+    print("=" * 66)
+
+
+def measure_cold_start(ltm, data_dir: Path, recorder: Recorder, query: str) -> dict[str, object]:
     memory = ltm.memory
     table_header("① 冷启动（一次性成本）")
     print(f"{'数据目录':<26} {str(data_dir)}")
@@ -259,9 +319,17 @@ def measure_cold_start(ltm, data_dir: Path, recorder: Recorder, query: str) -> N
     print(f"{'BM25 是否可用':<26} {'是' if encoder is not None else '否'}")
 
     started = time.perf_counter()
-    memory.search(query=query, top_k=1, filters={"run_id": f"warmup_{uuid.uuid4().hex}"},
-                  threshold=0.0, rerank=False)
-    print(fmt_row("首次 search（含模型预热）", [(time.perf_counter() - started) * 1000]))
+    warm_rows = memory.search(query=query, top_k=1, filters={"run_id": f"warmup_{uuid.uuid4().hex}"},
+                              threshold=0.0, rerank=False)
+    first_search_ms = (time.perf_counter() - started) * 1000
+    print(fmt_row("首次 search（含模型预热）", [first_search_ms]))
+    warm_rows = warm_rows.get("results", warm_rows) if isinstance(warm_rows, dict) else warm_rows
+    return {
+        "bm25_encoder_load_ms": bm25_ms,
+        "bm25_available": encoder is not None,
+        "first_search_ms": first_search_ms,
+        "first_search_hits": len(warm_rows or []),
+    }
 
 
 def measure_write_path(ltm, corpus: list[str]) -> int:
@@ -588,6 +656,9 @@ def run_scale_probe(data_root: Path, sizes: list[int], json_out: str | None) -> 
 
     probe_root = data_root / "qdrant-scale"
     probe_root.mkdir(parents=True, exist_ok=True)
+    environment = collect_environment("not-used", "not-used", probe_root,
+                                      vector_backend="qdrant-local-path")
+    print_environment(environment)
     rng = np.random.default_rng(0)
     filters = {"user_id": "bench_user", "agent_id": "bumi_companion"}
     table_header("⑩ 本地 Qdrant 稠密检索规模伸缩（随机向量，非语义质量证据）")
@@ -622,6 +693,7 @@ def run_scale_probe(data_root: Path, sizes: list[int], json_out: str | None) -> 
         payload = {"config": {"mode": "qdrant-scale-probe", "sizes": sizes,
                               "collection": "scale_<n>", "dim": 1024, "top_k": 5,
                               "data_dir": str(probe_root)},
+                   "environment": environment,
                    "scale": results}
         Path(json_out).expanduser().write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                                                encoding="utf-8")
@@ -643,6 +715,8 @@ def main() -> int:
     os.environ["MEM0_DATA_ROOT"] = str(data_root / "data")
     data_dir = data_root / "data" / "bumi_mem_l3"
     data_dir.mkdir(parents=True, exist_ok=True)
+    # 先加载外置 secrets，让环境证据记录的是实际生效的 MEM0_EMBED_DEVICE，而不是默认值。
+    load_secrets()
 
     if args.scale_probe:
         sizes = [int(part) for part in args.scale_probe.split(",") if part.strip()]
@@ -653,14 +727,22 @@ def main() -> int:
     from bumi_mem.providers import ProviderConfig
 
     device = args.embed_device or os.environ.get("MEM0_EMBED_DEVICE", "auto")
+    resolved_device = resolve_embed_device(device)
+    embed_model = MODEL_ROOT / "Qwen3-Embedding-0.6B"
+    # 本基准固定用 mem0 的 Qdrant local path client；换 server 时这里要改成对应标记。
+    environment = collect_environment(device, resolved_device, data_dir,
+                                      vector_backend="qdrant-local-path",
+                                      collection_name="bumi_latency_bench",
+                                      embed_model=str(embed_model))
     print("=" * 66)
     print("Bumi_Mem 时延基准")
     print(f"仓库      : {paths['repo']}")
     print(f"Python    : {paths['python']}")
     print(f"数据目录  : {data_dir}")
-    print(f"embed 设备: {resolve_embed_device(device)}（请求 {device}）")
+    print(f"embed 设备: {resolved_device}（请求 {device}）")
     print(f"语料条数  : {args.corpus}    每查询重复: {args.repeats}    top_k: {args.top_k}")
     print("=" * 66)
+    print_environment(environment)
 
     queries = DEFAULT_QUERIES
     if args.queries:
@@ -676,8 +758,9 @@ def main() -> int:
         if args.json_out:
             payload = {
                 "config": {"corpus": args.corpus, "repeats": args.repeats, "top_k": args.top_k,
-                           "device": resolve_embed_device(device), "data_dir": str(data_dir),
+                           "device": resolved_device, "data_dir": str(data_dir),
                            "mode": "assembly-only"},
+                "environment": {**environment, "warmup": decomposition.get("boot", {})},
                 "engine": {"decomposition": decomposition},
             }
             Path(args.json_out).expanduser().write_text(json.dumps(payload, ensure_ascii=False, indent=2),
@@ -689,15 +772,17 @@ def main() -> int:
     ltm = Mem0LongTermMemory(
         ProviderConfig(provider="deepseek", model="deepseek-chat",
                        base_url="https://api.deepseek.com/v1", api_key="benchmark-unused"),
-        Mem0AdapterConfig(data_dir=data_dir, embed_model=MODEL_ROOT / "Qwen3-Embedding-0.6B",
+        Mem0AdapterConfig(data_dir=data_dir, embed_model=embed_model,
                           embed_device=device, collection_name="bumi_latency_bench"),
     )
     construct_ms = (time.perf_counter() - started) * 1000
 
-    measure_cold_start(ltm, data_dir, Recorder(), queries[0])
+    cold_start = measure_cold_start(ltm, data_dir, Recorder(), queries[0])
     print(f"{'Memory.from_config 构造':<26} {construct_ms:>9.1f}   （含 embedding 模型加载）")
+    environment["warmup"] = {"memory_construct_ms": construct_ms, **cold_start}
 
     corpus = make_corpus(args.corpus)
+    unique_corpus = len(set(corpus))
     dimension = measure_write_path(ltm, corpus)
     print(f"{'向量维度':<26} {dimension}")
     measure_embedding_micro(ltm.memory, args.repeats)
@@ -716,14 +801,19 @@ def main() -> int:
             engine_payload["foreground"] = measure_engine(data_dir, args, queries[:4])
         except Exception as exc:  # noqa: BLE001
             print(f"\n引擎前台路径未能测量：{type(exc).__name__}: {exc}")
+        if "foreground" in engine_payload:
+            environment.setdefault("warmup", {})
+            environment["warmup"]["engine_warmup_ms"] = engine_payload["foreground"]["warmup_ms"]
 
     if args.json_out:
         payload = {
             "config": {
-                "corpus": args.corpus, "repeats": args.repeats, "top_k": args.top_k,
-                "threshold": args.threshold, "device": resolve_embed_device(device),
+                "corpus": args.corpus, "unique_corpus": unique_corpus,
+                "repeats": args.repeats, "top_k": args.top_k,
+                "threshold": args.threshold, "device": resolved_device,
                 "data_dir": str(data_dir),
             },
+            "environment": environment,
             "search": {query: {"total_ms": item["total"], "hits": item["hits"],
                                "stages_ms": item["stages"]}
                        for query, item in per_query.items()},
