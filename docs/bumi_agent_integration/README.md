@@ -235,7 +235,7 @@ Agent `.env.example` 默认 `BUMI_SPEAKER_ID_ENABLED=0`、`BUMI_SPEAKER_ID_MODE=
 
 可用连接参数：服务URL（不是DeepSeek模型URL）、BUMI_SERVICE_API_KEY、HTTP超时。示例见 `configs/bumi_agent.env.example`；Agent原Settings尚未读取这些新配置，须接线时添加。
 
-检索60ms目标没有在本次重新测量；HTTP往返、状态保存、DDS结算不是同一个指标。本次没有启动Agent、声纹服务、音频设备、真实模型或GPU。
+检索60ms目标没有在本次重新测量；HTTP往返、状态保存、DDS结算不是同一个指标。本次没有启动Agent、声纹服务、音频设备、真实模型或GPU。2026-09-22 的 CPU/本地 Qdrant 压测与串行拼装分解见 [时延压测报告](../latency/REPORT.md)。
 
 ## 5. 升级与验证
 

@@ -97,7 +97,7 @@ Agent integration MUST:
 
 ## 6. Timing and deployment
 
-Normal serial memory-read deadline remains `BUMI_MEMORY_READ_TIMEOUT=0.2`. Explicit recall phrases can use `BUMI_EXPLICIT_RECALL_TIMEOUT=1.0`; both are configurable wait/degradation policies, **not measured retrieval latency**. The user's target of retrieval below 60 ms requires verification on the actual embedding/Qdrant deployment. Core reads do not depend on that queue. SQLite overhead, reference rendering, network and model generation are separate metrics.
+Normal serial memory-read deadline remains `BUMI_MEMORY_READ_TIMEOUT=0.2`. Explicit recall phrases can use `BUMI_EXPLICIT_RECALL_TIMEOUT=1.0`; both are configurable wait/degradation policies, **not measured retrieval latency**. The user's target of retrieval below 60 ms requires verification on the actual embedding/Qdrant deployment. Core reads do not depend on that queue. SQLite overhead, reference rendering, network and model generation are separate metrics. 实测与差距见 [时延压测报告](../latency/REPORT.md)。
 
 Schema 6 adds tables and nullable/defaulted columns, preserving existing messages, sessions and jobs. Before upgrading a real database, stop the service and take a consistent SQLite backup (and the L3 backend backup according to its deployment procedure). The older binary must not open a schema-6 database; rollback means restoring a pre-upgrade backup, not lowering `user_version`. Test only on a copied database before production use.
 
