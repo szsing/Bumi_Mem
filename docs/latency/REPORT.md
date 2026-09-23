@@ -518,6 +518,9 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 `recall_ablation.py`（召回对照：语义 / +BM25 / +实体加成）、
 `preflight_check.py`（验收前环境预检，见 §8.1）。
 
+部署脚本：`scripts/qdrant_server.sh`（启停/状态/日志/copytruncate 轮转）、
+`scripts/make_service_env.py`（生成仓库外的 service.env）、`scripts/run_memory_service.sh`（起服务）。
+
 ```bash
 # 0a. CPU 基线：依赖仓库 pyproject 的 runtime；脚本会自动 re-exec 到 ~/.venvs/bumi
 # 0b. GPU 复测：先建独立环境（不改 CPU 基线）
@@ -619,6 +622,27 @@ tools/latency/preflight_check.py --require-gpu --require-server \
 2. 检索 P90 ≤60ms、P99 ≤100ms；
 3. 任一查询命中排名变差 → 该语料不适用“关实体加成”，改用“同一次前向/后置到下一轮”的方案。
 
+工具已支持外部语料，不需要改代码：把数据整理成
+
+```json
+{"memories": ["记忆原文（脱敏后）", "..."],
+ "probes": [{"query": "…", "expected": "必须与某条 memories 逐字一致的原文", "group": "分组名"}]}
+```
+
+然后：
+
+```bash
+$SRV tools/latency/recall_ablation.py --dataset /path/to/real.json \
+  --collection recall_real --data-root ~/mem0-runtime/recall-real --repeats 5 \
+  --json ~/mem0-runtime/logs/recall-real.json
+# 再以 BUMI_ENTITY_BOOST=on 跑一次同一条命令（换 --collection / --json 便于对比）
+```
+
+仓库里有一份可直接跑通的最小示例 `tools/latency/datasets/recall_demo.json`（10 条记忆 / 11 条查询，
+覆盖地点/时间/关键词/人物/编号/偏好/习惯/计划/称谓边界）；本次用它跑通：三档 Recall 1.00、
+MRR 0.82、逐查询排名完全一致。真实语料建议放在 `~/mem0-runtime/recall-real/`（仓库外），
+跑完把 JSON 结果落到 `~/mem0-runtime/logs/`。
+
 ### 8.3 尾延迟：稳态 P99 达标，真正的尾巴是后台整理
 
 - 稳态（20000 条，8 查询 × 100 次 = 800 样本，GPU + Server + 实体加成 off）：
@@ -681,6 +705,26 @@ preflight_check.py（环境）
   → latency_bench --concurrent 8（并发降级率）
   → recall_ablation.py（召回回归）
 ```
+
+### 8.7 服务与 Qdrant 的启停（已验证）
+
+```bash
+# 1) 首次生成 service.env（仓库外，权限 600；只从已有 secrets 读 DeepSeek Key，不打印）
+scripts/make_service_env.py --python $HOME/.venvs/bumi-cuda/bin/python \
+  --qdrant-url http://127.0.0.1:6333 --entity-boost off
+
+# 2) Qdrant Server：启停 / 状态 / 日志 / 轮转（copytruncate，运行中可轮转）
+scripts/qdrant_server.sh start | stop | status | logs 50 | rotate
+# 常驻环境建议加 cron：0 3 * * * QDRANT_LOG_MAX_BYTES=52428800 <repo>/scripts/qdrant_server.sh rotate
+
+# 3) 记忆服务
+export BUMI_SERVICE_ENV_FILE=$HOME/mem0-runtime/memory-service/service.env
+bash scripts/run_memory_service.sh     # BUMI_PYTHON 未设置时会自动探测 venv
+curl -sS http://127.0.0.1:8088/health/ready
+```
+
+本次实测：`{"status":"ready","warmed_up":true}`；随后用带 Bearer 的真实请求连打 5 轮
+`operation=prepare` + `operation=complete`，**端到端（含 HTTP/JSON/拼装）45–58ms，`recall_status=ok`**。
 
 ---
 

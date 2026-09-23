@@ -104,11 +104,17 @@ def bootstrap() -> dict[str, str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bumi_Mem 检索对照实验")
-    parser.add_argument("--fillers", type=int, default=200, help="干扰性填充记忆条数")
+    parser.add_argument("--fillers", type=int, default=None,
+                        help="干扰性填充记忆条数（默认：内置语料 200，--dataset 时 0）")
+    parser.add_argument("--dataset", default=None,
+                        help='真实/脱敏语料 JSON：{"memories": [...], '
+                             '"probes": [{"query","expected","group"}, ...]}')
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--threshold", type=float, default=0.1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--data-root", default=None)
+    parser.add_argument("--collection", default="bumi_ablation",
+                        help="Qdrant 集合名；跑真实语料时用独立集合，避免与内置语料混在一起")
     parser.add_argument("--json", dest="json_out", default=None)
     return parser.parse_args()
 
@@ -134,8 +140,28 @@ def point_id(text: str) -> str:
     return str(uuid.UUID(hashlib.sha1(text.encode("utf-8")).hexdigest()[:32]))
 
 
-def build_corpus(fillers: int) -> list[str]:
-    rows = [text for _, text, _ in PROBES] + DISTRACTORS
+def load_dataset(path: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """读取外部召回回归语料：memories 是记忆原文，probes 是 (query, expected, group)。"""
+    import json as _json
+
+    payload = _json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    memories = [str(item) for item in payload.get("memories", [])]
+    probes: list[tuple[str, str, str]] = []
+    for item in payload.get("probes", []):
+        probes.append((str(item["query"]), str(item["expected"]),
+                       str(item.get("group", "未分组"))))
+    if not memories or not probes:
+        raise ValueError("dataset 必须同时包含非空的 memories 与 probes")
+    missing = sorted({expected for _, expected, _ in probes if expected not in set(memories)})
+    if missing:
+        raise ValueError(
+            f"{len(missing)} 条标准答案不在 memories 里，无法计算 Recall；例如：{missing[0][:40]}")
+    return probes, memories
+
+
+def build_corpus(fillers: int, probes: list[tuple[str, str, str]],
+                 base_memories: list[str]) -> list[str]:
+    rows = [text for _, text, _ in probes] + DISTRACTORS + base_memories
     for index in range(fillers):
         subject = SUBJECTS[index % len(SUBJECTS)]
         verb = VERBS[(index // len(SUBJECTS)) % len(VERBS)]
@@ -181,13 +207,21 @@ def main() -> int:
         ProviderConfig(provider="deepseek", model="deepseek-chat",
                        base_url="https://api.deepseek.com/v1", api_key="benchmark-unused"),
         Mem0AdapterConfig(data_dir=data_dir, embed_model=MODEL_ROOT / "Qwen3-Embedding-0.6B",
-                          embed_device=device, collection_name="bumi_ablation"),
+                          embed_device=device, collection_name=args.collection),
     )
     memory = ltm.memory
     user_id, agent_id = "ablation_user", "bumi_companion"
     filters = {"user_id": user_id, "agent_id": agent_id}
 
-    corpus = build_corpus(args.fillers)
+    probes = PROBES
+    base_memories: list[str] = []
+    if args.dataset:
+        probes, base_memories = load_dataset(args.dataset)
+    fillers = args.fillers if args.fillers is not None else (0 if args.dataset else 200)
+    print(f"语料来源: {'内置合成语料' if not args.dataset else args.dataset}"
+          f"（记忆 {len(base_memories)} 条 + 干扰 {fillers} 条，查询 {len(probes)} 条）")
+
+    corpus = build_corpus(fillers, probes, base_memories)
     now = datetime.now(timezone.utc).isoformat()
     payloads = [{"data": text, "text_lemmatized": text, "user_id": user_id, "agent_id": agent_id,
                  "created_at": now, "updated_at": now, "hash": hashlib.sha1(text.encode()).hexdigest()}
@@ -244,7 +278,7 @@ def main() -> int:
     bm25_hits: dict[str, int] = {}
     entity_counts: dict[str, int] = {}
     boost_counts: dict[str, int] = {}
-    for query, _, _ in PROBES:
+    for query, _, _ in probes:
         rows = memory.vector_store.keyword_search(query=query, top_k=args.top_k, filters=filters)
         bm25_hits[query] = len(rows or [])
         found = extract_entities(query)
@@ -272,7 +306,7 @@ def main() -> int:
         reciprocal: list[float] = []
         latencies: list[float] = []
         detail = []
-        for query, target, group in PROBES:
+        for query, target, group in probes:
             target_id = point_id(target)
             hit_rank = 0
             for _ in range(args.repeats):
@@ -296,7 +330,8 @@ def main() -> int:
         }
 
     print(f"\n② 三种配置的召回与耗时（top_k={args.top_k}，每条查询重复 {args.repeats} 次）")
-    groups = ["中文·问句", "中文·关键词", "中文·编号", "中文·长句", "英文·对照"]
+    groups = [group for _, _, group in probes]
+    groups = list(dict.fromkeys(groups))  # 按数据集出现顺序，保持稳定
     header = f"{'配置':<20}" + "".join(f"{g:>12}" for g in groups) + f"{'总Recall':>10}{'MRR':>8}{'中位ms':>9}"
     print(header)
     print("-" * len(header))
