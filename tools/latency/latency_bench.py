@@ -273,6 +273,7 @@ def collect_environment(requested_device: str, resolved_device: str, data_dir: P
         "requested_embed_device": requested_device,
         "resolved_embed_device": resolved_device,
         "MEM0_EMBED_DEVICE_env": os.environ.get("MEM0_EMBED_DEVICE"),
+        "entity_boost": os.environ.get("BUMI_ENTITY_BOOST", "on"),
         "vector_backend": vector_backend,
         "data_dir": str(data_dir),
     }
@@ -306,6 +307,7 @@ def print_environment(env: dict[str, object]) -> None:
     print("⓪ 环境证据（验收口径，同时写入 JSON 的 environment 字段）")
     for key in ("hostname", "platform", "python_version", "python_executable", "logical_cpus",
                 "requested_embed_device", "resolved_embed_device", "MEM0_EMBED_DEVICE_env",
+                "entity_boost",
                 "torch_version", "torch_cuda_build", "torch_cuda_available",
                 "torch_cuda_device_count", "torch_cuda_devices", "torch_error",
                 "mem0_version", "embed_model", "vector_backend", "vector_store_collection",

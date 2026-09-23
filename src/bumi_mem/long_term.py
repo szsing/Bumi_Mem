@@ -111,6 +111,27 @@ def _vector_store_config(config: Mem0AdapterConfig) -> dict[str, Any]:
     return store
 
 
+def _apply_entity_boost_policy(memory, *, mode: str | None = None) -> str:
+    """实体加成开关：BUMI_ENTITY_BOOST=on|off。
+
+    本地实测（docs/latency/REPORT.md §3.8 与 retrieval-ablation）：实体加成在中文语料上
+    对 Recall/MRR 没有贡献，却要在检索里多付一次批量编码（GPU 下 P90 26–30ms）。
+    off 只跳过检索热路径上的加成计算，实体库仍照常写入，随时可切回 on。
+    """
+    mode = (mode or os.environ.get("BUMI_ENTITY_BOOST", "on")).strip().lower()
+    if mode not in {"on", "off"}:
+        raise ValueError("BUMI_ENTITY_BOOST must be 'on' or 'off'")
+    if mode == "off":
+        memory._compute_entity_boosts = lambda query_entities, filters: {}
+
+        async def _skip_async(query_entities, filters):
+            return {}
+
+        if hasattr(memory, "_compute_entity_boosts_async"):
+            memory._compute_entity_boosts_async = _skip_async
+    return mode
+
+
 class Mem0LongTermMemory:
     def __init__(self, llm: ProviderConfig, config: Mem0AdapterConfig) -> None:
         from mem0 import Memory
@@ -151,6 +172,7 @@ class Mem0LongTermMemory:
                 },
             }
         )
+        self.entity_boost = _apply_entity_boost_policy(self.memory)
 
     def warmup(self, *, query: str) -> None:
         warmup_mem0_backend(self.memory, query=query)

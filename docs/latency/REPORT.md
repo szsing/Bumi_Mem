@@ -8,7 +8,7 @@
 | 执行人 | 张冉 |
 | 被测版本 | Bumi_Mem `6315aaf`（main，schema 7 / v0.4 Agent API）、mem0 2.0.20 |
 | 压测脚本 | `tools/latency/latency_bench.py`（等价于本机 `~/.local/bin/bumi-latency-bench`） |
-| 结论 | **检索 P90 ≤ 60ms：仍差最后一项**。GPU + Qdrant Server 下 300/5000/20000 条的 P90 是 **62.2 / 66.8 / 63.0ms**，且**超预算全部来自实体加成**（不含实体查询 P90 只有 36–41ms）；**串行拼装 ≤ 20ms：通过**（P90 14.2–15.5ms） |
+| 结论 | **检索 P90 ≤ 60ms：达标**（GPU + Qdrant Server + `BUMI_ENTITY_BOOST=off`）：300/5000/20000 条 P90 = **35.0 / 35.9 / 37.1ms**；**串行拼装 ≤ 20ms：通过**（P90 14.2–15.5ms） |
 
 > 一句话结论：目标部署形态是 **H20 + GPU 编码 + Qdrant Server**。本报告给三档实测：CPU 基线、
 > GPU 复测、GPU + Qdrant Server 复测（`~/.venvs/bumi-cuda`，torch 2.8.0+cu128，`CUDA_VISIBLE_DEVICES=4`，
@@ -24,8 +24,10 @@
 > - 串行关键路径 P90 **14.2ms（5000 条，Server）**，满足 ≤20ms；首轮冷启动 25–26ms 仍需预热或豁免。
 > - 尾延迟仍要盯：三档的 max 是 167.8/176.1/179.1ms，来自冷启动/单次慢样本，验收时建议同时看 P99。
 >
-> 结论：三项否决项已解决两项（CPU 编码 → GPU；本地 client → Qdrant Server），**只剩实体加成**。
-> 提前发起仍然只是把检索移出串行路径，不能替代这一项修复。
+> 结论：三个否决项全部解决——CPU 编码 → GPU、本地 client → Qdrant Server、实体加成移出热路径
+> （`BUMI_ENTITY_BOOST=off`，消融与 ID 级 A/B 都显示没有召回损失，见 §3.9）。**检索 P90 达标**
+> （35.0 / 35.9 / 37.1ms），串行拼装 14.2ms 达标。提前发起（附录 B）仍是把检索移出串行路径的独立优化，
+> 不是达标的前提。
 >
 > CPU 基线（`~/.venvs/bumi`，torch 2.8.0+cpu）保留在 §3.1–3.6：完整检索 P90 156.8ms（300 条）/
 > 393.2ms（5000 条），串行 P90 16.6 / 16.7ms。
@@ -70,7 +72,7 @@ t_serial = max(0, t_retrieval - t_lead) + t_assembly
 
 | 编号 | 指标 | 预算 | 本次结果 |
 |---|---|---|---|
-| B1 | L3 检索（预取分支，目标部署/目标规模） | P90 ≤ 60ms | 仍差一项：GPU+Server 62.2 / 66.8 / 63.0ms（300/5000/20000 条），超预算全部来自实体加成，见 §3.8 |
+| B1 | L3 检索（预取分支，目标部署/目标规模） | P90 ≤ 60ms | **通过**：GPU+Server+`BUMI_ENTITY_BOOST=off` 下 35.0 / 35.9 / 37.1ms（300/5000/20000 条），见 §3.9 |
 | B2 | 串行上下文拼装（ASR 终稿 → memory_context） | P90 ≤ 20ms | 通过：CPU 16.6ms、GPU 14.5ms、GPU+Server 14.2ms（首轮冷启动 25–33ms 待处理） |
 | B3 | L1 当前轮落库（`reserve_turn`） | P90 ≤ 10ms | 通过：2.3ms |
 | B4 | Prompt 持久化（`save_turn_prompt`） | P90 ≤ 10ms | 通过：1.2ms |
@@ -373,6 +375,34 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 尾延迟：三档 max 167.8 / 176.1 / 179.1ms，`entity_boost` 出现单次 125–128ms 慢样本（冷启动/偶发）。
 建议验收同时看 P99，不要只看 P90。
 
+### 3.9 实体加成移出热路径（`BUMI_ENTITY_BOOST=off`）
+
+**质量证据（先证明可以关）**：
+
+- 消融实验 `mem0-runtime/logs/retrieval-ablation-20260922-184417.*`（317 条记忆 / 13 条查询）比较
+  「语义 only」「语义 + BM25」「完整（含实体加成）」三种配置，**Recall 0.92、MRR 0.71、逐查询命中排名
+  三者完全相同**——两条旁路在中文语料上没有召回收益。
+- 本次在 20000 条 GPU + Server 上做 ID 级 A/B：8 条查询在实体加成 on/off 下返回的 top-5
+  **ID 与顺序 8/8 完全一致**（Jaccard 1.00）。
+
+**实现**：`BUMI_ENTITY_BOOST=on|off`（默认 `on`，保持原行为）。`off` 时只在检索热路径跳过
+`_compute_entity_boosts`，实体库仍照常写入，可随时切回；代码见 `src/bumi_mem/long_term.py`，
+环境证据写入 JSON 的 `environment.entity_boost`。
+
+**时延（GPU + Qdrant Server，n=160，P90）**：
+
+| 规模 | 实体加成 on | 实体加成 off | 降幅 |
+|---:|---:|---:|---:|
+| 300 | 62.2ms | **35.0ms** | −44% |
+| 5000 | 66.8ms | **35.9ms** | −46% |
+| 20000 | 63.0ms | **37.1ms** | −41% |
+
+`off` 后所有分查询的中位都落在 33–36ms；引擎前台 0.2s 截止三档 0/4 超时、`recall_status=ok`。
+原始数据：`latency-eboff-300.*`、`latency-eboff5000.*`、`latency-eboff20000.*`。
+
+**结论：在 GPU + Qdrant Server + `BUMI_ENTITY_BOOST=off` 这一配置下，检索 P90 ≤60ms 达标**
+（35.0 / 35.9 / 37.1ms）。
+
 ---
 
 ## 4. 分析
@@ -407,18 +437,19 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 在当前 150–500ms 的检索上，提前发起既买不到 60ms 达标，也买不到串行 ≤20ms（会退化成“等检索”）。
 另外，前缀与终稿不一致时的缓存复用规则必须单独定义（见附录 B），否则会返回基于半句话的错误候选。
 
-### 4.3 GPU + Qdrant Server 之后只剩一项
+### 4.3 三个否决项都已解决
 
-三个否决项现在解决了两个：
+（开）实体加成时三个否决项解决两个，关掉后是三个全解决：
 
 | 项 | 状态 | 证据 |
 |---|---|---|
 | 查询编码 | ✅ GPU 已解决 | P90 64.4 → 23.1ms |
 | 向量库规模 | ✅ Qdrant Server 已解决 | 300 / 5000 / 20000 条检索 P90 = 62.2 / 66.8 / 63.0ms；本地 client 在 5000 条是 221.7ms |
-| **实体加成** | ❌ **未解决** | 不含实体查询 P90 36.4–40.9ms（三档全达标），含实体 63.3–67.5ms；实体加成本身 P90 26.3–29.5ms |
+| 实体加成 | ✅ 已移出热路径 | `BUMI_ENTITY_BOOST=off` 后三档 P90 = **35.0 / 35.9 / 37.1ms**；消融与 ID 级 A/B 均无召回差异 |
 
-把实体加成从首轮热路径移走（并入同一次前向 / 后置到下一轮 / 低置信才触发 / 复用查询向量），
-三档 P90 预期都会落到 **36–41ms**，60ms 即可达标。
+最终配置：**GPU 编码 + Qdrant Server/HNSW + `BUMI_ENTITY_BOOST=off`**，检索 P90 35–37ms、
+串行拼装 P90 14.2ms，两项预算都达标。后续如果要把实体加成重新上热路径，应改成
+「并入同一次前向 / 后置到下一轮 / 低置信才触发」，并重新验证召回与 P90。
 `docs/stage0/REPORT.md` 的独立探针（CUDA FP16 单条编码 P95 约 10.3ms）说明编码还有压缩空间
 （本次 23.1ms 含批处理与框架开销），但它已不是限制项。
 
@@ -428,24 +459,25 @@ BM25 8.4 ≈ **92ms（P90 口径，分项不可直接相加，仅示意）**，�
 
 ### 5.1 结论
 
-1. **两个否决项已解决。** GPU 把编码 P90 从 64.4 降到 23.1ms；Qdrant Server 把规模问题解耦——
-   300/5000/20000 条检索 P90 = 62.2 / 66.8 / 63.0ms（本地 client 在 5000 条是 221.7ms）。
-2. **检索 P90 ≤60ms 只差实体加成这一项。** 不含实体加成的查询三档 P90 都是 36.4–40.9ms，已经达标；
-   含实体加成的是 63.3–67.5ms，超预算的部分全部来自那次额外编码（P90 26.3–29.5ms）。
+1. **三个否决项全部解决。** GPU 把编码 P90 从 64.4 降到 23.1ms；Qdrant Server 把规模解耦
+   （本地 client 5000 条 221.7ms → Server 66.8ms）；`BUMI_ENTITY_BOOST=off` 把实体加成那次
+   额外编码（P90 26.3–29.5ms）移出热路径。
+2. **检索 P90 ≤60ms 达标。** GPU + Qdrant Server + `BUMI_ENTITY_BOOST=off` 下，300/5000/20000 条
+   P90 = **35.0 / 35.9 / 37.1ms**；消融与 ID 级 A/B 显示关掉实体加成没有召回损失。
 3. **串行关键路径 ≤20ms 通过（有保留）。** CPU 16.6 / GPU 14.5 / GPU+Server 14.2ms（n=8）；
    首轮冷启动 25–26ms 需预热或豁免；样本量小，需要扩到 ≥50 轮回归。
 4. **前台 0.2s 截止在 GPU+Server 下三档 0/4 超时、`recall_status=ok`**，不再是降级状态。
-5. **尾延迟要单独盯。** 三档 max 167.8–179.1ms（含单次 entity_boost 125ms 慢样本），验收建议同时看 P99。
+5. **尾延迟要单独盯。** 三档 max 110–179ms（含冷启动/单次慢样本），验收建议同时看 P99。
 
 ### 5.2 整改建议
 
 | 优先级 | 事项 | 验收标准 |
 |---|---|---|
-| P0 | **实体加成移出首轮热路径**：并入同一批前向、后置到下一轮，或低置信才触发 | 含实体与不含实体的检索 P90 差 ≤10ms（当前 36–41 vs 63–68ms）；这是达标前唯一剩余项 |
+| P0 | 部署配置里设 `BUMI_ENTITY_BOOST=off`（代码默认仍是 `on`，避免改既有行为）；要恢复必须先做召回回归 | 含实体与不含实体的检索 P90 差 ≤10ms（已达成：全部分查询 33–36ms） |
 | P0 | Qdrant Server + HNSW + payload 索引固化到部署（`BUMI_QDRANT_URL`）；本地 client 仅限开发 | ≥20k 向量、带 `user_id/agent_id` 过滤，单路 P90 ≤15ms（已达成 4–6ms，需写入部署文档/服务配置） |
 | P0 | GPU 部署固化：`--embed-device cuda` + fail-fast 不回退；观测实际 device | `resolved_embed_device=cuda`、编码 P90 ≤25ms（已达成 23.1ms） |
-| P1 | 一次查询只编码一次，复用查询向量做实体库检索 | 实体类查询不再出现第二次 24–30ms 编码 |
-| P1 | 尾延迟：定位 entity_boost 单次 125ms 与首轮冷启动 | P99 ≤100ms，首轮不进入 SLA 或有预热 |
+| P2 | 若将来要恢复实体加成：并入同一次前向 / 后置到下一轮 / 低置信才触发，并回归召回 | 恢复后含实体查询额外开销 ≤10ms，Recall/MRR 不低于关闭时 |
+| P1 | 尾延迟：定位首轮冷启动与偶发慢样本 | P99 ≤100ms，首轮不进入 SLA 或有预热 |
 | P1 | 实现流式前缀预取契约（附录 B）并打点 | 预取 P90 ≤60ms；命中率/陈旧重算率可观测；预取失败不影响 prepare |
 | P1 | 串行拼装回归：把 `--assembly` 纳入部署验收/CI | 排除首轮后串行 P90 ≤20ms，样本 ≥50 轮 |
 | P1 | 扩展预热：覆盖 BM25、spaCy、实体编码器与首轮 Qdrant | ready 之后第一轮不再出现 32ms 串行 / 1.3s 首查 |
@@ -464,6 +496,8 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 - Qdrant Server 是**单机单节点**、默认参数、无副本/无 TLS/无鉴权，且与压测进程同机（本机回环）；
   分布式、跨机网络、慢盘与容量上限都未验证。Server 写入改为 500 条/批是为了绕开 32MB 单请求上限。
 - 合成语料 + 8 条固定查询，不是真实记忆分布；20000 条仍小于真实长期记忆规模（趋势已持平，但未测 10 万级）。
+- 实体加成 `off` 的召回结论来自合成语料（317 条消融 + 20000 条 ID 级 A/B、8 条查询）；
+  真实用户语料仍需回归，不能据此断言所有语料都无收益。
 - 串行分解 n=8，样本偏小；首轮冷启动与稳态混在一起，需要用 ≥50 轮、排除首轮的统计复测。
 - 不含 HTTP/Pydantic/JSON 序列化/反向代理、ASR、声纹、DDS 播放和回答模型；这些是另外的指标。
 - 未做并发、长稳、内存增长、进程重启恢复、多用户同时检索的压测。
@@ -519,9 +553,10 @@ cd ~/.local/opt/qdrant-musl-1.19.1 && QDRANT__STORAGE__STORAGE_PATH=~/mem0-runti
   setsid nohup ./qdrant > ~/mem0-runtime/logs/qdrant-server.log 2>&1 < /dev/null &
 curl -sS http://127.0.0.1:6333/healthz   # healthz check passed / all shards are ready
 
-# 6. 切到 Server 复测（不同规模用不同 --collection，避免互相污染）
+# 6. 达标配置：Server + 实体加成 off（不同规模用不同 --collection，避免互相污染）
 export SRV="env -u ALL_PROXY -u all_proxy CUDA_VISIBLE_DEVICES=4 \
-  MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python BUMI_QDRANT_URL=http://127.0.0.1:6333"
+  MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python BUMI_QDRANT_URL=http://127.0.0.1:6333 \
+  BUMI_ENTITY_BOOST=off"
 $SRV tools/latency/latency_bench.py --corpus 5000 --repeats 20 --with-engine --embed-device cuda \
   --collection srv5000 --data-root ~/mem0-runtime/latency-bench-srv5000 \
   --json ~/mem0-runtime/logs/latency-srv-5000.json
