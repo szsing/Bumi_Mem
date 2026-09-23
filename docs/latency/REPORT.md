@@ -853,15 +853,19 @@ curl -sS http://127.0.0.1:8088/health/ready
 本次实测：`{"status":"ready","warmed_up":true}`；随后用带 Bearer 的真实请求连打 5 轮
 `operation=prepare` + `operation=complete`，**端到端（含 HTTP/JSON/拼装）45–58ms，`recall_status=ok`**。
 
-**端口与归属（本机踩坑）**：这台机器上 `0.0.0.0:8088` 可能被**其他用户的服务**占用
-（实测 `/data1/sunzhixing/Bumi_Mem/.venv/bin/python -m bumi_mem.api` 就在 8088 上）。
-两个后果：一是自己的服务会 bind 失败；二是 `curl 127.0.0.1:8088/health/ready` 返回
-`ready` 可能根本不是自己的实例。做法：
+**端口分配与归属（本机约定，2026-09-23 确认）**：`8088` 是记忆服务的默认端口，但**端口是主机级
+资源、不按用户隔离**——这台机器上 `0.0.0.0:8088` 已经是 **sunzhixing 的实例**
+（`/data1/sunzhixing/Bumi_Mem/.venv/bin/python -m bumi_mem.api`）。
+**决定：8088 归他，我们的验收实例固定用 8099**（`BUMI_HOST=127.0.0.1`）。
+
+两个后果与做法：
 
 1. 用 `BUMI_PORT` 换一个端口（本次自己用 `8099`）；
 2. 启动后用**自己的 `BUMI_SERVICE_API_KEY`** 发一次 `operation=prepare` 验证归属
    （别人的服务不会接受你的密钥，且返回的 `agent_id` 应对得上自己的配置）；
 3. 不要 kill 不属于自己的进程；`pgrep -f bumi_mem.api` 会同时列出其他用户的服务。
+4. `scripts/make_service_env.py` 现在会在目标端口已被占用时给出警告；
+   `configs/memory_service.env.example` 里也写明了本机约定。
 
 本次验收实例：`127.0.0.1:8099`，`BUMI_ENTITY_BOOST=off`，长句 `prepare` 44–71ms（中位约 50ms），
 `recall_status=ok`；同一问句在 `on` 下稳态约 72ms。

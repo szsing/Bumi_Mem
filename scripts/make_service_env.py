@@ -14,11 +14,19 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import socket
 import stat
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """端口是主机级资源：同机多实例必须换端口，否则 bind 失败或问到别人的服务。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -62,6 +70,12 @@ def main() -> int:
     if out.exists() and not args.force:
         print(f"{out} 已存在；如需重建请加 --force（会轮换服务密钥）", file=sys.stderr)
         return 2
+
+    if port_in_use(int(args.port)):
+        print(f"警告：{args.host}:{args.port} 目前有服务在监听——可能是同机其他用户或其他实例"
+              f"（包括你自己的另一个实例）。"
+              f"同机多实例必须用不同 BUMI_PORT；本机 8088 已归 sunzhixing 的实例，"
+              f"我们自己的验收实例建议用 8099。", file=sys.stderr)
 
     secrets_map = read_env_file(Path(args.deepseek_secrets).expanduser())
     memory_key = secrets_map.get("DEEPSEEK_API_KEY", "").strip()
