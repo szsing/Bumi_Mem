@@ -33,15 +33,23 @@ class BumiMemoryClient:
 
     def agent_request(self, payload: dict) -> dict:
         """Send prepare/complete/agent_event; persist payload unchanged before retry."""
-        if payload.get('operation') not in {'prepare', 'complete', 'agent_event', 'pending'}:
+        if payload.get('operation') not in {'prefetch', 'prepare', 'complete', 'agent_event', 'pending'}:
             raise ValueError('expected an explicit Agent operation')
         result = self._http.post('/v1/memory/context', json=payload)
         result.raise_for_status()
         return result.json()
 
     def prepare_turn(self, *, client_turn_id: str, query: str, user_id: str | None = None,
-                     speaker: dict | None = None, occurred_at: str | None = None) -> dict:
-        return self.agent_request(_prepare_payload(client_turn_id, query, user_id, speaker, occurred_at))
+                     speaker: dict | None = None, occurred_at: str | None = None,
+                     prefetch_id: str | None = None) -> dict:
+        return self.agent_request(_prepare_payload(client_turn_id, query, user_id, speaker,
+                                                   occurred_at, prefetch_id))
+
+    def prefetch_turn(self, *, client_turn_id: str, query_prefix: str, user_id: str | None = None,
+                      speaker: dict | None = None, prefix_revision: int | None = None) -> dict:
+        """在稳定的 ASR 前缀上提前发起检索；把返回的 prefetch_id 交给 prepare_turn。"""
+        return self.agent_request(_prefetch_payload(client_turn_id, query_prefix, user_id,
+                                                    speaker, prefix_revision))
 
     def complete_turn(self, *, turn_id: str, status: str, reply: str = '',
                       speech: dict | None = None, occurred_at: str | None = None) -> dict:
@@ -81,15 +89,22 @@ class AsyncBumiMemoryClient:
 
     async def agent_request(self, payload: dict) -> dict:
         """Never retry a 409 as a new operation or silently reassign a turn."""
-        if payload.get('operation') not in {'prepare', 'complete', 'agent_event', 'pending'}:
+        if payload.get('operation') not in {'prefetch', 'prepare', 'complete', 'agent_event', 'pending'}:
             raise ValueError('expected an explicit Agent operation')
         result = await self._http.post('/v1/memory/context', json=payload)
         result.raise_for_status()
         return result.json()
 
     async def prepare_turn(self, *, client_turn_id: str, query: str, user_id: str | None = None,
-                           speaker: dict | None = None, occurred_at: str | None = None) -> dict:
-        return await self.agent_request(_prepare_payload(client_turn_id, query, user_id, speaker, occurred_at))
+                           speaker: dict | None = None, occurred_at: str | None = None,
+                           prefetch_id: str | None = None) -> dict:
+        return await self.agent_request(_prepare_payload(client_turn_id, query, user_id, speaker,
+                                                         occurred_at, prefetch_id))
+
+    async def prefetch_turn(self, *, client_turn_id: str, query_prefix: str, user_id: str | None = None,
+                            speaker: dict | None = None, prefix_revision: int | None = None) -> dict:
+        return await self.agent_request(_prefetch_payload(client_turn_id, query_prefix, user_id,
+                                                          speaker, prefix_revision))
 
     async def complete_turn(self, *, turn_id: str, status: str, reply: str = '',
                             speech: dict | None = None, occurred_at: str | None = None) -> dict:
@@ -105,9 +120,17 @@ class AsyncBumiMemoryClient:
         await self.close()
 
 
-def _prepare_payload(client_turn_id, query, user_id, speaker, occurred_at):
+def _prepare_payload(client_turn_id, query, user_id, speaker, occurred_at, prefetch_id=None):
     body = {'operation': 'prepare', 'client_turn_id': client_turn_id, 'query': query}
-    body.update({k: v for k, v in {'user_id': user_id, 'speaker': speaker, 'occurred_at': occurred_at}.items() if v is not None})
+    body.update({k: v for k, v in {'user_id': user_id, 'speaker': speaker, 'occurred_at': occurred_at,
+                                   'prefetch_id': prefetch_id}.items() if v is not None})
+    return body
+
+
+def _prefetch_payload(client_turn_id, query_prefix, user_id, speaker, prefix_revision):
+    body = {'operation': 'prefetch', 'client_turn_id': client_turn_id, 'query_prefix': query_prefix}
+    body.update({k: v for k, v in {'user_id': user_id, 'speaker': speaker,
+                                   'prefix_revision': prefix_revision}.items() if v is not None})
     return body
 
 

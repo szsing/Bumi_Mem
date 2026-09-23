@@ -35,6 +35,8 @@ class ServiceSettings:
     local_chunk_tokens: int = 3500
     max_attempts: int = 3
     retry_base_seconds: float = 5.0
+    prefetch_ttl_seconds: float = 3.0
+    prefetch_max_growth_chars: int = 12
 
     def __post_init__(self):
         if not math.isfinite(self.explicit_recall_timeout) or self.explicit_recall_timeout <= 0:
@@ -101,6 +103,8 @@ class ServiceSettings:
             local_chunk_tokens=int(os.getenv('BUMI_LOCAL_CHUNK_TOKENS', '3500')),
             max_attempts=int(os.getenv('BUMI_MEMORY_MAX_ATTEMPTS', '3')),
             retry_base_seconds=float(os.getenv('BUMI_MEMORY_RETRY_BASE_SECONDS', '5')),
+            prefetch_ttl_seconds=float(os.getenv('BUMI_PREFETCH_TTL_SECONDS', '3')),
+            prefetch_max_growth_chars=int(os.getenv('BUMI_PREFETCH_MAX_GROWTH_CHARS', '12')),
         )
 
 
@@ -144,4 +148,6 @@ def build_service_engine(settings: ServiceSettings):
                                              search_threshold=settings.search_threshold,
                                              memory_read_timeout=settings.read_timeout,
                                              explicit_recall_timeout=settings.explicit_recall_timeout,
-                                             memory_warmup_timeout=settings.warmup_timeout))
+                                             memory_warmup_timeout=settings.warmup_timeout,
+                                             prefetch_ttl_seconds=settings.prefetch_ttl_seconds,
+                                             prefetch_max_growth_chars=settings.prefetch_max_growth_chars))

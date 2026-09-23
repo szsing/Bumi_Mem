@@ -77,7 +77,7 @@ t_serial = max(0, t_retrieval - t_lead) + t_assembly
 | B3 | L1 当前轮落库（`reserve_turn`） | P90 ≤ 10ms | 通过：2.3ms |
 | B4 | Prompt 持久化（`save_turn_prompt`） | P90 ≤ 10ms | 通过：1.2ms |
 | B5 | L3 整理/抽取 | 异步，不进串行预算 | 未测（后台任务） |
-| B6 | 预取命中率 / 陈旧重算率 | 待定，需可观测 | 未测（接口未实现） |
+| B6 | 预取命中率 / 陈旧重算率 | 待定，需可观测 | 已实现：`prefetch_stats()` 给出 hit/stale/expired/miss 与串行分位；对照实测 24/24 命中（§3.10） |
 
 预算口径固定为：本机内存服务进程内的时间，不含 HTTP/反向代理、ASR、DDS 播放、声纹和回答模型。
 
@@ -411,6 +411,37 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 
 ---
 
+### 3.10 流式前缀预取（已实现并实测）
+
+附录 B 的契约已经落地：`src/bumi_mem/prefetch.py`（有界 TTL 缓存 + 复用策略）+
+`AgentEngineMixin.prefetch_agent` + `POST /v1/memory/context` 的 `operation=prefetch`。
+
+行为：
+
+- 预取只算候选，**不写 L1、不建轮次、不发布 `shared_memory_refs`**（§tests/test_prefetch.py 有硬断言）；
+- `prepare` 带 `prefetch_id` 时才尝试复用，条件不满足一律静默重算：前缀不再是终稿前缀、
+  增长超过 12 字、TTL 3s 过期、身份/轮次/agent 不一致、删除或更正导致 generation 变化、预取状态非 ok；
+- 复用时仍然走 `_finalize_recalled`（删除即失效、作用域校验、核心状态冲突过滤），
+  "提前算过"不等于跳过校验；
+- 观测：`engine.prefetch_stats()` 给出 hit/stale/expired/miss/evicted、命中率与串行段分位；
+  guest 预取直接不算不缓存。
+
+对照实测（5000 条，GPU + Server + 实体加成 off，3 轮 × 8 查询，模拟"前缀→终稿"提前量 50ms）：
+
+| 指标 | P50 | P90 | P99 | max |
+|---|---:|---:|---:|---:|
+| 不预取 prepare（含检索） | 47.8 | 51.0 | 61.8 | 61.8 |
+| 预取本身（可提前发起，不占串行） | 36.3 | 37.6 | 39.9 | 39.9 |
+| **预取后 prepare（终稿 → 上下文）** | **14.7** | **15.5** | 15.7 | 15.7 |
+
+复用结果 hit 24 / stale 0 / expired 0 / miss 0（100% 命中）。结论：检索 36ms 被移出串行路径，
+**串行只剩 15.5ms P90**（≤20ms 预算），所需提前量 `36.3 + 15.5 − 20 ≈ 32ms`——
+ASR 稳定前缀只要比终稿早约 32ms 即可（本次模拟 50ms）。原始数据：`latency-prefetch-sim.json`。
+
+仍未验证：真实 ASR 前缀的稳定时间与"前缀→终稿"编辑距离分布（§6），因此上面的提前量是模拟值。
+
+---
+
 ## 4. 分析
 
 ### 4.1 60ms 预算被哪些项吃掉
@@ -509,7 +540,8 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 - 不含 HTTP/Pydantic/JSON 序列化/反向代理、ASR、声纹、DDS 播放和回答模型；这些是另外的指标。
 - 未做并发、长稳、内存增长、进程重启恢复、多用户同时检索的压测。
 - 未测真实写入端到端（`remember`/后台抽取/`forget`）及其对检索线程的占用。
-- 未测 ASR 前缀的稳定时间与“前缀→终稿”的编辑距离分布，因此无法给出预取命中率保证。
+- 流式前缀预取已实现（§3.10），但**真实 ASR 前缀**的稳定时间与“前缀→终稿”的编辑距离分布
+  仍未测；本次对照用的是模拟提前量（50ms），命中率 24/24 不能直接外推到线上。
 - 5000 条规模结果使用修正后的唯一语料生成器；300 条另有两次旧生成器结果（P90 148.1 / 150.4ms）作为重复性参考。
 - 尾延迟只做了检索侧的长样本（20000 条 × 800 次，P99 44.1ms）；引擎/HTTP 路径的 P99 未做同等规模采样。
 - 后台整理的前台让路**已实现并复测**（§8.3：阻塞轮次 19/400 → 0）；同一问题的另外两个方案
@@ -938,7 +970,7 @@ Qdrant Server 1.19.1；`top_k=5`、`threshold=0.1`、每条查询重复 3 次（
 | What coffee does the user like? | 321.0 | 130.9 | 131.3 | 0.0 | 5 |
 | 我周末想去西湖边跑步，顺便看看天气怎么样 | 368.2 | 131.4 | 117.9 | 56.6 | 5 |
 
-## 附录 B：流式前缀预取接口草案（待评审/未实现）
+## 附录 B：流式前缀预取接口（已实现，见 §3.10）
 
 目标：在 ASR 稳定前缀出现时提前发起检索，让 60ms 检索与说话/识别重叠；终稿到达后串行只做拼装。
 该草案只做候选预热，**不写 L1、不创建轮次、不发布共享引用**。
@@ -974,6 +1006,11 @@ POST /v1/memory/context
 3. 预取年龄 ≤ TTL（初值 3s），期间无删除/更正导致的 context epoch 变化；
 4. 命中则复用候选并重新渲染/落引用；任一条件不满足则静默重算，`prepare` 不因预取失败而失败。
 
-预算与观测：预取分支 P90 ≤60ms；命中率、陈旧重算率、`prefetch_wait_ms`、`assembly_ms` 必须打点。
-安全边界与现有一致：预取不绕过 `user_id/agent_id` 门控，不提前发布 `shared_memory_refs`，
-`forget_all()` 提升 epoch 后缓存立即失效。
+预算与观测：预取分支 P90 ≤60ms（实测 37.6ms）；命中率/陈旧重算率/串行段分位由
+`engine.prefetch_stats()` 提供，对照实测见 §3.10。安全边界与现有一致：预取不绕过
+`user_id/agent_id` 门控，不提前发布 `shared_memory_refs`，`forget_all()`/`forget_memory()`
+会立即丢弃该作用域的预取（条目缓存 + generation 双保险）。
+
+Agent 侧接线：`agent_bridge.prefetch_payload(...)` 生成请求，`prepare_payload(..., prefetch_id=...)`
+把 ID 带回；`BumiMemoryClient.prefetch_turn(...)` / `AsyncBumiMemoryClient.prefetch_turn(...)`
+是对应客户端方法。

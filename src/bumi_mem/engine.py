@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 import re
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone
 from uuid import uuid4
 import logging
@@ -25,6 +25,7 @@ from bumi_mem.consolidator import SessionConsolidator
 from bumi_mem.context import ContextBuilder
 from bumi_mem.long_term import LongTermMemory, Mem0LongTermMemory
 from bumi_mem.memory_access import SerialMemoryAccess
+from bumi_mem.prefetch import RetrievalPrefetchCache
 from bumi_mem.providers import TextProvider
 from bumi_mem.schemas import ConsolidationSubmission, MemoryJob, MessageRecord, SessionRecord, SessionStats, TurnResult
 from bumi_mem.session_store import SQLiteSessionStore
@@ -46,6 +47,9 @@ class BumiMemoryConfig:
     memory_warmup_enabled: bool = True
     memory_warmup_timeout: float = 120.0
     memory_warmup_query: str = "记忆系统预热"
+    prefetch_ttl_seconds: float = 3.0
+    prefetch_max_growth_chars: int = 12
+    prefetch_max_entries: int = 256
 
 
 class BumiMemory(AgentEngineMixin):
@@ -66,6 +70,12 @@ class BumiMemory(AgentEngineMixin):
         self.chat_token_counter = chat_token_counter
         self.context_builder = ContextBuilder(max_messages=self.config.max_messages,
                                                max_l1_tokens=self.config.max_l1_tokens)
+        # 流式前缀预取缓存：只在内存里，随进程结束消失；不写 L1、不建轮次、不发引用。
+        self.prefetch = RetrievalPrefetchCache(
+            ttl_seconds=self.config.prefetch_ttl_seconds,
+            max_growth_chars=self.config.prefetch_max_growth_chars,
+            max_entries=self.config.prefetch_max_entries)
+        self._prefetch_serial_ms: deque[float] = deque(maxlen=200)
         self._locks_guard = threading.Lock()
         self._turn_locks: dict[str, threading.RLock] = {}
         self._warmup_lock = threading.Lock()
@@ -165,9 +175,18 @@ class BumiMemory(AgentEngineMixin):
                            top_k=self.config.top_k, threshold=self.config.search_threshold)
         rows = (self.long_term.search(**search_args) if read_timeout is None else
                 self.long_term.search_with_timeout(timeout=read_timeout, **search_args))
+        return self._finalize_recalled(rows, user_id=user_id, agent_id=agent_id,
+                                       query=query, expected_scope=before)
+
+    def _finalize_recalled(self, rows, *, user_id: str, agent_id: str, query: str,
+                           expected_scope) -> list[dict[str, Any]]:
+        """检索结果的公共后处理：删除即失效、作用域校验、核心状态冲突过滤。
+
+        预取复用走同一条路径——缓存里的候选也要重新校验，不能因为"提前算过"就跳过。
+        """
         # Deletion may have been requested while the read was executing. Drop
         # stale rows before inspecting them so they can never enter user context.
-        if self.store.read_scope(user_id, agent_id) != before:
+        if self.store.read_scope(user_id, agent_id) != expected_scope:
             return []
         rows = self._scoped_results(rows, user_id, agent_id)
         rows = self.store.filter_memory_rows(rows, user_id=user_id, agent_id=agent_id)
@@ -218,7 +237,7 @@ class BumiMemory(AgentEngineMixin):
             self.worker.wake()  # a prior timed-out window may have rotated
             return self._prompt_for_turn(turn, recall_enabled=recall_enabled, memory_only=memory_only)
 
-    def _prompt_for_turn(self, turn, *, recall_enabled=True, memory_only=True):
+    def _prompt_for_turn(self, turn, *, recall_enabled=True, memory_only=True, prefetched=None):
         user_id, agent_id, query = turn['user_id'], turn['agent_id'], turn['query']
         if self.store.read_scope(user_id, agent_id)[0] != turn['generation']:
             raise TurnConflict('memory_scope_changed')
@@ -266,9 +285,16 @@ class BumiMemory(AgentEngineMixin):
                 recall_status = 'deleting'
             else:
                 try:
-                    explicit_recall = bool(re.search(r'还记得|记不记得|回忆|上次.{0,20}(说|聊|提)|\bremember\b|\blast time\b', query, re.I))
-                    recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=query,
-                        read_timeout=self.config.explicit_recall_timeout if explicit_recall else None)
+                    if prefetched is not None:
+                        # 复用预取候选：仍走同一套删除/作用域/核心冲突校验，
+                        # 但不再触发一次新的检索（这正是串行路径只剩拼装的原因）。
+                        recalled = self._finalize_recalled(
+                            prefetched, user_id=user_id, agent_id=agent_id, query=query,
+                            expected_scope=self.store.read_scope(user_id, agent_id))
+                    else:
+                        explicit_recall = bool(re.search(r'还记得|记不记得|回忆|上次.{0,20}(说|聊|提)|\bremember\b|\blast time\b', query, re.I))
+                        recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=query,
+                            read_timeout=self.config.explicit_recall_timeout if explicit_recall else None)
                     recall_status = 'ok'
                 except Exception as exc:
                     logger.debug('L3 unavailable: %s', type(exc).__name__)
@@ -427,6 +453,8 @@ class BumiMemory(AgentEngineMixin):
     def forget_all(self, *, user_id: str, agent_id: str) -> MemoryJob:
         require_person(user_id)
         with self._pair_lock(user_id, agent_id):
+            # 预取候选必须随删除立即失效（generation 校验是兜底，不是唯一防线）。
+            self.prefetch.invalidate_scope(user_id=user_id, agent_id=agent_id)
             job = self.store.request_forget(user_id=user_id, agent_id=agent_id,
                                            max_attempts=self.consolidator.config.max_attempts)
             self.worker.wake()
@@ -497,6 +525,7 @@ class BumiMemory(AgentEngineMixin):
         """Source-aware logical deletion. Use forget_all for backend physical erasure."""
         require_person(user_id)
         with self._pair_lock(user_id, agent_id):
+            self.prefetch.invalidate_scope(user_id=user_id, agent_id=agent_id)
             row = self.read_memory(user_id=user_id, agent_id=agent_id, memory_id=memory_id)
             if row is None:
                 return {'status': 'not_found', 'memory_id': memory_id}

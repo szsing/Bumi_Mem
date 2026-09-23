@@ -27,6 +27,7 @@ BumiMicSource → SileroUserTurnProcessor → [WakeWordProcessor]
 | operation | 用途 | 稳定身份/幂等依据 |
 |---|---|---|
 | `prepare` | 保存一个完整新用户问题，返回本轮记忆上下文 | `client_turn_id`，全 agent 范围唯一 |
+| `prefetch`（可选） | 在 ASR 稳定前缀上提前发起检索；只返回候选数与状态，**不写 L1、不建轮次、不发引用** | `client_turn_id`；返回的 `prefetch_id` 交给同轮的 `prepare` 复用 |
 | `complete` | 提交该轮确认输出，显式结束它 | 服务返回的 `turn_id` + 不变的结束内容/证据 |
 | `agent_event` | 无需用户问题的机器人独立发言或本地控制事实 | `event_id`，全 agent 范围唯一 |
 | `pending` | 重连时只读取待结算轮次元数据 | 只读，不生成回答或检索个人记忆 |
@@ -36,6 +37,12 @@ BumiMicSource → SileroUserTurnProcessor → [WakeWordProcessor]
 新操作的幂等身份在 body 中，不依赖每次自动生成的 `Idempotency-Key`。旧 exchange 仍使用该 header。重试保存原 body，包括原时间，不重新生成 key/时间。HTTP 409 不能用换 ID 的方式绕过。
 
 ### 2.1 prepare：完整转写就绪后，每个用户轮次调用一次
+
+> 可选优化：转写还没结束时，可以用同一 `client_turn_id` 先发一次
+> `{"operation":"prefetch","query_prefix":"<已经稳定的前缀>"}`（`agent_bridge.prefetch_payload(...)`），
+> 把返回的 `prefetch_id` 放进随后的 prepare。检索会在前缀阶段提前跑完，终稿到达后只剩拼装
+> （实测串行 P90 15.5ms，见 docs/latency/REPORT.md §3.10）。前缀必须真的是终稿的前缀、
+> 增量 ≤12 字、3 秒内有效；不满足会自动重算，预取失败也不影响 prepare。
 
 ```json
 {

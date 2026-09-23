@@ -209,6 +209,23 @@ async with AsyncBumiMemoryClient(service_url, service_key) as memory:
 
 以上是流程示例；对方需处理空输入流、模型异常、播放进度和断线重连，并持久化尚未提交的 previous_reply。不能在模型还在并行生成时提前处理下一请求。
 
+新 Agent 协议（`prepare/complete/prefetch`）下的**流式前缀预取**写法：
+
+```python
+async with AsyncBumiMemoryClient(service_url, service_key) as memory:
+    cid = client_turn_id(run_id, timeline_turn_id)   # 同一轮固定不变
+    # ASR 给出稳定前缀时（稳定判据由 Agent 决定，不要传还在变的尾字）
+    hint = await memory.prefetch_turn(client_turn_id=cid, query_prefix=stable_prefix,
+                                      user_id=user_id)
+    # 终稿到达后带上 prefetch_id：命中则跳过检索，只做拼装（实测串行 P90 15.5ms）
+    prepared = await memory.prepare_turn(client_turn_id=cid, query=final_query,
+                                         user_id=user_id,
+                                         prefetch_id=hint.get('prefetch_id'))
+```
+
+前缀必须是终稿的前缀、增量 ≤ 12 字、3 秒内有效、身份/轮次一致；不满足会自动重算，
+预取失败也不影响 `prepare`。
+
 同步版同名 get_context，无 await。命令行单次调用：
 
 ```bash

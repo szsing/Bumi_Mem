@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
                         help="并发用户数（>0 时额外做并发压测：N 个用户同时 prepare_prompt）")
     parser.add_argument("--concurrent-rounds", type=int, default=5,
                         help="并发压测轮数（默认 5），每轮 N 个用户各发一次")
+    parser.add_argument("--prefetch-sim", action="store_true",
+                        help="对照：不预取 prepare vs 前缀预取后 prepare（只计终稿后的串行段）")
+    parser.add_argument("--prefetch-rounds", type=int, default=3,
+                        help="预取对照的轮数（默认 3 轮 × 全部查询）")
+    parser.add_argument("--prefetch-lead-ms", type=float, default=0.0,
+                        help="模拟“前缀稳定→终稿”的提前量（毫秒），仅用于时间轴演示")
     parser.add_argument("--json", dest="json_out", default=None, help="原始数据导出路径")
     return parser.parse_args()
 
@@ -739,6 +745,67 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
     }
 
 
+def measure_prefetch(data_dir: Path, args: argparse.Namespace, queries: list[str]) -> dict:
+    """对照：不预取 prepare（含检索） vs 前缀预取后 prepare（只计终稿后的串行段）。
+
+    预取在"ASR 稳定前缀"上发起，属于可提前的部分；终稿到达后只做拼装。
+    """
+    from bumi_mem.agent_protocol import AgentCompleteRequest, AgentPrefetchRequest, AgentPrepareRequest
+
+    engine, _ = _build_engine(data_dir, args, args.read_timeout)
+    user_id, agent_id = "bench_user", "bumi_companion"
+    baseline: list[float] = []
+    serial: list[float] = []
+    prefetch_ms: list[float] = []
+    outcomes: dict[str, int] = defaultdict(int)
+
+    def settle(turn_id: str) -> None:
+        engine.complete_agent(request=AgentCompleteRequest(
+            operation='complete', turn_id=turn_id, status='completed', reply='（预取对照占位回复）'),
+            agent_id=agent_id)
+
+    for round_index in range(max(1, args.prefetch_rounds)):
+        for index, query in enumerate(queries):
+            # ① 基线：同一句话，不预取
+            request = AgentPrepareRequest(operation='prepare', client_turn_id=f"pfbase-{round_index}-{index}",
+                                          query=query, user_id=user_id)
+            started = time.perf_counter()
+            prepared = engine.prepare_agent(request=request, agent_id=agent_id)
+            baseline.append((time.perf_counter() - started) * 1000)
+            settle(prepared['turn_id'])
+
+            # ② 预取：用前 60% 作为"稳定前缀"，等 lead 毫秒后交终稿
+            prefix = query[:max(1, int(len(query) * 0.6))]
+            started = time.perf_counter()
+            pre = engine.prefetch_agent(request=AgentPrefetchRequest(
+                operation='prefetch', client_turn_id=f"pfsim-{round_index}-{index}",
+                query_prefix=prefix, user_id=user_id), agent_id=agent_id)
+            prefetch_ms.append((time.perf_counter() - started) * 1000)
+            if args.prefetch_lead_ms:
+                time.sleep(args.prefetch_lead_ms / 1000)
+            request = AgentPrepareRequest(operation='prepare', client_turn_id=f"pfsim-{round_index}-{index}",
+                                          query=query, user_id=user_id,
+                                          prefetch_id=pre.get('prefetch_id'))
+            started = time.perf_counter()
+            prepared = engine.prepare_agent(request=request, agent_id=agent_id)
+            serial.append((time.perf_counter() - started) * 1000)
+            settle(prepared['turn_id'])
+
+    stats = engine.prefetch_stats()
+    for key in ('hit', 'stale', 'expired', 'miss'):
+        outcomes[key] = stats[key]
+    table_header(f"⑫ 前缀预取对照（{max(1, args.prefetch_rounds)} 轮 × {len(queries)} 查询，"
+                 f"提前量 {args.prefetch_lead_ms:.0f}ms）")
+    print(fmt_row("不预取 prepare（含检索）", baseline))
+    print(fmt_row("预取本身（可提前发起）", prefetch_ms))
+    print(fmt_row("预取后 prepare（终稿→上下文）", serial))
+    print(f"{'复用结果':<26} {outcomes}")
+    engine.close()
+    return {"rounds": max(1, args.prefetch_rounds), "lead_ms": args.prefetch_lead_ms,
+            "baseline_prepare_ms": baseline, "prefetch_ms": prefetch_ms,
+            "serial_prepare_ms": serial, "outcomes": outcomes, "stats": stats}
+
+
 def run_scale_probe(data_root: Path, sizes: list[int], json_out: str | None) -> int:
     """本地 Qdrant 稠密检索随向量条数的伸缩。随机归一化向量，只测存储层，不是语义质量证据。"""
     import numpy as np
@@ -905,6 +972,11 @@ def main() -> int:
                 engine_payload["concurrent"] = measure_concurrent(data_dir, args, queries)
             except Exception as exc:  # noqa: BLE001
                 print(f"\n并发压测未能测量：{type(exc).__name__}: {exc}")
+        if args.prefetch_sim:
+            try:
+                engine_payload["prefetch"] = measure_prefetch(data_dir, args, queries)
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n前缀预取对照未能测量：{type(exc).__name__}: {exc}")
 
     if args.json_out:
         payload = {

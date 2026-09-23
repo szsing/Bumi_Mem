@@ -60,13 +60,33 @@ def speaker_for_memory(identity, *, enabled: bool, mode: str) -> dict:
 
 def prepare_payload(*, query: str, request_turn_id: str, identity=None,
                     identity_enabled: bool = False, identity_mode: str = 'shadow',
-                    occurred_at: str | None = None) -> dict:
+                    occurred_at: str | None = None, prefetch_id: str | None = None) -> dict:
     if not isinstance(query, str) or not query.strip():
         raise ValueError('memory requires a finalized text transcript; raw audio bypass is unsupported')
     result = {'operation': 'prepare', 'client_turn_id': _id(request_turn_id), 'query': query.strip(),
               'speaker': speaker_for_memory(identity, enabled=identity_enabled, mode=identity_mode)}
     if occurred_at is not None:
         result['occurred_at'] = occurred_at
+    if prefetch_id is not None:
+        result['prefetch_id'] = _id(prefetch_id)
+    return result
+
+
+def prefetch_payload(*, query_prefix: str, request_turn_id: str, identity=None,
+                     identity_enabled: bool = False, identity_mode: str = 'shadow',
+                     prefix_revision: int | None = None) -> dict:
+    """流式前缀预取：在 ASR 稳定前缀上提前发起检索，不写 L1、不建轮次。
+
+    只传已经稳定的前缀（稳定判据由 Agent 的 ASR 决定），不要传还在变的尾字。
+    返回的 prefetch_id 交给同一 client_turn_id 的 prepare_payload 复用。
+    """
+    if not isinstance(query_prefix, str) or not query_prefix.strip():
+        raise ValueError('prefetch requires a non-empty stabilized prefix')
+    result = {'operation': 'prefetch', 'client_turn_id': _id(request_turn_id),
+              'query_prefix': query_prefix.strip(),
+              'speaker': speaker_for_memory(identity, enabled=identity_enabled, mode=identity_mode)}
+    if prefix_revision is not None:
+        result['prefix_revision'] = int(prefix_revision)
     return result
 
 
