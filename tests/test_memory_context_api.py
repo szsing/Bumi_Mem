@@ -300,7 +300,7 @@ def test_migrate_v4_speaker_identity_without_changing_extraction_owner(tmp_path)
     drain(new)
     assert memory.add_calls[0]['user_id'] == 'A'
     with sqlite3.connect(store.path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 8
 
 
 def test_sync_and_async_clients_only_use_context_route():

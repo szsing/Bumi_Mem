@@ -1,8 +1,8 @@
-> **主路径（OpenAPI 1.3.0）：** 正常对话每轮只调用一次 `POST /v1/memory/context`，请求带 `turn_id`，响应只有 `turn_id` 和 `prompt` 两个字段。见下面第 0 节。**新接入一律用这个。**
+> **主路径（OpenAPI 1.3.1）：** 正常对话每轮只调用一次 `POST /v1/memory/context`，请求带 `turn_id`，响应只有 `turn_id` 和 `prompt` 两个字段。见下面第 0 节。**新接入一律用这个。**
 
 > 同一 URL 上另有两条兼容路径，只为已有调用方保留，不要用于新接入：本文第 1–9 节的旧 exchange（不带 `turn_id`，靠 `Idempotency-Key` 头）和 `operation=prepare/complete/agent_event/pending` 的两次调用协议（见 [实际 bumi-agent 接入](../bumi_agent_integration/README.md)）。三者不能在同一个未结束轮次上混用。
 
-> 记忆内容沿用 v0.3 契约：门控后的 L3 引用进入共享 L1，包含陌生身份、时间来源与 core_write；当前数据库是 schema 7。详细记忆语义见 [陪伴记忆契约](../companion_memory/README.md)。
+> 记忆内容沿用 v0.3 契约：门控后的 L3 引用进入共享 L1，包含陌生身份、时间来源与 core_write；当前数据库是 schema 8。详细记忆语义见 [陪伴记忆契约](../companion_memory/README.md)。
 
 # 单接口记忆服务：Agent 接入与部署
 
@@ -67,7 +67,7 @@ Content-Type: application/json
 
 ### prompt 内部结构
 
-`prompt` **只包含检索到的记忆**，一共三段，段间空行分隔：
+`prompt` 包含当前身份/时间、可用长期信息和短期记录，共三个受控区块；保存未确认、内容未完整展示等必要事实不会被省略：
 
 ```text
 当前用户：<user_id>
@@ -132,6 +132,19 @@ Content-Type: application/json
 - 现有删除、更正、来源撤回和防重复提取的保护不变。
 - 没有可靠的上一轮关联时，服务拒绝把无来源回复挂到当前用户（`409 no_previous_turn`）。
 - 下一轮请求成功后，上一轮的缓存响应即失效；此时重放旧 `turn_id` 返回 `409 context_request_closed`，应按当前轮次继续而不是回退。
+
+
+### 0.5.1 修复与表示规则
+
+- 核心保存/读取确认失败时，长期区明确写“本轮新信息未确认长期保存”，不恢复额外JSON字段，也不把失败表述成没有记忆。
+- 自动整理的 `metadata.source_messages` 被保留为抽取输入时间；多条可比较时间显示范围并标明“非事件起止”，不是给某条事实编造发生时刻。
+- 程序控制记录按真实 `result` 区分已停止、未开始、失败、结果未知等；反馈音完成不等于动作成功。
+- 长期引用复用6,000字符预算，最新可容纳引用优先、整条保留；历史版本最多16条。核心规则不因引用预算丢失。省略会有简短说明，不伪装成“暂无记忆”。这不是整个prompt的总token保证。
+- 原始内容仍原样存储；输出时数据内的换行、方括号及不可打印字符采用可逆JSON转义，不能制造服务自己的分区/角色行。客户端只解析外层响应JSON，**不要对prompt再次做unicode_escape解码或把字面的\n替换成换行**。这仅保护格式边界，不宣称模型免疫所有语义注入。
+- 新旧协议有独立内部编号空间和明确的缓存类型；不能把旧 `Idempotency-Key: turn:t1` 当成新 `turn_id=t1`。
+- 新增409：`request_protocol_conflict` 表示缓存/协议类型不一致；`request_protocol_ambiguous` 表示旧库缺少可确认的模式或编号来源，需要核验，不得换ID重播原问题。
+
+**迁移为schema 8；旧版单次Prompt缓存会失效，原消息/记忆不被改写。升级前暂停入口并结算旧轮；迁移详情见 `../single_turn_hardening/README.md`。**
 
 ---
 

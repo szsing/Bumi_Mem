@@ -1,3 +1,5 @@
+> 当前版本为0.5.1 / API 1.3.1 / schema 8；主路径仍为每轮单次请求、仅返回turn_id与prompt。下文兼容流程不作为新接入要求。旧缓存与编号迁移见 `../single_turn_hardening/README.md`。
+
 # bumi-agent 实际代码接入说明（Bumi_Mem v0.4 / schema 7）
 
 > **这份文档描述的 `operation=prepare/complete/agent_event/pending` 两次调用协议现在是兼容路径，不是主路径。** 主路径已改为每轮一次请求、只返回 `{"turn_id", "prompt"}`，见 **[单接口记忆服务第 0 节](../agent_api/README.md)**。新接入请用主路径；本文内容仅供已按两次调用协议接线的调用方参考。两者不能混用同一个待结束轮次。

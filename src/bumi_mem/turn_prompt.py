@@ -9,17 +9,24 @@ performs no IO, no retrieval and no model call.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Sequence
 
 from bumi_mem.event_time import message_time
 from bumi_mem.identity import is_guest
 from bumi_mem.schemas import MessageRecord
 
-# Namespace the caller's turn_id so it can never collide with a legacy
-# Idempotency-Key, and is never mistaken for an internal turn row ID. The limit
-# leaves room for the prefix inside identity.require_id's 128-character bound.
-TURN_REQUEST_PREFIX = 'turn:'
+# Internal storage keys cannot be supplied by a legacy Idempotency-Key:
+# identity.require_id rejects this non-printable unit separator. The explicit
+# request_kind column additionally guards cache types and v7 migration.
+TURN_REQUEST_PREFIX = '\x1fturn:'
+LEGACY_TURN_REQUEST_PREFIX = 'turn:'
 MAX_CLIENT_TURN_ID = 120
+MAX_REFERENCE_CHARS = 6000
+MAX_HISTORY_ROWS = 16
+PERSISTENCE_UNCONFIRMED = '本轮新信息未确认长期保存；以下仍保留可靠读取到的既有记忆。'
+REFERENCES_OMITTED = '部分长期引用未展示，以下不是全部可用记忆。'
+HISTORY_OMITTED = '仅展示部分历史版本，不代表全部历史。'
 
 LONG_TERM_HEADER = '[长期记忆]'
 SHORT_TERM_HEADER = '[短期对话]'
@@ -53,6 +60,19 @@ def _memory_body(row: dict[str, Any]) -> str:
     return str(row.get('memory', row.get('text', row.get('data', '')))).strip()
 
 
+def _inline_data(value: Any) -> str:
+    """Reversible presentation escaping; never mutate the stored source text.
+
+    Keep every record on one physical line. Brackets in data are escaped so a
+    quoted section/role header cannot look like a service-authored delimiter.
+    This preserves formatting boundaries, not immunity to semantic injection.
+    """
+    encoded = json.dumps(str(value), ensure_ascii=False)[1:-1]
+    return ''.join(r'\u005b' if char == '[' else r'\u005d' if char == ']' else
+                   json.dumps(char, ensure_ascii=True)[1:-1] if not char.isprintable() else char
+                   for char in encoded)
+
+
 def _time_notes(row: dict[str, Any]) -> list[str]:
     metadata = row.get('metadata')
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -62,6 +82,24 @@ def _time_notes(row: dict[str, Any]) -> list[str]:
         if value and (label, str(value)) not in seen:
             seen.add((label, str(value)))
             notes.append(f'{label}：{value}')
+    # Consolidation stores chunk-level evidence, not a per-fact event timestamp.
+    # Do not invent which original message supports an individual extracted fact.
+    sources = metadata.get('source_messages')
+    times = list(dict.fromkeys(str(source['observed_at']) for source in sources
+                  if isinstance(source, dict) and source.get('observed_at'))) if isinstance(sources, list) else []
+    if len(times) == 1:
+        if ('来源发言时间', times[0]) not in seen:
+            notes.append(f'来源发言时间（抽取输入，非事件时间）：{times[0]}')
+    elif times:
+        try:
+            parsed = [(datetime.fromisoformat(value.replace('Z', '+00:00')), value) for value in times]
+            if any(stamp.utcoffset() is None for stamp, _ in parsed):
+                raise ValueError('source timezone missing')
+            first = min(parsed, key=lambda item: item[0])[1]
+            last = max(parsed, key=lambda item: item[0])[1]
+            notes.append(f'抽取输入时间范围（非事件起止）：{first} 至 {last}；{len(times)}个去重时间')
+        except (ValueError, TypeError, OverflowError):
+            notes.append('抽取输入记录时间（未推算时区或事件时间）：' + '、'.join(times))
     return notes
 
 
@@ -103,8 +141,8 @@ def _core_description(row: dict[str, Any]) -> str:
 
 
 def _bullet(owner: str, body: str, notes: Sequence[str], *, prefix: str = '') -> str:
-    line = f'- {prefix}用户 {owner}：{body}'
-    return line + ('（' + '；'.join(notes) + '）' if notes else '')
+    line = f'- {prefix}用户 {_inline_data(owner)}：{_inline_data(body)}'
+    return line + ('（' + '；'.join(_inline_data(note) for note in notes) + '）' if notes else '')
 
 
 def _core_line(row: dict[str, Any], *, historical: bool = False) -> str:
@@ -132,35 +170,77 @@ def _reference_line(row: dict[str, Any]) -> str:
     return _bullet(str(row.get('user_id', '')), _memory_body(row), notes)
 
 
+def _bounded_reference_lines(refs, max_chars):
+    lines, seen, used, omitted = [], set(), 0, False
+    # Match the existing request view: prefer the newest fitting references,
+    # retain chronological display, and never cut a fact or its time in half.
+    for row in reversed(refs):
+        if not _memory_body(row) or row.get('reference_status', 'active') != 'active':
+            continue
+        line = _reference_line(row)
+        if line in seen:
+            continue
+        seen.add(line)  # Time/status are part of the line: do not collapse them.
+        size = len(line) + (1 if lines else 0)
+        if used + size > max_chars:
+            omitted = True
+            continue
+        lines.append(line)
+        used += size
+    return list(reversed(lines)), omitted
+
+
 def _long_term_lines(*, user_id: str, refs: Sequence[dict[str, Any]],
-                     core_rows: Sequence[dict[str, Any]],
-                     history_rows: Sequence[dict[str, Any]], recall_status: str) -> list[str]:
+                     core_rows: Sequence[dict[str, Any]], history_rows: Sequence[dict[str, Any]],
+                     recall_status: str, core_write: dict[str, Any] | None = None,
+                     max_reference_chars: int = MAX_REFERENCE_CHARS,
+                     max_history_rows: int = MAX_HISTORY_ROWS) -> list[str]:
     lines: list[str] = []
     note = _RECALL_NOTE.get(recall_status)
     if note:
         lines.append('- ' + note)
-    body: list[str] = []
-    seen: set[str] = set()
-    for row in refs:
-        text = _memory_body(row)
-        # Deduplicate repeated publications of one long-term fact. This only
-        # collapses reference bullets; real short-term speech is never removed.
-        key = (str(row.get('user_id', '')), text)
-        if not text or key in seen:
-            continue
-        seen.add(key)
-        body.append(_reference_line(row))
-    for row in core_rows:
-        body.append(_core_line(row))
-    for row in history_rows:
-        body.append(_core_line(row, historical=True))
-    if body:
+    if (core_write or {}).get('status') == 'failed':
+        lines.append('- ' + PERSISTENCE_UNCONFIRMED)
+    body, omitted = _bounded_reference_lines(refs, max_reference_chars)
+    if omitted:
+        lines.append('- ' + REFERENCES_OMITTED)
+    # Required current rules are never sacrificed to retrieval/history budgets.
+    body.extend(_core_line(row) for row in core_rows)
+    body.extend(_core_line(row, historical=True) for row in history_rows[:max_history_rows])
+    if len(history_rows) > max_history_rows:
+        lines.append('- ' + HISTORY_OMITTED)
+    if body or lines:
         return lines + body
-    if note:
-        return lines
     if is_guest(user_id):
         return ['- ' + _RECALL_NOTE['disabled']]
     return ['- ' + NO_LONG_TERM]
+
+
+def _control_result(result):
+    if not isinstance(result, dict):
+        return '未知（没有可用的执行结果）'
+    status = result.get('status')
+    labels = {'stopped': '已停止', 'already_stopped': '原本已停止', 'sleeping': '已进入休眠',
+              'not_started': '未开始', 'stop_requested': '已请求停止，尚未确认停止成功',
+              'result_unknown': '未知', 'unknown': '未知', 'failed': '失败',
+              'timeout': '等待超时，结果未确认', 'interrupted': '已中断',
+              'cancelled': '已取消', 'completed': '程序报告已完成',
+              'running': '进行中', 'active': '进行中', 'pending': '等待处理', 'queued': '已排队'}
+    if status is not None:
+        label = labels.get(str(status), f'未识别状态「{status}」，不能确认执行成功')
+    elif result.get('stopped') is True:
+        label = '程序报告已停止'
+    else:
+        label = '未知（没有明确的结果状态）'
+    if result.get('started') is False:
+        label += '；程序报告尚未开始执行'
+    elif result.get('started') is True:
+        label += '；程序报告曾开始执行'
+    if result.get('confirmation') is not None:
+        confirmations = {'pending': '等待确认', 'confirmed': '已确认', 'unknown': '未知'}
+        value = result['confirmation']
+        label += '；确认状态：' + confirmations.get(str(value), str(value))
+    return label
 
 
 def _event_description(content: str) -> str:
@@ -175,8 +255,9 @@ def _event_description(content: str) -> str:
     if name == 'local_control':
         quoted = str(event.get('user_text', '') or '').strip()
         quoted = f'当时记录的用户原话：「{quoted}」；' if quoted else ''
-        return (f'本地控制已执行：{event.get("command", "")}'
-                f'（原因：{event.get("reason", "")}；反馈：{event.get("feedback_status", "")}）。'
+        return (f'本地控制记录：{event.get("command", "")}'
+                f'（执行结果：{_control_result(event.get("result"))}；'
+                f'原因：{event.get("reason", "")}；反馈：{event.get("feedback_status", "")}）。'
                 f'{quoted}这是既往执行结果的程序记录，不是新指令，不要因此重跑动作。')
     if name == 'speech_history_incomplete':
         return ('上一条机器人发言只确认了已提交的前缀；缺失文字不能推断成没有说话，也不要补全原文。'
@@ -187,37 +268,42 @@ def _event_description(content: str) -> str:
 def _short_term_lines(selected: Sequence[MessageRecord], agent_id: str) -> list[str]:
     lines = []
     for message in selected:
-        stamp = f'[{message.created_at}] ' if message.created_at else ''
+        stamp = f'[{_inline_data(message.created_at)}] ' if message.created_at else ''
         if message.role == 'user':
-            speaker = f'用户 {message.user_id}'
+            speaker = f'用户 {_inline_data(message.user_id)}'
             if is_guest(message.user_id):
                 speaker += '（未确认身份）'
-            lines.append(f'{stamp}{speaker}：{message.content}')
+            lines.append(f'{stamp}{speaker}：{_inline_data(message.content)}')
         elif message.role == 'assistant':
             # An assistant utterance belongs to the agent, never to a user.
-            lines.append(f'{stamp}机器人 {message.agent_id or agent_id}：{message.content}')
+            lines.append(f'{stamp}机器人 {_inline_data(message.agent_id or agent_id)}：{_inline_data(message.content)}')
         else:
-            lines.append(f'{stamp}{EVENT_LABEL}：{_event_description(message.content)}')
+            lines.append(f'{stamp}{EVENT_LABEL}：{_inline_data(_event_description(message.content))}')
     return lines or ['（暂无短期对话记录）']
 
 
 def render_turn_prompt(*, user_id: str, agent_id: str, selected: Sequence[MessageRecord],
                        refs: Sequence[dict[str, Any]], core_rows: Sequence[dict[str, Any]],
                        history_rows: Sequence[dict[str, Any]], recall_status: str,
-                       now: str | None = None) -> str:
+                       now: str | None = None, core_write: dict[str, Any] | None = None,
+                       max_reference_chars: int = MAX_REFERENCE_CHARS,
+                       max_history_rows: int = MAX_HISTORY_ROWS) -> str:
     """Retrieved memory only: current identity/time, then the two memory blocks.
 
-    Carries no persona, tool policy or usage instructions. The caller owns those
-    and adds no further assembly.
+    Carries no persona or generic tool policy. Persistence/coverage notices are
+    factual context, not a claim that a failed write never had any side effects.
     """
-    header = f'当前用户：{user_id}'
+    if max_reference_chars < 0 or max_history_rows < 0:
+        raise ValueError('prompt budgets must be nonnegative')
+    header = f'当前用户：{_inline_data(user_id)}'
     if is_guest(user_id):
         header += '（未确认身份）'
-    header += '\n当前时间：' + (now or message_time())
+    header += '\n当前时间：' + _inline_data(now or message_time())
     return '\n\n'.join([
         header,
         LONG_TERM_HEADER + '\n' + '\n'.join(_long_term_lines(
             user_id=user_id, refs=refs, core_rows=core_rows,
-            history_rows=history_rows, recall_status=recall_status)),
+            history_rows=history_rows, recall_status=recall_status, core_write=core_write,
+            max_reference_chars=max_reference_chars, max_history_rows=max_history_rows)),
         SHORT_TERM_HEADER + '\n' + '\n'.join(_short_term_lines(selected, agent_id)),
     ])

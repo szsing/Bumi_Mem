@@ -6,10 +6,95 @@ import time
 from uuid import uuid4
 
 from bumi_mem.turn_store import ACTIVE, TurnConflict
+from bumi_mem.turn_prompt import TURN_REQUEST_PREFIX, LEGACY_TURN_REQUEST_PREFIX
+
+
+def _json_object(value):
+    try:
+        decoded = json.loads(value) if value else None
+    except (ValueError, TypeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _single_response(payload, client_id):
+    return (isinstance(payload, dict) and set(payload) == {'turn_id', 'prompt'} and
+            payload['turn_id'] == client_id and isinstance(payload['prompt'], str))
 
 
 class ContextStoreMixin:
+    def migrate_context_request_protocols(self, conn):
+        """v8 migration; no network, transcript/L3 rewrite or guessed replay.
+
+        v7 reused a printable prefix, and sometimes cleared every format marker
+        after completion. Only provable single requests are rekeyed. Ambiguous
+        old rows stay intact and explicitly block reuse until reviewed.
+        """
+        columns = {r['name'] for r in conn.execute('PRAGMA table_info(context_requests)')}
+        if 'request_kind' not in columns:
+            conn.execute("ALTER TABLE context_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'legacy'")
+        if 'pre_v8_key' not in columns:
+            conn.execute('ALTER TABLE context_requests ADD COLUMN pre_v8_key TEXT')
+        conn.execute('CREATE INDEX IF NOT EXISTS context_requests_pre_v8_key ON context_requests(agent_id,pre_v8_key)')
+        stale_agents = set()
+        rows = conn.execute('SELECT r.*,t.prompt_json AS cached_turn_prompt FROM context_requests r '
+                            'LEFT JOIN interaction_turns t ON t.turn_id=r.turn_id').fetchall()
+        for row in rows:
+            key = row['idempotency_key']
+            if not isinstance(key, str):
+                continue
+            if key.startswith(TURN_REQUEST_PREFIX):
+                # This representation could never be a valid external legacy ID.
+                conn.execute("UPDATE context_requests SET request_kind='single' WHERE request_id=?", (row['request_id'],))
+                continue
+            if not key.startswith(LEGACY_TURN_REQUEST_PREFIX):
+                continue
+            # Keep the old name reserved even if the record moves. An older
+            # crash/race may have lost the original caller mode; never use its
+            # now-free printable key to silently create another input.
+            conn.execute('UPDATE context_requests SET pre_v8_key=? WHERE request_id=?', (key, row['request_id']))
+            client_id = key[len(LEGACY_TURN_REQUEST_PREFIX):]
+            response = _json_object(row['response_json'])
+            cached = _json_object(row['cached_turn_prompt'])
+            proven_single = _single_response(response, client_id) or (
+                response is None and cached is not None and isinstance(cached.get('prompt_text'), str))
+            proven_legacy = (response is not None and response.get('request_id') == row['request_id']
+                             and isinstance(response.get('messages'), list)) or (
+                response is None and cached is not None and 'prompt_text' not in cached
+                and isinstance(cached.get('messages'), list))
+            if proven_single:
+                new_key = TURN_REQUEST_PREFIX + client_id
+                if conn.execute('SELECT 1 FROM context_requests WHERE agent_id=? AND idempotency_key=?',
+                                (row['agent_id'], new_key)).fetchone():
+                    raise RuntimeError('Conflicting persisted request namespaces; restore backup and audit before upgrading')
+                conn.execute("UPDATE context_requests SET request_kind='single',idempotency_key=? WHERE request_id=?",
+                             (new_key, row['request_id']))
+                stale_agents.add(row['agent_id'])
+            elif not proven_legacy:
+                conn.execute("UPDATE context_requests SET request_kind='ambiguous' WHERE request_id=?", (row['request_id'],))
+                stale_agents.add(row['agent_id'])
+        # Never replay a pre-fix prompt that lost a failed write or misstated a
+        # control result. Keep pending speech/source records for normal settlement.
+        for agent_id in stale_agents:
+            self._bump_context_epoch(conn, agent_id)
+
+    @staticmethod
+    def _check_response_kind(row):
+        if row['request_kind'] == 'ambiguous':
+            raise TurnConflict('request_protocol_ambiguous')
+        if not row['response_json']:
+            return
+        payload = _json_object(row['response_json'])
+        if row['request_kind'] == 'single':
+            key = row['idempotency_key'] or ''
+            if not key.startswith(TURN_REQUEST_PREFIX) or not _single_response(payload, key[len(TURN_REQUEST_PREFIX):]):
+                raise TurnConflict('request_protocol_conflict')
+        elif row['request_kind'] != 'legacy' or payload is None or (
+                payload.get('request_id') != row['request_id'] or not isinstance(payload.get('messages'), list)):
+            raise TurnConflict('request_protocol_conflict')
+
     def _check_context_request(self, conn, row):
+        self._check_response_kind(row)
         if row['response_json'] and row['context_epoch'] != self._context_epoch(conn, row['agent_id']):
             raise TurnConflict('shared_memory_context_changed')
         if row['state'] == 'revoked':
@@ -25,17 +110,33 @@ class ContextStoreMixin:
 
     def begin_context_request(self, *, user_id, agent_id, query, previous_ai_reply,
                               idempotency_key, query_tokens, reply_tokens, settings,
-                              max_messages, max_l1_tokens, query_occurred_at=None, previous_reply_occurred_at=None):
+                              max_messages, max_l1_tokens, query_occurred_at=None, previous_reply_occurred_at=None,
+                              request_kind='legacy'):
+        if request_kind not in {'legacy', 'single'}:
+            raise ValueError('invalid request protocol')
+        if request_kind == 'single':
+            if not isinstance(idempotency_key, str) or not idempotency_key:
+                raise ValueError('single-turn requests require an ID')
+            client_id = idempotency_key
+            idempotency_key = TURN_REQUEST_PREFIX + client_id
         with self._connect(write=True) as conn:
             if idempotency_key is not None:
                 existing = conn.execute('SELECT * FROM context_requests WHERE agent_id=? AND idempotency_key=?',
                                         (agent_id, idempotency_key)).fetchone()
                 if existing:
+                    if existing['request_kind'] == 'ambiguous':
+                        raise TurnConflict('request_protocol_ambiguous')
+                    if existing['request_kind'] != request_kind:
+                        raise TurnConflict('request_protocol_conflict')
                     if (existing['user_id'], existing['query'], existing['previous_ai_reply'], existing['query_occurred_at'], existing['previous_reply_occurred_at']) != (
                             user_id, query, previous_ai_reply, query_occurred_at, previous_reply_occurred_at):
                         raise TurnConflict('idempotency_conflict')
                     self._check_context_request(conn, existing)
                     return dict(existing)
+                old_key = LEGACY_TURN_REQUEST_PREFIX + client_id if request_kind == 'single' else idempotency_key
+                if conn.execute('SELECT 1 FROM context_requests WHERE agent_id=? AND pre_v8_key=?',
+                                (agent_id, old_key)).fetchone():
+                    raise TurnConflict('request_protocol_ambiguous')
             pending = conn.execute("SELECT * FROM interaction_turns WHERE agent_id=? "
                                    "AND status IN ('preparing','awaiting_reply')", (agent_id,)).fetchone()
             previous_turn_id = None
@@ -67,10 +168,10 @@ class ContextStoreMixin:
                     max_messages=max_messages, max_l1_tokens=max_l1_tokens, protocol='context', occurred_at=query_occurred_at)
                 turn_id = turn['turn_id']
             conn.execute('INSERT INTO context_requests(request_id,agent_id,user_id,query,previous_ai_reply,'
-                         'idempotency_key,turn_id,previous_turn_id,previous_reply_saved,consolidation_status,created_at) '
-                         'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                         'idempotency_key,turn_id,previous_turn_id,previous_reply_saved,consolidation_status,created_at,request_kind) '
+                         'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                          (request_id, agent_id, user_id, query, previous_ai_reply, idempotency_key,
-                          turn_id, previous_turn_id, int(previous_reply_saved), consolidation_status, time.time()))
+                          turn_id, previous_turn_id, int(previous_reply_saved), consolidation_status, time.time(), request_kind))
             conn.execute('UPDATE context_requests SET query_occurred_at=?,previous_reply_occurred_at=? WHERE request_id=?',
                          (query_occurred_at, previous_reply_occurred_at, request_id))
             return dict(conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone())
@@ -79,6 +180,8 @@ class ContextStoreMixin:
         """Persist the single-request protocol's two-field response for replay."""
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone()
+            if row['request_kind'] != 'single' or row['idempotency_key'] != TURN_REQUEST_PREFIX + turn_id:
+                raise TurnConflict('request_protocol_conflict')
             self._check_context_request(conn, row)
             epoch = self._context_epoch(conn, row['agent_id'])
             if expected_epoch is not None and epoch != expected_epoch:
@@ -91,6 +194,8 @@ class ContextStoreMixin:
     def save_context_response(self, request_id, *, messages, recall_status, core_write=None, expected_epoch=None):
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone()
+            if row['request_kind'] != 'legacy':
+                raise TurnConflict('request_protocol_conflict')
             self._check_context_request(conn, row)
             epoch = self._context_epoch(conn, row['agent_id'])
             if expected_epoch is not None and epoch != expected_epoch:

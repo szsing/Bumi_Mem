@@ -1,12 +1,14 @@
 # Bumi_Mem
 
-## 服务器启动（0.5.0）
+> 0.5.1 修复单次 Prompt 的保存失败提示、来源时间、控制结果、预算与文本边界，以及新旧协议幂等碰撞。输入输出不变；主数据库升级到 schema 8。升级前先暂停 Agent、结算待处理轮次并备份数据，见 [升级说明](docs/single_turn_hardening/README.md)。
 
-按实际服务器目录部署见 **[服务器启动与 Agent 连接](docs/deployment/README.md)**。新增交互配置与预检脚本；DeepSeek 记忆摘要/抽取默认使用 `deepseek-flash` 并关闭思考模式，不改变 Agent 的回答模型。当前 API 为 1.3.0（单次请求主路径）。配置和两种密钥保存在 Git 目录外。
+## 服务器启动（0.5.1）
+
+按实际服务器目录部署见 **[服务器启动与 Agent 连接](docs/deployment/README.md)**。新增交互配置与预检脚本；DeepSeek 记忆摘要/抽取默认使用 `deepseek-flash` 并关闭思考模式，不改变 Agent 的回答模型。当前 API 为 1.3.1（单次请求主路径）。配置和两种密钥保存在 Git 目录外。
 
 ## Agent 部门接入（单接口 HTTP 服务）
 
-**主路径：每轮一次请求，返回一条 prompt 字符串（OpenAPI 1.3.0）。** 唯一业务接口 `POST /v1/memory/context`，请求带 `turn_id`、`user_id`、`query`、`previous_ai_reply`：先补存上一轮机器人已确认输出，再保存当前用户问题，最后返回
+**主路径：每轮一次请求，返回一条 prompt 字符串（OpenAPI 1.3.1）。** 唯一业务接口 `POST /v1/memory/context`，请求带 `turn_id`、`user_id`、`query`、`previous_ai_reply`：先补存上一轮机器人已确认输出，再保存当前用户问题，最后返回
 
 ```json
 {"turn_id": "session-abc:turn-000002", "prompt": "当前用户：…\n\n[长期记忆]\n…\n\n[短期对话]\n…"}
