@@ -170,10 +170,12 @@ python -c 'import secrets; print(secrets.token_urlsafe(32))'
 | BUMI_SERVICE_API_KEY | 给 Agent 后端的服务密钥，至少 32 字符 |
 | BUMI_MEMORY_API_KEY | 我们自己的记忆摘要/提取 API Key，不分发给对方 |
 | BUMI_MEMORY_MODEL / BASE_URL | 我们的记忆模型与完整兼容 API 根路径 |
+| BUMI_HOST / BUMI_PORT | 服务监听地址与端口，默认 `127.0.0.1:8088`。**端口是主机级资源、不按用户隔离**：同机多实例必须显式分配不同端口，agent 的连接地址要写实际端口 |
 
 ```bash
 export BUMI_SERVICE_ENV_FILE=/data1/sunzhixing/mem0-runtime/secrets/memory_service.env
 bash scripts/run_memory_service.sh
+# 端口以实际分配为准（默认 8088，但同机可能已被其他实例/其他用户占用）
 curl -f http://127.0.0.1:8088/health/ready
 ```
 
@@ -210,6 +212,7 @@ async with AsyncBumiMemoryClient(service_url, service_key) as memory:
 同步版同名 get_context，无 await。命令行单次调用：
 
 ```bash
+# 用实际分配的地址；/health/ready 无法区分端口后面是谁的服务，联调前先用自己的密钥核对 agent_id
 export BUMI_SERVICE_URL=http://127.0.0.1:8088
 # 安全设置 BUMI_SERVICE_API_KEY，不要放入源码。
 python -m bumi_mem.client --user-id A --query '你好' --idempotency-key first
