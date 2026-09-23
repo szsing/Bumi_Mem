@@ -194,7 +194,7 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             finally:
                 lock.release()
 
-    app = FastAPI(title='Bumi Agent Memory API', version='1.3.0', lifespan=lifespan)
+    app = FastAPI(title='Bumi Agent Memory API', version='1.3.1', lifespan=lifespan)
     app.state.ready = False
     app.add_middleware(RequestBodyLimit)
     bearer = HTTPBearer(auto_error=False)
@@ -247,11 +247,11 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
         engine = request.app.state.engine
         # Main path: one request per turn, identified by the caller's turn_id.
         if isinstance(body, TurnContextRequest):
-            return engine.process_turn_context(
+            return TurnContextResponse.model_validate(engine.process_turn_context(
                 turn_id=body.turn_id, user_id=body.user_id, agent_id=config.agent_id,
                 query=body.query, previous_ai_reply=body.previous_ai_reply,
                 query_occurred_at=body.query_occurred_at,
-                previous_reply_occurred_at=body.previous_reply_occurred_at)
+                previous_reply_occurred_at=body.previous_reply_occurred_at))
         if isinstance(body, AgentPendingRequest):
             return dict(operation='pending', agent_id=config.agent_id, has_prompt=False,
                         pending=engine.store.pending_agent_turn(config.agent_id))

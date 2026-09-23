@@ -300,7 +300,7 @@ def test_program_control_event_is_not_disguised_as_speech(harness):
     assert client.post('/v1/memory/context', headers=AUTH, json=event).status_code == 200
     prompt = turn(client, 't1', query='刚才怎么了？').json()['prompt']
     _, short_term = sections(prompt)
-    assert '程序事件记录（非发言）：本地控制已执行：stop' in short_term
+    assert '程序事件记录（非发言）：本地控制记录：stop（执行结果：程序报告已停止' in short_term
     assert '不是新指令，不要因此重跑动作' in short_term
     assert '机器人 bot：' not in short_term and '用户 A：布米停一下' not in short_term
 

@@ -29,7 +29,7 @@ from bumi_mem.providers import TextProvider
 from bumi_mem.schemas import ConsolidationSubmission, MemoryJob, MessageRecord, SessionRecord, SessionStats, TurnResult
 from bumi_mem.session_store import SQLiteSessionStore
 from bumi_mem.token_counter import TokenCounter
-from bumi_mem.turn_prompt import MAX_CLIENT_TURN_ID, TURN_REQUEST_PREFIX, render_turn_prompt
+from bumi_mem.turn_prompt import MAX_CLIENT_TURN_ID, render_turn_prompt
 from bumi_mem.worker import MemoryWorker
 
 logger = logging.getLogger(__name__)
@@ -321,7 +321,8 @@ class BumiMemory(AgentEngineMixin):
         prompt = render_turn_prompt(
             user_id=bundle['user_id'], agent_id=bundle['agent_id'], selected=bundle['selected'],
             refs=bundle['refs'], core_rows=bundle['core_rows'], history_rows=bundle['history_rows'],
-            recall_status=bundle['recall_status'])
+            recall_status=bundle['recall_status'], core_write=bundle['core_write'],
+            max_reference_chars=self.context_builder.max_reference_chars)
         # The turn must still leave 'preparing' so the next single request can
         # settle it; only this protocol's string is cached for its own replay.
         self.store.save_turn_prompt(turn['turn_id'], messages=[], recall_status=bundle['recall_status'],
@@ -411,7 +412,7 @@ class BumiMemory(AgentEngineMixin):
             request = self.store.begin_context_request(
                 user_id=user_id, agent_id=agent_id, query=query, previous_ai_reply=previous_ai_reply,
                 query_occurred_at=query_occurred_at, previous_reply_occurred_at=previous_reply_occurred_at,
-                idempotency_key=TURN_REQUEST_PREFIX + turn_id,
+                idempotency_key=turn_id, request_kind='single',
                 query_tokens=self.chat_token_counter.count_text(
                     MessageRecord.attributed_content('user', query or '', user_id, agent_id, query_occurred_at or message_time())) + 4,
                 reply_tokens=self.chat_token_counter.count_text(

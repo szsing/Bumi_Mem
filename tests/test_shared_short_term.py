@@ -205,7 +205,7 @@ def test_migrate_v2_backfills_speaker_and_only_imports_live_window_once(tmp_path
     reopened = SQLiteSessionStore(path)
     assert reopened.list_shared_messages('bot') == migrated.list_shared_messages('bot')
     with sqlite3.connect(path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 8
 
 
 def test_tampered_owner_snapshot_is_rejected_before_llm_or_write(tmp_path):

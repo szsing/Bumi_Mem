@@ -83,7 +83,7 @@ def test_v3_database_upgrade_preserves_shared_window(tmp_path):
     upgraded = SQLiteSessionStore(store.path)
     assert upgraded.list_shared_messages('bot') == store.list_shared_messages('bot')
     with sqlite3.connect(store.path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 8
         assert c.execute('SELECT COUNT(*) FROM interaction_turns').fetchone()[0] == 0
 
 def test_config_validation_and_missing_local_model_do_not_download(tmp_path):
