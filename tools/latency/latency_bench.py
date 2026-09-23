@@ -114,6 +114,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--read-timeout", type=float, default=0.2, help="前台检索截止（默认 0.2s）")
     parser.add_argument("--assembly-read-timeout", type=float, default=5.0,
                         help="分解计时时允许检索跑完的等待上限（默认 5s，只用于把检索与串行拼装分开）")
+    parser.add_argument("--assembly-repeats", type=int, default=1,
+                        help="分解计时的轮数（默认 1；验收建议 ≥50，首轮单独剔除）")
+    parser.add_argument("--concurrent", type=int, default=0,
+                        help="并发用户数（>0 时额外做并发压测：N 个用户同时 prepare_prompt）")
+    parser.add_argument("--concurrent-rounds", type=int, default=5,
+                        help="并发压测轮数（默认 5），每轮 N 个用户各发一次")
     parser.add_argument("--json", dest="json_out", default=None, help="原始数据导出路径")
     return parser.parse_args()
 
@@ -170,21 +176,23 @@ def pct(values: list[float], ratio: float) -> float:
     return ordered[index]
 
 
-def summarize(values: list[float]) -> tuple[float, float, float, float]:
-    return statistics.fmean(values), statistics.median(values), pct(values, 0.9), max(values)
+def summarize(values: list[float]) -> tuple[float, float, float, float, float]:
+    return (statistics.fmean(values), statistics.median(values),
+            pct(values, 0.9), pct(values, 0.99), max(values))
 
 
 def fmt_row(label: str, values: list[float], width: int = 26) -> str:
     if not values:
-        return f"{label:<{width}} {'-':>9} {'-':>9} {'-':>9} {'-':>9}"
-    mean, median, p90, worst = summarize(values)
-    return f"{label:<{width}} {mean:>9.1f} {median:>9.1f} {p90:>9.1f} {worst:>9.1f}"
+        return f"{label:<{width}} {'-':>9} {'-':>9} {'-':>9} {'-':>9} {'-':>9}"
+    mean, median, p90, p99, worst = summarize(values)
+    return (f"{label:<{width}} {mean:>9.1f} {median:>9.1f} {p90:>9.1f} "
+            f"{p99:>9.1f} {worst:>9.1f}")
 
 
 def table_header(title: str, width: int = 26) -> None:
     print(f"\n{title}")
-    print(f"{'阶段':<{width}} {'均值ms':>9} {'中位ms':>9} {'p90ms':>9} {'最大ms':>9}")
-    print("-" * (width + 40))
+    print(f"{'阶段':<{width}} {'均值ms':>9} {'中位ms':>9} {'p90ms':>9} {'p99ms':>9} {'最大ms':>9}")
+    print("-" * (width + 50))
 
 
 # --------------------------------------------------------------------------- #
@@ -426,9 +434,9 @@ def measure_embedding_micro(memory, repeats: int) -> None:
             started = time.perf_counter()
             memory.embedding_model.embed_batch(texts, "search")
             values.append((time.perf_counter() - started) * 1000)
-        mean, median, p90, worst = summarize(values)
-        print(f"{f'稠密 batch={batch}':<26} {mean:>9.1f} {median:>9.1f} {p90:>9.1f} {worst:>9.1f}"
-              f"   （每条 {mean / batch:.1f}ms）")
+        mean, median, p90, p99, worst = summarize(values)
+        print(f"{f'稠密 batch={batch}':<26} {mean:>9.1f} {median:>9.1f} {p90:>9.1f} "
+              f"{p99:>9.1f} {worst:>9.1f}   （每条 {mean / batch:.1f}ms）")
 
     table_header("⑤ Qdrant 单路查询（不含编码）")
     query_vector = memory.embedding_model.embed(base, "search")
@@ -507,10 +515,10 @@ def measure_search_path(memory, recorder: Recorder, queries: list[str], repeats:
     nested = [value for item in per_query.values() for value in item["stages"].get("bm25_encode", [])]
     if nested:
         print(fmt_row("  └ 其中的稀疏编码", nested))
-    mean_total, median_total, p90_total, worst_total = summarize(total_values)
-    print("-" * 66)
+    mean_total, median_total, p90_total, p99_total, worst_total = summarize(total_values)
+    print("-" * 76)
     print(f"{'总计 memory.search':<26} {mean_total:>9.1f} {median_total:>9.1f} "
-          f"{p90_total:>9.1f} {worst_total:>9.1f}")
+          f"{p90_total:>9.1f} {p99_total:>9.1f} {worst_total:>9.1f}")
     print(f"{'其中 融合/排序/其他':<26} {mean_total - accounted:>9.1f}")
 
     table_header("⑦ 分查询明细（每次调用，ms）")
@@ -601,6 +609,67 @@ def measure_engine(data_dir: Path, args: argparse.Namespace, queries: list[str])
             "chat_ms": chat_totals, "statuses": dict(statuses)}
 
 
+def measure_concurrent(data_dir: Path, args: argparse.Namespace, queries: list[str]) -> dict:
+    """并发压测：N 个线程同时走引擎检索路径（SerialMemoryAccess 单线程 + 生产截止）。
+
+    注意：不并发调用 prepare_prompt——同一 agent 的轮次协议要求上层顺序发送
+    （见 docs/agent_api/README.md §5），并发 prepare 会得到 TurnConflict。
+    这里只压真正的共享瓶颈：单 SDK 线程上的检索队列，看并发下的
+    时延放大与超时降级率。
+    """
+    import threading
+
+    engine, _ = _build_engine(data_dir, args, args.read_timeout)
+    latencies: list[float] = []
+    hits: list[int] = []
+    errors: dict[str, int] = defaultdict(int)
+    lock = threading.Lock()
+
+    def one(query: str) -> None:
+        started = time.perf_counter()
+        try:
+            rows = engine.search_long_term(user_id="bench_user", agent_id="bumi_companion",
+                                           query=query)
+            elapsed = (time.perf_counter() - started) * 1000
+            count = len(rows or [])
+        except Exception as exc:  # noqa: BLE001 - 并发下要统计失败类型，不能中断整轮
+            with lock:
+                errors[type(exc).__name__] += 1
+                latencies.append((time.perf_counter() - started) * 1000)
+            return
+        with lock:
+            latencies.append(elapsed)
+            hits.append(count)
+
+    table_header(f"⑪ 并发检索（{args.concurrent} 线程 × {args.concurrent_rounds} 轮，"
+                 f"截止 {args.read_timeout}s，串行 SDK 单线程）")
+    round_totals: list[float] = []
+    for round_index in range(args.concurrent_rounds):
+        threads = [
+            threading.Thread(target=one, daemon=True,
+                             args=(queries[(round_index + index) % len(queries)],))
+            for index in range(args.concurrent)
+        ]
+        started = time.perf_counter()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        round_totals.append((time.perf_counter() - started) * 1000)
+    print(fmt_row("每轮墙钟总时长", round_totals))
+    print(fmt_row("单次检索", latencies))
+    over = [value for value in latencies if value > args.read_timeout * 1000]
+    print(f"{'超过截止的调用':<26} {len(over)}/{len(latencies)}")
+    if hits:
+        print(f"{'平均命中':<26} {statistics.fmean(hits):.1f}")
+    if errors:
+        print(f"{'异常':<26} {dict(errors)}")
+    engine.close()
+    return {"concurrent_users": args.concurrent, "rounds": args.concurrent_rounds,
+            "latency_ms": latencies, "round_wall_ms": round_totals,
+            "hits": hits, "errors": dict(errors)}
+
+
 def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queries: list[str]) -> dict:
     """把前台一轮拆成“检索”与“检索之后的串行拼装”。
 
@@ -621,20 +690,24 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
     statuses: dict[str, int] = defaultdict(int)
     totals: list[float] = []
     serial: list[float] = []
-    for query in queries:
-        before = {name: len(values) for name, values in recorder.samples.items()}
-        started = time.perf_counter()
-        prepared = engine.prepare_prompt(user_id="bench_user", agent_id="bumi_companion",
-                                         query=query, memory_only=False)
-        totals.append((time.perf_counter() - started) * 1000)
-        statuses[prepared.get("recall_status", "?")] += 1
-        engine.record_reply(turn_id=prepared["turn_id"], agent_id="bumi_companion",
-                            reply="（时延基准占位回复）")
-        retrieval = recorder.samples["retrieval"][before.get("retrieval", 0):]
-        if retrieval:
-            serial.append(totals[-1] - sum(retrieval))
+    rounds = max(1, args.assembly_repeats)
+    for _ in range(rounds):
+        for query in queries:
+            before = {name: len(values) for name, values in recorder.samples.items()}
+            started = time.perf_counter()
+            prepared = engine.prepare_prompt(user_id="bench_user", agent_id="bumi_companion",
+                                             query=query, memory_only=False)
+            totals.append((time.perf_counter() - started) * 1000)
+            statuses[prepared.get("recall_status", "?")] += 1
+            engine.record_reply(turn_id=prepared["turn_id"], agent_id="bumi_companion",
+                                reply="（时延基准占位回复）")
+            retrieval = recorder.samples["retrieval"][before.get("retrieval", 0):]
+            if retrieval:
+                serial.append(totals[-1] - sum(retrieval))
 
-    table_header(f"⑨ 前台一轮分解（检索等待上限 {args.assembly_read_timeout}s，串行=总时长-检索）")
+    warm_serial = serial[1:]  # 首轮含进程冷启动，按验收口径单独看
+    table_header(f"⑨ 前台一轮分解（{rounds} 轮 × {len(queries)} 查询，"
+                 f"检索等待上限 {args.assembly_read_timeout}s，串行=总时长-检索）")
     print(fmt_row("完整 prepare_prompt", totals))
     for name, label in (
         ("retrieval", "L3 检索（可提前发起）"),
@@ -648,15 +721,18 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
         if values:
             print(fmt_row(label, values))
     if serial:
-        print("-" * 66)
+        print("-" * 76)
         print(fmt_row("串行关键路径（总-检索）", serial))
+        print(fmt_row("串行（排除首轮冷启动）", warm_serial))
     print(f"{'recall_status 分布':<26} {dict(statuses)}")
     engine.close()
     return {
         "read_timeout": args.assembly_read_timeout,
+        "rounds": rounds,
         "queries": queries,
         "total_ms": totals,
         "serial_ms": serial,
+        "serial_warm_ms": warm_serial,
         "statuses": dict(statuses),
         "stages_ms": {name: list(values) for name, values in recorder.samples.items()},
         "boot": boot,
@@ -701,8 +777,9 @@ def run_scale_probe(data_root: Path, sizes: list[int], json_out: str | None) -> 
             started = time.perf_counter()
             store.search(query="scale-probe", vectors=query_vector, top_k=5, filters=filters)
             values.append((time.perf_counter() - started) * 1000)
-        mean, median, p90, worst = summarize(values)
-        print(f"{f'n={n} 稠密查询':<26} {mean:>9.2f} {median:>9.2f} {p90:>9.2f} {worst:>9.2f}")
+        mean, median, p90, p99, worst = summarize(values)
+        print(f"{f'n={n} 稠密查询':<26} {mean:>9.2f} {median:>9.2f} {p90:>9.2f} "
+              f"{p99:>9.2f} {worst:>9.2f}")
         print(f"{f'n={n} 写入（本地client）':<26} {insert_ms:>9.1f} ms   "
               f"{n / (insert_ms / 1000):.0f} 条/秒")
         results[str(n)] = {"insert_ms": insert_ms, "query_ms": values,
@@ -823,6 +900,11 @@ def main() -> int:
         if "foreground" in engine_payload:
             environment.setdefault("warmup", {})
             environment["warmup"]["engine_warmup_ms"] = engine_payload["foreground"]["warmup_ms"]
+        if args.concurrent > 0:
+            try:
+                engine_payload["concurrent"] = measure_concurrent(data_dir, args, queries)
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n并发压测未能测量：{type(exc).__name__}: {exc}")
 
     if args.json_out:
         payload = {

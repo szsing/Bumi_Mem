@@ -506,10 +506,17 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 - 未测 ASR 前缀的稳定时间与“前缀→终稿”的编辑距离分布，因此无法给出预取命中率保证。
 - 5000 条规模结果使用修正后的唯一语料生成器；300 条另有两次旧生成器结果（P90 148.1 / 150.4ms）作为重复性参考。
 - 尾延迟未系统采样：三档 max 167.8–179.1ms，P99 需要单独用更长样本量复测。
+- 后台整理与前台检索共享同一个 SDK 线程：50 轮里约 5% 轮次被整理任务阻塞（最长 1s），
+  修复方案（延后整理/独立进程/优先队列）已给出但未实现验证。
+- 单进程 8 路并发检索在 0.2s 截止下有 40% 降级；跨 agent 的真实并发与长稳未测。
 
 ---
 
 ## 7. 复现
+
+本目录三个工具：`latency_bench.py`（时延基准：检索/串行/并发/规模探针）、
+`recall_ablation.py`（召回对照：语义 / +BM25 / +实体加成）、
+`preflight_check.py`（验收前环境预检，见 §8.1）。
 
 ```bash
 # 0a. CPU 基线：依赖仓库 pyproject 的 runtime；脚本会自动 re-exec 到 ~/.venvs/bumi
@@ -578,6 +585,102 @@ CPU 基线把 `$GPU_PREFIX` 换成 `MEM0_PYTHON=$HOME/.venvs/bumi/bin/python`、
 注：如果运行 shell 导出了 `ALL_PROXY=socks5://…`（clash 默认会设置），mem0 在初始化时构造 OpenAI
 客户端会因缺少 `httpx[socks]` 直接报 `ImportError: Using SOCKS proxy...`。运行前 `unset ALL_PROXY all_proxy`
 或 `pip install "httpx[socks]"`，否则压测和服务都会起不来。
+
+## 8. 验收与部署固化（四项收尾）
+
+### 8.1 环境预检：一条命令确认“到底跑在什么环境上”
+
+`tools/latency/preflight_check.py` 逐项检查 GPU/CUDA、实际编码设备、Qdrant 后端、集合点数、
+实体加成策略，硬性项失败返回非零退出码，可直接接进部署脚本：
+
+```bash
+BUMI_QDRANT_URL=http://127.0.0.1:6333 BUMI_ENTITY_BOOST=off \
+MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python \
+tools/latency/preflight_check.py --require-gpu --require-server \
+  --require-entity-boost-off --collection bumi_latency_bench
+```
+
+本次结果（`mem0-runtime/logs/preflight-gpu-server.json`）：11 项全部 PASS，退出码 0。
+
+### 8.2 召回回归：合成语料已过，真实语料按同一套流程
+
+已做：
+
+- 2000 条干扰记忆 + 13 条带标准答案查询 × 10 次（GPU + Server，`tools/latency/recall_ablation.py`）：
+  语义 only / +BM25 / 含实体加成三档 **Recall 0.92、MRR 0.69、逐查询命中排名完全相同**，
+  中位时延 32.1 / 33.7 / 33.7ms。
+- 20000 条上实体加成 on/off 的 ID 级 A/B：**8/8 查询 top-5 ID 与顺序完全一致**。
+
+真实语料上线前的流程（已固定）：把脱敏记忆灌进隔离集合，准备 ≥30 条带标准答案的查询（覆盖称谓、
+地点、时间、偏好、计划、否定/更正、跨语言），`BUMI_ENTITY_BOOST=on` 与 `off` 各跑一次
+`recall_ablation.py`。通过标准：
+
+1. Recall@5 与 MRR 不低于关闭前（允许 ±0.02 噪声）；
+2. 检索 P90 ≤60ms、P99 ≤100ms；
+3. 任一查询命中排名变差 → 该语料不适用“关实体加成”，改用“同一次前向/后置到下一轮”的方案。
+
+### 8.3 尾延迟：稳态 P99 达标，真正的尾巴是后台整理
+
+- 稳态（20000 条，8 查询 × 100 次 = 800 样本，GPU + Server + 实体加成 off）：
+  检索 P50 34.7 / P90 36.0 / **P99 44.1** / max 101.0ms；max 来自单次 HNSW 67.5ms 的离群点。
+- 但连跑 50 轮（400 轮次）时：**19/400（4.8%）的检索被后台整理任务堵住**，最长 **1008.8ms**
+  （检索 P99 765ms），同期串行拼装完全不受影响。原因是单 worker + `SerialMemoryAccess` 单 SDK
+  线程：窗口轮转触发的整理任务与前台检索抢同一线程；在 0.2s 截止下这些轮次会降级成
+  `unavailable`（≈5% 的 L3 召回丢失）。
+
+修复方向（按性价比）：
+
+1. **整理延后到空闲**：窗口轮转后不立刻抽取，等最近一轮结束 ≥2s 再跑；
+2. **整理独立进程/线程**：Qdrant 已是 Server，可让独立进程持有自己的 SDK 客户端，彻底不与读竞争；
+3. `SerialMemoryAccess` 前台优先队列：读请求排在已入队的后台任务之前（不能抢占正在执行的任务）；
+4. 保留 0.2s 截止兜底，但要监控降级率（现状 ≈5%，仅出现在轮转窗口附近）。
+
+### 8.4 串行拼装：50 轮复测
+
+`--assembly --assembly-repeats 50`（5000 条，n=400）：
+
+| 指标 | P50 | P90 | P99 | max |
+|---|---:|---:|---:|---:|
+| 串行关键路径（总时长−检索） | 12.4ms | **13.3ms** | 23.0ms | 39.4ms |
+
+P90 达标；P99 23.0ms 略超 20ms 预算，来自 SQLite/GC 抖动，验收建议同时看 P99 并决定是否收紧。
+
+### 8.5 并发：8 路并发下 0.2s 截止降级 40%
+
+`--concurrent 8 --concurrent-rounds 10`（5000 条，GPU + Server，实体加成 off，压检索队列）：
+
+| 指标 | 值 |
+|---|---|
+| 单次检索 P50 / P90 / P99 / max | 175.6 / 206.5 / 208.0 / 208.2ms |
+| 超过 0.2s 截止 | **32/80** |
+| `MemoryReadUnavailable`（降级） | 31 |
+| 每轮墙钟（8 个并发） | ≈207ms |
+
+单 SDK 线程下 8 个检索排队 = 8×26ms ≈ 208ms，正好越过 200ms 截止。同一 agent 的轮次协议本来就要求
+上层顺序发送（`docs/agent_api/README.md` §5），所以真实并发来自“一个进程服务多个 agent”。
+建议按 agent 限定进程/队列深度，或对并发检索放宽截止；不要让一个进程同时服务大量 agent。
+
+### 8.6 固化配置清单与验收顺序
+
+```dotenv
+MEM0_EMBED_DEVICE="cuda"
+BUMI_QDRANT_URL="http://127.0.0.1:6333"
+BUMI_ENTITY_BOOST="off"
+BUMI_PYTHON="/data1/zhangran/.venvs/bumi-cuda/bin/python"
+BUMI_MEMORY_READ_TIMEOUT="0.2"
+```
+
+Qdrant Server 启动方式见 §7 第 5 条；正式环境建议用 systemd 托管并固定 storage 路径。
+验收顺序：
+
+```text
+preflight_check.py（环境）
+  → 冷启动预热（ready 之后再开始计时）
+  → latency_bench --corpus N --repeats 20（检索 P90/P99）
+  → latency_bench --assembly --assembly-repeats 50（串行 P90/P99）
+  → latency_bench --concurrent 8（并发降级率）
+  → recall_ablation.py（召回回归）
+```
 
 ---
 
