@@ -828,7 +828,8 @@ preflight_check.py（环境）
   → latency_bench --corpus N --repeats 20（检索 P90/P99）
   → latency_bench --assembly --assembly-repeats 50（串行 P90/P99）
   → latency_bench --concurrent 8（并发降级率）
-  → recall_ablation.py（召回回归）
+  → recall_ablation.py --dataset ~/mem0-runtime/datasets/recall_locomo_zh.json \
+       --collection recall_locomo_zh --repeats 3（召回回归，结论见 §9）
 ```
 
 ### 8.7 服务与 Qdrant 的启停（已验证）
@@ -850,6 +851,40 @@ curl -sS http://127.0.0.1:8088/health/ready
 
 本次实测：`{"status":"ready","warmed_up":true}`；随后用带 Bearer 的真实请求连打 5 轮
 `operation=prepare` + `operation=complete`，**端到端（含 HTTP/JSON/拼装）45–58ms，`recall_status=ok`**。
+
+---
+
+## 9. 召回验收记录（2026-09-23）
+
+**语料**（按项目决定，本阶段以 LoCoMo 中文子集作为"真实用户语料"的代理）：
+`~/mem0-runtime/datasets/recall_locomo_zh.json` —— 来源为公开数据集 LoCoMo（**真人两人对话 +
+人工标注 evidence**），取 1 段对话后**机器翻译**为中文；419 条记忆 / 80 条查询
+（cat1–5 = 18/17/11/17/17，其中 24 条多证据）。生成方式、翻译缓存与语料分级见 §8.2。
+
+**环境**：H20 + `~/.venvs/bumi-cuda`（torch 2.8.0+cu128，`CUDA_VISIBLE_DEVICES=4`）+
+Qdrant Server 1.19.1；`top_k=5`、`threshold=0.1`、每条查询重复 3 次（每档 240 个样本）。
+
+**判定标准**（§8.2 的三条）：① Recall@5 与 MRR 不低于关闭实体加成前（±0.02 噪声内）；
+② 检索 P90 ≤60ms、P99 ≤100ms。
+
+| 配置 | Recall@5 | MRR | P50 | P90 | P99 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| 语义 only（无 BM25、无实体加成） | 0.487 | 0.334 | 32.4 | 33.7 | 37.6 | 357.9 |
+| **实体加成 off**（语义 + BM25） | **0.487** | **0.334** | 34.0 | **35.6** | **37.3** | 38.6 |
+| **实体加成 on**（完整） | 0.475 | 0.300 | 34.0 | **60.7** | 65.3 | 67.1 |
+
+**结论**：
+
+1. 标准① **通过**：关闭实体加成后 Recall **+0.013**、MRR **+0.034**（更好而非更差），
+   远在 ±0.02 之内；
+2. 标准② **只有关闭实体加成才通过**：off 时 P90 35.6ms / P99 37.3ms；on 时 P90 60.7ms
+   已经越过 60ms；
+3. 因此本语料下的验收通过配置是 **`GPU + Qdrant Server + BUMI_ENTITY_BOOST=off`**；
+   代码默认值保持 `on` 不变，部署配置按此切换（改一行 + 重启，见 §8.6）；
+4. 端到端参考：同配置下 HTTP `operation=prepare` 为 45–59ms（§8.7）。
+
+原始数据：`mem0-runtime/logs/recall-locomo-zh.json`（含每档 240 个样本与分组召回）；
+运行命令见 §8.2。
 
 ---
 
