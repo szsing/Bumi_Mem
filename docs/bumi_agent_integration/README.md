@@ -1,8 +1,10 @@
 # bumi-agent 实际代码接入说明（Bumi_Mem v0.4 / schema 7）
 
+> **这份文档描述的 `operation=prepare/complete/agent_event/pending` 两次调用协议现在是兼容路径，不是主路径。** 主路径已改为每轮一次请求、只返回 `{"turn_id", "prompt"}`，见 **[单接口记忆服务第 0 节](../agent_api/README.md)**。新接入请用主路径；本文内容仅供已按两次调用协议接线的调用方参考。两者不能混用同一个待结束轮次。
+
 核查对象：`Noetix-AI/bumi-agent` 提交 `212900a`，`requirements.txt` 固定 `pipecat-ai[silero]==1.8.0`。这份说明按该仓库的真实代码编写，不是官方 Mem0 插件的替代配置。
 
-本次只修改记忆服务仓库。**Agent 仓库没有安装适配器或修改启动代码；仍需 Agent 同事按下述位置接线。**
+本次只修改记忆服务仓库。**Agent 仓库没有安装适配器或修改启动代码；仍需 Agent 同事按下述位置接线。**主路径的单次请求协议同样尚未在 Agent 仓库接线，不能认为它已自动完成新格式接入。
 
 ## 1. 实际架构与接入位置
 
@@ -239,7 +241,7 @@ Agent `.env.example` 默认 `BUMI_SPEAKER_ID_ENABLED=0`、`BUMI_SPEAKER_ID_MODE=
 
 ## 5. 升级与验证
 
-Bumi_Mem 0.4.0 / OpenAPI 1.2.0 / SQLite schema 7。v6增量迁移只增加explicit-turn/event幂等表，保留旧pending轮次；升级前结束旧入口或按旧协议结算，不能让新complete操作处理旧protocol轮次。部署前备份，旧二进制拒绝更高版本库，回滚恢复备份。
+Bumi_Mem 0.5.0 / OpenAPI 1.3.0 / SQLite schema 7。1.3.0 新增的单次请求主路径**没有改动 schema**，只在同一路由上增加请求/响应形状；旧pending轮次和两次调用协议保持可用。v6增量迁移只增加explicit-turn/event幂等表，保留旧pending轮次；升级前结束旧入口或按旧协议结算，不能让新complete操作处理旧protocol轮次。部署前备份，旧二进制拒绝更高版本库，回滚恢复备份。
 
 ```powershell
 # 实际Agent源码的纯逻辑契约测试（不加载Pipecat或硬件）

@@ -1,14 +1,22 @@
 # Bumi_Mem
 
+## 服务器启动（0.5.0）
+
+按实际服务器目录部署见 **[服务器启动与 Agent 连接](docs/deployment/README.md)**。新增交互配置与预检脚本；DeepSeek 记忆摘要/抽取默认使用 `deepseek-flash` 并关闭思考模式，不改变 Agent 的回答模型。当前 API 为 1.3.0（单次请求主路径）。配置和两种密钥保存在 Git 目录外。
+
 ## Agent 部门接入（单接口 HTTP 服务）
 
-**v0.4 已按实际 `bumi-agent`（Pipecat 1.8.0）增加显式协议。** 同一 URL 使用 `operation=prepare/complete/agent_event/pending`，通过明确 turn_id 提交结算输出，支持独立欢迎语和 stop/sleep 事件；`memory_context` 用于补充 Agent 自有工具历史，不能覆盖它。新 Agent 请先阅读 **[实际代码接入说明](docs/bumi_agent_integration/README.md)**。Agent 仓库本身尚未接线。
+**主路径：每轮一次请求，返回一条 prompt 字符串（OpenAPI 1.3.0）。** 唯一业务接口 `POST /v1/memory/context`，请求带 `turn_id`、`user_id`、`query`、`previous_ai_reply`：先补存上一轮机器人已确认输出，再保存当前用户问题，最后返回
 
-下面的三字段请求保留为旧 exchange 兼容方式，不能与新协议混用同一待结束轮次。
+```json
+{"turn_id": "session-abc:turn-000002", "prompt": "当前用户：…\n\n[长期记忆]\n…\n\n[短期对话]\n…"}
+```
 
-唯一业务接口 `POST /v1/memory/context`，接收 `user_id`、`previous_ai_reply`、`query`：先补存上一轮 agent 回复，再保存当前用户问题并返回完整 messages。第一轮回复为空；结束时 query=null 可补存最后回复。回答模型由对方调用，后台摘要和长期提取继续由我们负责。
+`prompt` **只含检索到的记忆**，三段：身份/时间头部、`[长期记忆]`、`[短期对话]`。当前问题只出现一次且在短期末尾。**不下发人物设定、工具规则或使用说明**，也不再同时返回 `messages`、`memory_context`、`core_memory` 等重复内容，不带检索分数或内部任务 ID。Agent 从 `response["prompt"]` 取记忆侧上下文，**不要再叠加一遍相同的普通历史**；Agent 自己的人设、工具调用链和执行结果仍由 Agent 管理，这个字符串不覆盖它们。防注入和“不要声称已长期记住”等约束也改由 Agent 侧人设负责。第一轮 `previous_ai_reply=null`；结束时用新的 `turn_id` 加 `query=null` 补存最后回复，返回空 prompt。回答模型由对方调用，后台摘要和长期提取继续由我们负责。
 
-用户发言带 user_id；AI 发言只有 agent_id，不标为某个用户的发言。服务端固定 agent_id，保留共享 L1 与个人 L3 隔离。完整协议、重试规则、配置和部署见 **docs/agent_api/README.md**；旧双业务路由已移除。主 SQLite 升级为 v7，部署旧库前请备份。
+同一 URL 上另有两条**兼容路径**，只为已有调用方保留、不要用于新接入：不带 `turn_id` 的旧三字段 exchange（用 `Idempotency-Key` 头，返回 messages），以及 `operation=prepare/complete/agent_event/pending` 的两次调用协议（见 **[实际代码接入说明](docs/bumi_agent_integration/README.md)**）。三者不能混用同一个待结束轮次。Agent 仓库本身尚未接线。
+
+用户发言带 user_id；AI 发言只有 agent_id，不标为某个用户的发言。服务端固定 agent_id，保留共享 L1 与个人 L3 隔离。完整协议、重试规则、配置和部署见 **docs/agent_api/README.md**；旧双业务路由已移除。主 SQLite 升级为 v7（本次协议改动不再变更 schema），部署旧库前请备份。
 
 ## 当前短期 / 长期记忆边界
 

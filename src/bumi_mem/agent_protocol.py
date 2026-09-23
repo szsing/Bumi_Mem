@@ -11,6 +11,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from bumi_mem.event_time import message_time
 from bumi_mem.identity import GUEST_USER_ID, require_id
+from bumi_mem.schemas import IdentityRequiredError
+
+
+def _checked_id(value):
+    """Report a bad ID as an ordinary field error.
+
+    IdentityRequiredError is a RuntimeError, so letting it escape validation
+    would abort the whole request union instead of failing only this model.
+    """
+    try:
+        return require_id(value)
+    except IdentityRequiredError:
+        raise ValueError('must be an explicit stable printable ID') from None
 
 
 class AgentModel(BaseModel):
@@ -19,7 +32,7 @@ class AgentModel(BaseModel):
     @field_validator('client_turn_id', 'turn_id', 'event_id', 'user_id', check_fields=False)
     @classmethod
     def validate_id(cls, value):
-        return require_id(value) if value is not None else None
+        return _checked_id(value) if value is not None else None
 
     @field_validator('occurred_at', check_fields=False)
     @classmethod
@@ -37,7 +50,7 @@ class SpeakerIdentityInput(BaseModel):
     @model_validator(mode='after')
     def valid_matched(self):
         if self.status == 'matched':
-            require_id(self.profile_id)
+            _checked_id(self.profile_id)
             if self.profile_id == GUEST_USER_ID:
                 raise ValueError('matched identity cannot be the reserved guest category')
         return self

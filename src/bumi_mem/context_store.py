@@ -75,6 +75,19 @@ class ContextStoreMixin:
                          (query_occurred_at, previous_reply_occurred_at, request_id))
             return dict(conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone())
 
+    def save_turn_context_response(self, request_id, *, turn_id, prompt, expected_epoch=None):
+        """Persist the single-request protocol's two-field response for replay."""
+        with self._connect(write=True) as conn:
+            row = conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone()
+            self._check_context_request(conn, row)
+            epoch = self._context_epoch(conn, row['agent_id'])
+            if expected_epoch is not None and epoch != expected_epoch:
+                raise TurnConflict('shared_memory_context_changed')
+            result = {'turn_id': turn_id, 'prompt': prompt}
+            conn.execute("UPDATE context_requests SET state='ready',response_json=?,context_epoch=? WHERE request_id=?",
+                         (json.dumps(result, ensure_ascii=False), epoch, request_id))
+            return result
+
     def save_context_response(self, request_id, *, messages, recall_status, core_write=None, expected_epoch=None):
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone()

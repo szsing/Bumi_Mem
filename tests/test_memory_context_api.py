@@ -256,7 +256,9 @@ def test_auth_input_limits_extra_fields_and_old_routes(harness):
     body={'user_id':'A','previous_ai_reply':None,'query':'q'}
     for headers in ({},{'Authorization':'Bearer invalid'}):
         assert client.post('/v1/memory/context',json=body,headers=headers).status_code == 401
-    for invalid in ({**body,'agent_id':'other'}, {**body,'turn_id':'old-interface'},
+    # turn_id now selects the single-request protocol, so it is no longer an
+    # unknown extra field here; see tests/test_turn_context_api.py.
+    for invalid in ({**body,'agent_id':'other'}, {**body,'unknown_field':'x'},
                     {**body,'user_id':' A'}, {**body,'user_id':None}, {**body,'query':' '},
                     {**body,'query':'x'*16001}, {**body,'previous_ai_reply':'x'*64001}):
         assert client.post('/v1/memory/context',json=invalid,headers=AUTH).status_code == 422
