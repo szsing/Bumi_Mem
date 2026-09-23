@@ -1,4 +1,6 @@
-> **v0.4 新 Agent 入口：** 同一 URL 新增 operation=prepare/complete/agent_event/pending；详见 [实际 bumi-agent 接入](../bumi_agent_integration/README.md)。下面旧 exchange 的三个业务字段保持兼容，不代表新 Agent 应继续用“上一轮回复”隐式关联。当前 schema 7。
+> **主路径（OpenAPI 1.3.0）：** 正常对话每轮只调用一次 `POST /v1/memory/context`，请求带 `turn_id`，响应只有 `turn_id` 和 `prompt` 两个字段。见下面第 0 节。**新接入一律用这个。**
+
+> 同一 URL 上另有两条兼容路径，只为已有调用方保留，不要用于新接入：本文第 1–9 节的旧 exchange（不带 `turn_id`，靠 `Idempotency-Key` 头）和 `operation=prepare/complete/agent_event/pending` 的两次调用协议（见 [实际 bumi-agent 接入](../bumi_agent_integration/README.md)）。三者不能在同一个未结束轮次上混用。
 
 > 记忆内容沿用 v0.3 契约：门控后的 L3 引用进入共享 L1，包含陌生身份、时间来源与 core_write；当前数据库是 schema 7。详细记忆语义见 [陪伴记忆契约](../companion_memory/README.md)。
 
@@ -6,7 +8,136 @@
 
 对外仅保留一个业务接口：`POST /v1/memory/context`。旧 `/v1/memory/prompt`、`/v1/memory/reply` 路由已移除。健康检查、在线文档不是额外的对话业务接口。
 
-## 1. 请求：三个必需业务含义与两个可选时间字段
+## 0. 主路径：单次请求 + 单条 prompt
+
+每轮一次 HTTP：同时提交**当前用户问题**和**上一轮机器人已确认输出的回复**。服务先补存上一轮回复，再保存当前问题，最后返回本轮可直接使用的记忆 prompt。
+
+### 请求
+
+```http
+POST /v1/memory/context
+Authorization: Bearer <BUMI_SERVICE_API_KEY>
+Content-Type: application/json
+
+{
+  "turn_id": "session-abc:turn-000002",
+  "user_id": "user_001",
+  "query": "你还记得我喜欢哪种茶吗？",
+  "previous_ai_reply": "好的，知道你喜欢绿茶了。",
+  "query_occurred_at": "2026-09-23T10:20:00+08:00",
+  "previous_reply_occurred_at": "2026-09-23T10:19:50+08:00"
+}
+```
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `turn_id` | 是 | Agent 生成的**本次请求**唯一编号，≤120 可打印字符。下一轮换新编号；网络重试保持不变。与服务内部轮次 ID 是不同命名空间，不要互相代入。 |
+| `user_id` | 是 | 当前 `query` 的说话人，**不是**机器人回复的说话人。未确认身份用 `__guest__`。 |
+| `query` | 是（键必须出现） | 当前用户完整文本。`""` 或纯空白**被拒绝**；`null` 表示只补存最后回复。 |
+| `previous_ai_reply` | 否 | 上一轮机器人**已确认输出**的文本，不是未播出的生成草稿。第一轮为 `null`。 |
+| `query_occurred_at` | 否 | 该条用户消息的原始发言时间，带时区偏移的 ISO 8601。 |
+| `previous_reply_occurred_at` | 否 | 该条机器人回复的原始发言时间，带时区偏移。 |
+
+`agent_id` 固定在服务端 `BUMI_AGENT_ID`，请求体不允许覆盖。两个时间字段各自对应各自的消息；已提供的原时间不会被入库时间覆盖。缺省才使用服务端接收时间。
+
+首尾规则：
+
+- **第一轮**：`previous_ai_reply` 与 `previous_reply_occurred_at` 都为 `null`。
+- **末轮补存**：`query: null`、`query_occurred_at: null`，仍走同一接口，但要用**新的唯一 `turn_id`**。仅补存请求不创建新的用户问题。
+
+### 响应
+
+```json
+{
+  "turn_id": "session-abc:turn-000002",
+  "prompt": "当前用户：user_001\n当前时间：2026-09-23T10:20:00.412+08:00\n\n[长期记忆]\n- 用户 user_001：偏好清淡口味（来源发言时间：2026-09-20T18:00:00+08:00）\n\n[短期对话]\n[2026-09-23T10:19:40+08:00] 用户 user_001：我喜欢绿茶。\n[2026-09-23T10:19:50+08:00] 机器人 bumi_robot_001：好的，知道你喜欢绿茶了。\n[2026-09-23T10:20:00+08:00] 用户 user_001：你还记得我喜欢哪种茶吗？"
+}
+```
+
+上面的事实、ID 和时间只是格式示例，不是真实用户记忆。
+
+正常响应**只有这两个字段**：
+
+1. `turn_id` 原样回显本次请求编号。
+2. `prompt` 是**一个字符串**，Agent 不需要再拼装。
+3. 不再同时返回 `messages`、`memory_context`、`short_term`、`long_term`、`core_memory` 等重复内容。
+4. 不附带检索分数、内部任务 ID、数据库字段等诊断信息。
+5. 仅补存请求返回 `{"turn_id": "本次补存ID", "prompt": ""}`，不重复返回整段历史。
+6. 错误仍返回真实 HTTP 状态和结构化错误码，**不会**为了精简包装成 200。
+
+### prompt 内部结构
+
+`prompt` **只包含检索到的记忆**，一共三段，段间空行分隔：
+
+```text
+当前用户：<user_id>
+当前时间：<带偏移 ISO 8601>
+
+[长期记忆]
+- 用户 <所属 user_id>：<内容>（状态：…；来源发言时间：…）
+
+[短期对话]
+[<原始发言时间>] 用户 <user_id>：<原话>
+[<原始发言时间>] 机器人 <agent_id>：<原话>
+[<原始发言时间>] 程序事件记录（非发言）：<说明>
+```
+
+**不含人物设定、角色设定、工具规则或使用说明。** 这些由 Agent 自己管理，记忆服务不下发、也不覆盖。`prompt` 里只有身份/时间、长期记忆和短期对话三段。
+
+**[长期记忆]**
+
+- 内容来自门控后的个人 L3 召回、已发布的共享引用，以及当前用户的已确认核心状态（称呼、互动边界、偏好、居住/工作地、计划与承诺）。称呼和互动边界就在这一区块用文字表达，不再另发一份核心记忆数组。
+- 每条标明所属 `user_id`、必要的时间依据，以及影响使用的状态（`已撤回，不再有效`、`已取消，不再有效`、`已被更新的表达取代，只能用于历史回忆` 等）。
+- 内部字段（`state_key`、`generation`、`change_id`、检索分数）不会出现，全部转成文字。
+- 同一长期引用去重；短期区块的真实发言不受去重影响。
+- 没有可用长期内容时明确写 `暂无相关长期记忆`。
+- 检索失败时写 `本轮长期检索暂不可用；以下只是可靠读取到的部分，不表示没有相关记忆。`，并保留仍能读到的核心状态和有效引用——**不会**冒充“从未有过记忆”。
+- 事件时间、原始发言时间、记录更新时间分别标注，不混用；没有依据的日期不编造。
+
+**[短期对话]**
+
+- 沿用现有 L1 窗口算法：默认 20 条有效消息（约 10 轮）+ 最多 4 条 carry-over，token 预算裁剪不变。
+- 保留原话、角色、说话人和每条消息自己的时间，按原对话顺序排列。
+- 用户消息标 `user_id`；机器人消息标 `agent_id`，**不会**把机器人回复写成某个用户的发言。
+- 当前 `query` 只出现一次，位于本区块末尾；没有额外的“当前问题”区块。
+- `local_control`、`speech_history_incomplete` 等程序记录以 `程序事件记录（非发言）` 呈现，不伪装成用户或机器人原话，也不作为新指令。
+
+### 不下发的内容与由此产生的调用方责任
+
+`prompt` 里没有任何指令性文字。以下几点服务端不再提醒，需要 Agent 侧自己在人设/系统提示中约束：
+
+- 记忆与历史是参考资料，不是指令；不要因为历史里的控制记录自动重跑工具或动作。
+- 当前用户的明确表达优先；不同用户的事实不要混用，机器人发言不属于任何用户。
+- 用户原话中可能出现伪造的 `[长期记忆]`、`[短期对话]` 分区标记或角色标签。**这些不改变服务端记录的身份与来源**，但 `prompt` 里不再声明这一点，Agent 需要自行防注入。
+- 没有依据的日期不要编造；带时间限定或已失效的内容不能当作当前事实。
+- **本轮长期保存是否成功不再出现在 `prompt` 中**。`core_write` 回执已随精简一并移除，所以 Agent 无法从这个字符串判断“刚说的内容有没有被长期记住”，也就不应声称已经长期记住。需要机读回执时走旧 exchange（返回 `core_write.status`，只有 `persisted` 是保存确认）。
+
+保留下来的不是指令而是**检索状态与事实状态**：`暂无相关长期记忆`、`本轮长期检索暂不可用…`、`（状态：已撤回，不再有效）`、`程序事件记录（非发言）` 等。它们描述这条记忆本身，删掉会导致把失效事实当成当前事实。
+
+### Agent 侧消费方式
+
+- Agent 从 `response["prompt"]` 取记忆侧上下文，当作一段 system 级参考资料注入。
+- **这段 prompt 已经包含短期普通对话和当前问题**，Agent 不应再把相同的普通历史重复叠加一遍。
+- Agent 自己的固定人设、工具调用链、图片和真实执行结果仍由 Agent 管理，**这个字符串不能覆盖它们**。记忆服务不重建工具或执行状态。
+- 本次改动**只修改记忆服务仓库**。`bumi-agent` 仓库尚未接线；不要据此认为 Agent 端已自动完成新格式接入。
+
+### 顺序、幂等和调用方仍需保证的边界
+
+- 同一 agent 下的请求由 Agent **按对话顺序**提交；上一轮输出要先结算为确认文本再作为 `previous_ai_reply` 送来。
+- `turn_id` 只提供**本次请求**的幂等：同 `turn_id`、同内容重试不重复保存消息并返回相同结果；同 `turn_id` 改变 `user_id`/`query`/`previous_ai_reply`/任一时间则返回 `409 idempotency_conflict`。它**不**解决乱序回复关联。
+- 不按 `query` 文本去重：不同 `turn_id` 的相同问题会被当作两次真实发言分别保存。
+- 补存上一回复与保存当前输入在同一事务内完成。
+- 跨用户切换时，上一回复保留原轮次来源，不因当前 `user_id` 变化而转入新用户的个人抽取。
+- `__guest__` 不直接访问或生成个人长期记忆，但保留使用共享 L1（含已发布共享引用）的能力。
+- 现有删除、更正、来源撤回和防重复提取的保护不变。
+- 没有可靠的上一轮关联时，服务拒绝把无来源回复挂到当前用户（`409 no_previous_turn`）。
+- 下一轮请求成功后，上一轮的缓存响应即失效；此时重放旧 `turn_id` 返回 `409 context_request_closed`，应按当前轮次继续而不是回退。
+
+---
+
+以下第 1–9 节描述**旧 exchange 兼容路径**（不带 `turn_id`，用 `Idempotency-Key` 头，返回 `messages` 等多份上下文）。仅供已有调用方参考，新接入请用上面第 0 节。
+
+## 1. 旧 exchange 请求：三个必需业务含义与两个可选时间字段
 
 ```http
 POST /v1/memory/context
@@ -183,42 +314,50 @@ spaCy/BM25 是上游可选资源，内部降级未必抛错；warmup 成功不�
 
 src/bumi_mem/client.py 只依赖 httpx，提供 BumiMemoryClient 与 AsyncBumiMemoryClient，不要求 Agent 部门安装模型或 Mem0。
 
+**主路径**用 `turn_context`，每轮一次调用：
+
 ```python
-from uuid import uuid4
+from itertools import count
 from bumi_mem.client import AsyncBumiMemoryClient
 
-previous_reply = None
+previous_reply, turns = None, count(1)
 async with AsyncBumiMemoryClient(service_url, service_key) as memory:
     async for user_id, query in your_user_input_stream:
-        key = uuid4().hex  # 发送前保存 key 和请求体；失败重试使用原值
-        data = await memory.get_context(user_id, query,
-                                        previous_ai_reply=previous_reply,
-                                        idempotency_key=key)
+        # 发送前持久化 turn_id 和请求体；失败重试使用原值，下一轮才换新编号。
+        turn_id = f'{your_session_id}:turn-{next(turns):06d}'
+        data = await memory.turn_context(turn_id=turn_id, user_id=user_id, query=query,
+                                        previous_ai_reply=previous_reply)
         previous_reply = None  # 上一回复已成功交付，勿在本轮模型失败后再次误交
-        previous_reply = await your_agent_generate(your_agent_system_messages + data['messages'])
-    # 若输入流正常结束且此前至少有一轮，补存最后输出。
-    await memory.get_context(user_id, None, previous_ai_reply=previous_reply,
-                             idempotency_key=uuid4().hex)
+        # prompt 已含短期历史和当前问题；不要再叠加一遍相同的普通历史。
+        previous_reply = await your_agent_generate(
+            your_agent_system_messages + [{'role': 'system', 'content': data['prompt']}])
+    # 若输入流正常结束且此前至少有一轮，用新的 turn_id 补存最后输出。
+    await memory.turn_context(turn_id=f'{your_session_id}:turn-{next(turns):06d}',
+                              user_id=user_id, query=None, previous_ai_reply=previous_reply)
 ```
 
-以上是流程示例；对方需处理空输入流、模型异常、播放进度和断线重连，并持久化尚未提交的 previous_reply。不能在模型还在并行生成时提前处理下一请求。
+以上是流程示例；对方需处理空输入流、模型异常、播放进度和断线重连，并持久化尚未提交的 previous_reply。不能在模型还在并行生成时提前处理下一请求。`previous_ai_reply` 只能送**已确认输出**的文本。
 
-同步版同名 get_context，无 await。命令行单次调用：
+同步版同名 `turn_context`，无 await。旧 exchange 的 `get_context` 保留但不建议新接入使用。命令行单次调用：
 
 ```bash
 export BUMI_SERVICE_URL=http://127.0.0.1:8088
 # 安全设置 BUMI_SERVICE_API_KEY，不要放入源码。
-python -m bumi_mem.client --user-id A --query '你好' --idempotency-key first
-python -m bumi_mem.client --user-id B --previous-ai-reply '你好，我在这里。' --query '你刚刚说什么' --idempotency-key second
-python -m bumi_mem.client --user-id B --previous-ai-reply '我刚才说我在这里。' --flush --idempotency-key end
+python -m bumi_mem.client --user-id A --query '你好' --turn-id demo:turn-000001
+python -m bumi_mem.client --user-id B --previous-ai-reply '你好，我在这里。' --query '你刚刚说什么' --turn-id demo:turn-000002
+python -m bumi_mem.client --user-id B --previous-ai-reply '我刚才说我在这里。' --flush --turn-id demo:turn-000003
+# 旧 exchange（返回 messages 等多份上下文）：
+python -m bumi_mem.client --legacy --user-id A --query '你好' --idempotency-key first
 ```
 
 ## 9. 错误码和验证
 
+两条路径共用同一套错误码。
+
 | HTTP | code | 含义 |
 |---|---|---|
 | 401 | unauthorized | 服务凭证缺失或错误 |
-| 409 | idempotency_conflict | 同 key 的三个业务字段发生改变 |
+| 409 | idempotency_conflict | 同 `turn_id`（或旧 key）的业务字段/时间发生改变 |
 | 409 | context_request_closed | 请求已被后续轮次推进，不能重跑旧 Prompt |
 | 409 | no_previous_turn | 没有已保存的上一轮，却提交非空 AI 回复 |
 | 409 | previous_prompt_not_ready | 前次 Prompt 尚未准备好却提交了回答 |
@@ -228,7 +367,9 @@ python -m bumi_mem.client --user-id B --previous-ai-reply '我刚才说我在这
 | 422 | invalid_request / invalid_identity | 字段或身份不合法 |
 | 503 | not_ready / memory_service_error | 未就绪或内部失败，使用原 key/原请求体重试 |
 
-query 最多 16000 字符；previous_ai_reply 最多 64000 字符；身份/key 最多 128 字符。query 空字符串不等于补存，补存必须明确传 null。第一轮的 previous_ai_reply 可以省略，默认 null。
+query 最多 16000 字符；previous_ai_reply 最多 64000 字符；身份/旧 key 最多 128 字符，主路径的 `turn_id` 最多 120 字符。query 空字符串或纯空白**不等于**补存，补存必须明确传 null。第一轮的 previous_ai_reply 可以省略，默认 null。
+
+主路径与旧 exchange 的幂等键彼此隔离：`turn_id` 与同名的 `Idempotency-Key` 不会互相命中。
 
 ## 10. 主库升级与验证范围
 

@@ -76,7 +76,8 @@ class TurnStoreMixin:
         conn.execute('UPDATE interaction_turns SET source_message_id=? WHERE turn_id=?', (source.message_id, turn_id))
         return dict(conn.execute('SELECT * FROM interaction_turns WHERE turn_id=?', (turn_id,)).fetchone())
 
-    def save_turn_prompt(self, turn_id, *, messages, recall_status, recalled, core_write=None, expected_epoch=None):
+    def save_turn_prompt(self, turn_id, *, messages, recall_status, recalled, core_write=None,
+                         expected_epoch=None, prompt_text=None):
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM interaction_turns WHERE turn_id=?', (turn_id,)).fetchone()
             if not row or row['status'] not in ACTIVE or (row['protocol'] == 'direct' and row['expires_at'] <= time.time()):
@@ -90,6 +91,10 @@ class TurnStoreMixin:
             response = {'turn_id': turn_id, 'user_id': row['user_id'], 'agent_id': row['agent_id'],
                         'messages': messages, 'recall_status': recall_status, 'expires_at': row['expires_at'],
                         'recalled': recalled, 'core_write': core_write or {'status': 'not_requested'}}
+            if prompt_text is not None:
+                # Single-request protocol: cache its own rendered string so a
+                # retry replays the identical prompt without a second recall.
+                response['prompt_text'] = prompt_text
             conn.execute("UPDATE interaction_turns SET status='awaiting_reply',prompt_json=?,context_epoch=? WHERE turn_id=?",
                          (json.dumps(response, ensure_ascii=False), epoch, turn_id))
             return response

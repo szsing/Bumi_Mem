@@ -111,7 +111,7 @@ http://<Agent可访问的服务器IP>:8088
 1. Base URL；
 2. BUMI_SERVICE_API_KEY（只分享这把服务密钥）；
 3. 对应的 agent_id，例如bumi_robot_001；
-4. API版本1.2.0和接口文档；
+4. API版本1.3.0和接口文档（主路径：每轮一次请求，响应只有 turn_id 和 prompt）；
 5. 该地址对应哪台机器人/共享现场。
 
 不需要给他们 DeepSeek Key、Embedding模型路径或数据库访问权限。

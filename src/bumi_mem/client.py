@@ -16,10 +16,27 @@ class BumiMemoryClient:
                                   headers={'Authorization': 'Bearer ' + api_key},
                                   timeout=timeout, transport=transport)
 
+    def turn_context(self, *, turn_id: str, user_id: str, query: str | None,
+                     previous_ai_reply: str | None = None, query_occurred_at: str | None = None,
+                     previous_reply_occurred_at: str | None = None) -> dict:
+        """Main path: one request per turn, returning {'turn_id', 'prompt'}.
+
+        Reuse the SAME turn_id and body on a network retry; use a NEW turn_id for
+        the next turn. query=None settles the last confirmed reply and returns an
+        empty prompt. Read the memory context from result['prompt'] as-is.
+        """
+        result = self._http.post('/v1/memory/context', json=_turn_payload(
+            turn_id, user_id, query, previous_ai_reply, query_occurred_at, previous_reply_occurred_at))
+        result.raise_for_status()
+        return result.json()
+
     def get_context(self, user_id: str, query: str | None, *, previous_ai_reply: str | None = None,
                     idempotency_key: str | None = None, query_occurred_at: str | None = None,
                     previous_reply_occurred_at: str | None = None) -> dict:
-        """Supply the same key/body on retry. query=None only flushes the last AI reply."""
+        """Legacy exchange kept for existing callers; prefer turn_context().
+
+        Supply the same key/body on retry. query=None only flushes the last AI reply.
+        """
         body = {'user_id': user_id, 'previous_ai_reply': previous_ai_reply, 'query': query}
         if query_occurred_at is not None:
             body['query_occurred_at'] = query_occurred_at
@@ -65,9 +82,19 @@ class AsyncBumiMemoryClient:
                                        headers={'Authorization': 'Bearer ' + api_key},
                                        timeout=timeout, transport=transport)
 
+    async def turn_context(self, *, turn_id: str, user_id: str, query: str | None,
+                           previous_ai_reply: str | None = None, query_occurred_at: str | None = None,
+                           previous_reply_occurred_at: str | None = None) -> dict:
+        """Main path: one request per turn, returning {'turn_id', 'prompt'}."""
+        result = await self._http.post('/v1/memory/context', json=_turn_payload(
+            turn_id, user_id, query, previous_ai_reply, query_occurred_at, previous_reply_occurred_at))
+        result.raise_for_status()
+        return result.json()
+
     async def get_context(self, user_id: str, query: str | None, *, previous_ai_reply: str | None = None,
                           idempotency_key: str | None = None, query_occurred_at: str | None = None,
                     previous_reply_occurred_at: str | None = None) -> dict:
+        """Legacy exchange kept for existing callers; prefer turn_context()."""
         body = {'user_id': user_id, 'previous_ai_reply': previous_ai_reply, 'query': query}
         if query_occurred_at is not None:
             body['query_occurred_at'] = query_occurred_at
@@ -105,6 +132,15 @@ class AsyncBumiMemoryClient:
         await self.close()
 
 
+def _turn_payload(turn_id, user_id, query, previous_ai_reply, query_occurred_at, previous_reply_occurred_at):
+    body = {'turn_id': turn_id, 'user_id': user_id, 'query': query}
+    body.update({k: v for k, v in {'previous_ai_reply': previous_ai_reply,
+                                   'query_occurred_at': query_occurred_at,
+                                   'previous_reply_occurred_at': previous_reply_occurred_at}.items()
+                 if v is not None})
+    return body
+
+
 def _prepare_payload(client_turn_id, query, user_id, speaker, occurred_at):
     body = {'operation': 'prepare', 'client_turn_id': client_turn_id, 'query': query}
     body.update({k: v for k, v in {'user_id': user_id, 'speaker': speaker, 'occurred_at': occurred_at}.items() if v is not None})
@@ -122,14 +158,27 @@ def main():
     parser.add_argument('--user-id', required=True)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--query')
-    mode.add_argument('--flush', action='store_true', help='Flush previous AI output without a new query')
+    mode.add_argument('--flush', action='store_true', help='Settle previous AI output without a new query')
     parser.add_argument('--previous-ai-reply', default=None)
-    parser.add_argument('--idempotency-key', default=None)
+    parser.add_argument('--turn-id', default=None, help='Unique ID for this request; new ID per turn')
+    parser.add_argument('--query-occurred-at', default=None)
+    parser.add_argument('--previous-reply-occurred-at', default=None)
+    parser.add_argument('--legacy', action='store_true',
+                        help='Use the old multi-context exchange instead of the single prompt')
+    parser.add_argument('--idempotency-key', default=None, help='Legacy exchange only')
     args = parser.parse_args()
     with BumiMemoryClient(os.environ['BUMI_SERVICE_URL'], os.environ['BUMI_SERVICE_API_KEY']) as client:
-        result = client.get_context(args.user_id, None if args.flush else args.query,
-                                    previous_ai_reply=args.previous_ai_reply,
-                                    idempotency_key=args.idempotency_key)
+        query = None if args.flush else args.query
+        if args.legacy:
+            result = client.get_context(args.user_id, query, previous_ai_reply=args.previous_ai_reply,
+                                        idempotency_key=args.idempotency_key,
+                                        query_occurred_at=args.query_occurred_at,
+                                        previous_reply_occurred_at=args.previous_reply_occurred_at)
+        else:
+            result = client.turn_context(turn_id=args.turn_id or uuid4().hex, user_id=args.user_id,
+                                         query=query, previous_ai_reply=args.previous_ai_reply,
+                                         query_occurred_at=args.query_occurred_at,
+                                         previous_reply_occurred_at=args.previous_reply_occurred_at)
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
