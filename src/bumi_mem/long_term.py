@@ -122,6 +122,12 @@ def _apply_entity_boost_policy(memory, *, mode: str | None = None) -> str:
     if mode not in {"on", "off"}:
         raise ValueError("BUMI_ENTITY_BOOST must be 'on' or 'off'")
     if mode == "off":
+        if not hasattr(memory, "_compute_entity_boosts"):
+            # 这是 mem0 的内部方法；升级 SDK 后若改名/移除，必须显式失败，
+            # 否则会出现“以为关了、实际还在算”的静默时延回退。
+            raise RuntimeError(
+                "BUMI_ENTITY_BOOST=off 需要 mem0 的 Memory._compute_entity_boosts；"
+                "当前 mem0 版本不匹配，请复核 src/bumi_mem/long_term.py 的适配")
         memory._compute_entity_boosts = lambda query_entities, filters: {}
 
         async def _skip_async(query_entities, filters):

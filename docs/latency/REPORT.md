@@ -389,6 +389,12 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 `_compute_entity_boosts`，实体库仍照常写入，可随时切回；代码见 `src/bumi_mem/long_term.py`，
 环境证据写入 JSON 的 `environment.entity_boost`。
 
+注意：**实体加成是 mem0 2.0.20 自带的行为**（`Memory.search` → `extract_entities` →
+`_compute_entity_boosts` → `mem0/utils/scoring.py` 把它加进 `semantic + bm25 + entity_boost`），
+上游没有开关，我们的 `off` 是给实例换个 no-op 的内部钩子。因此升级 mem0 后必须复核：
+若该方法改名/移除，`off` 会**显式报错**而不是静默失效（`tests/test_entity_boost_policy.py`）。
+另外 `extract_entities` 在查询侧仍会跑（约 4ms），`off` 省掉的是第二次批量编码与实体库检索。
+
 **时延（GPU + Qdrant Server，n=160，P90）**：
 
 | 规模 | 实体加成 on | 实体加成 off | 降幅 |
