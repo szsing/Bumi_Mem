@@ -164,6 +164,8 @@ python -c 'import secrets; print(secrets.token_urlsafe(32))'
 | MEM0_EMBED_DEVICE | cuda 强制 GPU，auto 允许 CPU 回退 |
 | BUMI_QDRANT_URL | 可选；设置后走 Qdrant Server（HNSW+payload 索引），不设置用本地 path client（仅开发/小数据） |
 | BUMI_ENTITY_BOOST | 可选；`off` 时检索热路径跳过实体加成（本地实测无召回收益、省一次编码，GPU 下约 26–30ms），默认 `on` |
+| BUMI_CONSOLIDATION_IDLE_SECONDS | 可选；有前台活动时后台整理让路的空闲窗口（秒），实测消除约 5% 的检索被阻塞，默认 `0`＝旧行为，建议 `2` |
+| BUMI_CONSOLIDATION_MAX_DEFER_SECONDS | 可选；后台整理最长可延后多少秒（防止长会话饿死整理），默认 `60` |
 | BUMI_AGENT_ID | 当前部署的共享现场 ID |
 | BUMI_SERVICE_API_KEY | 给 Agent 后端的服务密钥，至少 32 字符 |
 | BUMI_MEMORY_API_KEY | 我们自己的记忆摘要/提取 API Key，不分发给对方 |

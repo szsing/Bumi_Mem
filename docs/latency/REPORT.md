@@ -659,6 +659,25 @@ MRR 0.82、逐查询排名完全一致。真实语料建议放在 `~/mem0-runtim
 3. `SerialMemoryAccess` 前台优先队列：读请求排在已入队的后台任务之前（不能抢占正在执行的任务）；
 4. 保留 0.2s 截止兜底，但要监控降级率（现状 ≈5%，仅出现在轮转窗口附近）。
 
+**已实现第 1 条并复测**：新增 `BUMI_CONSOLIDATION_IDLE_SECONDS`（默认 `0` 保持旧行为，建议 `2`）
+与 `BUMI_CONSOLIDATION_MAX_DEFER_SECONDS`（默认 `60`，防止长会话把整理饿死）。有前台读写时
+worker 不认领后台任务；空闲满窗口、或任务年龄超过最大延迟后照常执行。实现见
+`src/bumi_mem/worker.py`（`note_foreground` / `_should_start_now`）与
+`SQLiteSessionStore.oldest_due_job_age_seconds()`，策略有 4 个确定性单测
+（`tests/test_worker_idle_policy.py`）。
+
+同一条件（5000 条，50 轮 × 8 查询 = 400 轮次，GPU + Server + 实体加成 off）复测：
+
+| 指标 | 修复前 | 修复后 |
+|---|---:|---:|
+| 检索 P99 / max | 765.3 / 1008.8ms | **38.5 / 45.7ms** |
+| 检索被阻塞（>200ms）的轮次 | 19/400（4.8%） | **0/400** |
+| 串行 P99 / max | 23.0 / 39.4ms | **14.6 / 15.3ms** |
+| `recall_status` | 400 ok | 400 ok |
+
+原始数据：`latency-eboff5000-assembly50.json`（修复前）与
+`latency-eboff5000-assembly50-idle.json`（修复后）。
+
 ### 8.4 串行拼装：50 轮复测
 
 `--assembly --assembly-repeats 50`（5000 条，n=400）：

@@ -474,6 +474,26 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                           time.time(), 'forget_all', '{}', now, now))
         return self.get_job(jid)
 
+    def oldest_due_job_age_seconds(self) -> float | None:
+        """最早可执行后台任务的年龄（秒）；没有可执行任务时返回 None。只读，不认领任务。"""
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT j.created_at FROM memory_jobs j JOIN memory_scopes s USING(user_id,agent_id)
+                WHERE j.status IN ('queued','retry_wait') AND j.available_at<=? AND j.generation=s.generation
+                  AND (j.kind='delete' OR s.delete_pending=0)
+                  AND (j.kind='delete' OR NOT EXISTS (
+                    SELECT 1 FROM memory_jobs older WHERE older.user_id=j.user_id AND older.agent_id=j.agent_id
+                      AND older.status IN ('queued','running','retry_wait') AND older.rowid<j.rowid))
+                ORDER BY CASE j.kind WHEN 'delete' THEN 0 ELSE 1 END,j.rowid LIMIT 1
+            """, (now,)).fetchone()
+        if row is None:
+            return None
+        try:
+            return max(0.0, now - datetime.fromisoformat(row['created_at']).timestamp())
+        except (TypeError, ValueError):
+            return 0.0
+
     def claim_job(self, owner: str, *, lease_seconds: float) -> MemoryJob | None:
         now = time.time()
         with self._connect(write=True) as conn:

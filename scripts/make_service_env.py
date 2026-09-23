@@ -90,6 +90,9 @@ def main() -> int:
         'BUMI_CARRYOVER_MESSAGES="4"',
         'BUMI_TOP_K="5"',
         'BUMI_SEARCH_THRESHOLD="0.1"',
+        '# 后台整理在有前台活动时让路（实测消除约 5% 的检索被阻塞；0 = 旧行为）',
+        'BUMI_CONSOLIDATION_IDLE_SECONDS="2"',
+        'BUMI_CONSOLIDATION_MAX_DEFER_SECONDS="60"',
     ]
     if args.qdrant_url:
         lines.append(f'BUMI_QDRANT_URL="{args.qdrant_url}"')

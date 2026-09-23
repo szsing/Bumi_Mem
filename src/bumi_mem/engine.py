@@ -198,6 +198,7 @@ class BumiMemory(AgentEngineMixin):
         """Persist input and return context; never invoke the answering model."""
         if self._closed:
             raise RuntimeError('memory engine is closed')
+        self.worker.note_foreground()
         require_pair(user_id, agent_id)
         if not isinstance(query, str) or not query.strip() or len(query) > 16000:
             raise ValueError('query must contain 1..16000 characters')
@@ -291,6 +292,7 @@ class BumiMemory(AgentEngineMixin):
         """Single external call: append previous agent speech, then prepare current context."""
         if self._closed:
             raise RuntimeError('memory engine is closed')
+        self.worker.note_foreground()
         require_pair(user_id, agent_id)
         if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 16000):
             raise ValueError('query must be null or contain 1..16000 characters')
@@ -340,6 +342,7 @@ class BumiMemory(AgentEngineMixin):
         """Persist agent speech in the preceding conversation, then rotate L1 atomically."""
         if self._closed:
             raise RuntimeError('memory engine is closed')
+        self.worker.note_foreground()
         require_id(turn_id, 'turn_id')
         require_id(agent_id, 'agent_id')
         if status not in ('completed', 'interrupted', 'cancelled', 'failed'):
@@ -368,6 +371,7 @@ class BumiMemory(AgentEngineMixin):
         """CLI adapter for the same prepare/reply flow used by external agents."""
         if self.chat_provider is None:
             raise RuntimeError('no answering model configured; use prepare_prompt and record_reply')
+        self.worker.note_foreground()
         with self._pair_lock(user_id, agent_id):
             prepared = self.prepare_prompt(user_id=user_id, agent_id=agent_id, query=text,
                                            recall_enabled=recall_enabled, memory_only=False)
@@ -393,6 +397,7 @@ class BumiMemory(AgentEngineMixin):
                               recall_status=prepared['recall_status'], user_id=user_id, agent_id=agent_id)
 
     def end_session(self, *, user_id: str, agent_id: str, reason: str = 'manual_new') -> ConsolidationSubmission:
+        self.worker.note_foreground()
         with self._pair_lock(user_id, agent_id):
             session = self.get_or_create_session(user_id=user_id, agent_id=agent_id)
             receipt = self.consolidator.submit(session.session_id, reason=reason)
@@ -448,6 +453,7 @@ class BumiMemory(AgentEngineMixin):
         Ordinary queued consolidation remains pending until that job completes.
         This method does not use an LLM or change retrieval/model settings.
         """
+        self.worker.note_foreground()
         require_person(user_id)
         if isinstance(contents, (str, bytes)) or not contents or any(not isinstance(x, str) or not x.strip() for x in contents):
             raise ValueError('contents must contain nonempty memory strings')
