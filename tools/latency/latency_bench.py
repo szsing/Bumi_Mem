@@ -102,6 +102,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.1)
     parser.add_argument("--embed-device", default=None, choices=["auto", "cpu", "cuda"])
     parser.add_argument("--data-root", default=None, help="隔离的数据目录（默认 <runtime>/latency-bench）")
+    parser.add_argument("--collection", default="bumi_latency_bench",
+                        help="Qdrant 集合名；不同规模/后端用不同集合，避免互相污染")
     parser.add_argument("--queries", default=None, help="查询文件，每行一条")
     parser.add_argument("--with-engine", action="store_true", help="额外测引擎前台召回路径")
     parser.add_argument("--assembly", action="store_true",
@@ -254,7 +256,13 @@ def collect_environment(requested_device: str, resolved_device: str, data_dir: P
     import platform
 
     if vector_backend is None:
-        vector_backend = "qdrant-local-path" if (data_dir / "qdrant").exists() else "unknown"
+        url = os.environ.get("BUMI_QDRANT_URL", "").strip()
+        if url:
+            vector_backend = f"qdrant-server({url})"
+        elif (data_dir / "qdrant").exists():
+            vector_backend = "qdrant-local-path"
+        else:
+            vector_backend = "unknown"
     env: dict[str, object] = {
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "hostname": platform.node(),
@@ -360,11 +368,15 @@ def measure_write_path(ltm, corpus: list[str]) -> int:
     bm25_ms = (time.perf_counter() - started) * 1000
 
     started = time.perf_counter()
-    memory.vector_store.insert(
-        vectors=vectors,
-        payloads=payloads,
-        ids=[point_id(text) for text in corpus],
-    )
+    # 分批 upsert：Qdrant Server 的 HTTP body 上限 32MB，整批提交会 400。
+    ids = [point_id(text) for text in corpus]
+    insert_batch = 500
+    for start in range(0, len(corpus), insert_batch):
+        memory.vector_store.insert(
+            vectors=vectors[start:start + insert_batch],
+            payloads=payloads[start:start + insert_batch],
+            ids=ids[start:start + insert_batch],
+        )
     insert_ms = (time.perf_counter() - started) * 1000
 
     table_header(f"② 写入路径（{len(corpus)} 条，一次性）")
@@ -529,7 +541,7 @@ def _build_engine(data_dir: Path, args: argparse.Namespace, read_timeout: float)
         "--user-id", "bench_user", "--agent-id", "bumi_companion",
         "--chat-provider", "deepseek", "--memory-provider", "deepseek",
         "--db-path", str(db_path),
-        "--collection-name", "bumi_latency_bench",
+        "--collection-name", args.collection,
         "--memory-read-timeout", str(read_timeout),
     ]
     if args.embed_device:
@@ -656,8 +668,8 @@ def run_scale_probe(data_root: Path, sizes: list[int], json_out: str | None) -> 
 
     probe_root = data_root / "qdrant-scale"
     probe_root.mkdir(parents=True, exist_ok=True)
-    environment = collect_environment("not-used", "not-used", probe_root,
-                                      vector_backend="qdrant-local-path")
+    qdrant_url = os.environ.get("BUMI_QDRANT_URL", "").strip()
+    environment = collect_environment("not-used", "not-used", probe_root)
     print_environment(environment)
     rng = np.random.default_rng(0)
     filters = {"user_id": "bench_user", "agent_id": "bumi_companion"}
@@ -666,7 +678,12 @@ def run_scale_probe(data_root: Path, sizes: list[int], json_out: str | None) -> 
     for n in sizes:
         path = probe_root / f"n{n}"
         path.mkdir(parents=True, exist_ok=True)
-        store = Qdrant(collection_name=f"scale_{n}", embedding_model_dims=1024, path=str(path))
+        if qdrant_url:
+            store = Qdrant(collection_name=f"scale_{n}", embedding_model_dims=1024, url=qdrant_url)
+            store.client.delete_collection(f"scale_{n}")
+            store.create_col(1024, on_disk=True)
+        else:
+            store = Qdrant(collection_name=f"scale_{n}", embedding_model_dims=1024, path=str(path))
         vectors = rng.normal(size=(n, 1024)).astype("float32")
         vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
         payloads = [{"user_id": "bench_user", "agent_id": "bumi_companion"} for _ in range(n)]
@@ -729,10 +746,9 @@ def main() -> int:
     device = args.embed_device or os.environ.get("MEM0_EMBED_DEVICE", "auto")
     resolved_device = resolve_embed_device(device)
     embed_model = MODEL_ROOT / "Qwen3-Embedding-0.6B"
-    # 本基准固定用 mem0 的 Qdrant local path client；换 server 时这里要改成对应标记。
+    # 后端由 BUMI_QDRANT_URL 决定：未设置=本地 path client，设置=Qdrant Server。
     environment = collect_environment(device, resolved_device, data_dir,
-                                      vector_backend="qdrant-local-path",
-                                      collection_name="bumi_latency_bench",
+                                      collection_name=args.collection,
                                       embed_model=str(embed_model))
     print("=" * 66)
     print("Bumi_Mem 时延基准")
@@ -750,8 +766,9 @@ def main() -> int:
                    if line.strip()]
 
     if args.assembly:
-        # 本地 Qdrant 是单实例锁，分解必须独立进程跑，且数据目录里要已有语料。
-        if not (data_dir / "qdrant").exists():
+        # 本地 Qdrant 是单实例锁，分解必须独立进程跑，且数据目录里要已有语料；
+        # 用 Qdrant Server 时语料在服务端，不检查本地 qdrant 目录。
+        if not os.environ.get("BUMI_QDRANT_URL", "").strip() and not (data_dir / "qdrant").exists():
             print(f"\n--assembly 需要已有语料：{data_dir} 下没有 qdrant 目录，请先跑一次完整基准")
             return 2
         decomposition = measure_engine_decomposition(data_dir, args, queries)
@@ -759,7 +776,7 @@ def main() -> int:
             payload = {
                 "config": {"corpus": args.corpus, "repeats": args.repeats, "top_k": args.top_k,
                            "device": resolved_device, "data_dir": str(data_dir),
-                           "mode": "assembly-only"},
+                           "collection": args.collection, "mode": "assembly-only"},
                 "environment": {**environment, "warmup": decomposition.get("boot", {})},
                 "engine": {"decomposition": decomposition},
             }
@@ -773,7 +790,7 @@ def main() -> int:
         ProviderConfig(provider="deepseek", model="deepseek-chat",
                        base_url="https://api.deepseek.com/v1", api_key="benchmark-unused"),
         Mem0AdapterConfig(data_dir=data_dir, embed_model=embed_model,
-                          embed_device=device, collection_name="bumi_latency_bench"),
+                          embed_device=device, collection_name=args.collection),
     )
     construct_ms = (time.perf_counter() - started) * 1000
 
@@ -811,6 +828,7 @@ def main() -> int:
                 "corpus": args.corpus, "unique_corpus": unique_corpus,
                 "repeats": args.repeats, "top_k": args.top_k,
                 "threshold": args.threshold, "device": resolved_device,
+                "collection": args.collection,
                 "data_dir": str(data_dir),
             },
             "environment": environment,

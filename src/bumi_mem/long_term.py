@@ -92,6 +92,25 @@ class Mem0AdapterConfig:
     memory_max_tokens: int = 4096
 
 
+def _vector_store_config(config: Mem0AdapterConfig) -> dict[str, Any]:
+    """Qdrant 后端配置：默认本地 path client；设置 BUMI_QDRANT_URL 时改用 Server。
+
+    本地 path client 是单进程精确扫描，只适合开发和小数据；生产/验收用
+    BUMI_QDRANT_URL=http://127.0.0.1:6333 走服务端 HNSW 与 payload 索引。
+    """
+    store: dict[str, Any] = {
+        "collection_name": config.collection_name,
+        "embedding_model_dims": config.embedding_dims,
+        "on_disk": True,
+    }
+    url = os.environ.get("BUMI_QDRANT_URL", "").strip()
+    if url:
+        store["url"] = url
+    else:
+        store["path"] = str(config.data_dir / "qdrant")
+    return store
+
+
 class Mem0LongTermMemory:
     def __init__(self, llm: ProviderConfig, config: Mem0AdapterConfig) -> None:
         from mem0 import Memory
@@ -128,12 +147,7 @@ class Mem0LongTermMemory:
                 },
                 "vector_store": {
                     "provider": "qdrant",
-                    "config": {
-                        "collection_name": config.collection_name,
-                        "embedding_model_dims": config.embedding_dims,
-                        "path": str(config.data_dir / "qdrant"),
-                        "on_disk": True,
-                    },
+                    "config": _vector_store_config(config),
                 },
             }
         )

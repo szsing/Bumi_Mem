@@ -162,6 +162,7 @@ python -c 'import secrets; print(secrets.token_urlsafe(32))'
 | BUMI_DATA_DIR | 独立联调数据目录，首次不要接真实用户库 |
 | BUMI_EMBED_MODEL_PATH | 实际存在的本地 Qwen3-Embedding-0.6B 目录 |
 | MEM0_EMBED_DEVICE | cuda 强制 GPU，auto 允许 CPU 回退 |
+| BUMI_QDRANT_URL | 可选；设置后走 Qdrant Server（HNSW+payload 索引），不设置用本地 path client（仅开发/小数据） |
 | BUMI_AGENT_ID | 当前部署的共享现场 ID |
 | BUMI_SERVICE_API_KEY | 给 Agent 后端的服务密钥，至少 32 字符 |
 | BUMI_MEMORY_API_KEY | 我们自己的记忆摘要/提取 API Key，不分发给对方 |
