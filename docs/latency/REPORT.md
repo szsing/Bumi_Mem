@@ -680,6 +680,36 @@ MRR 0.82、逐查询排名完全一致。真实语料建议放在 `~/mem0-runtim
 原始数据：`mem0-runtime/logs/recall-locomo.json`；
 数据集与原始 LoCoMo 放在仓库外 `mem0-runtime/datasets/`。
 
+#### LoCoMo 中文子集（规模更小，可选）
+
+全量 LoCoMo 是 5882 条话语 / 1986 条 QA，跑一次约 2 分钟；如果只需要快速回归，转换器支持裁剪
+并翻译成中文：
+
+```bash
+MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python \
+tools/latency/locomo_to_recall_dataset.py --samples 1 --max-probes 80 \
+  --translate --batch-size 30 \
+  --out ~/mem0-runtime/datasets/recall_locomo_zh.json
+```
+
+- `--samples N`：只取前 N 段对话（1 段 ≈ 420–590 条话语）；另有 `--max-memories` / `--max-probes` 控规模；
+- `--translate`：用 DeepSeek 逐批翻译，**先统一人名译法作为术语表**再翻正文，日期/数字保留；
+  `expected` 直接复用译好的记忆原文，保证"逐字一致"这一约束不被翻译破坏；
+- 翻译结果缓存在 `~/mem0-runtime/datasets/locomo_zh_cache.json`，重跑不重复计费、结果可复现。
+
+本次产出：1 段对话 → **419 条记忆 / 80 条查询**（cat1–5 = 18/17/11/17/17，其中 24 条多证据），
+约 22 次翻译请求、耗时约 1.5 分钟。三档对照（top_k=5，每条 3 次）：
+
+| 配置 | Recall@5 | MRR | P50 | 分组（cat1/2/3/4/5） |
+|---|---:|---:|---:|---|
+| 语义 only | 0.49 | 0.33 | 32.4ms | 0.39 / 0.65 / 0.36 / 0.59 / 0.41 |
+| 语义 + BM25 | 0.49 | 0.33 | 34.0ms | 0.39 / 0.65 / 0.36 / 0.59 / 0.41 |
+| 完整（含实体加成） | 0.47 | 0.30 | 34.0ms | 0.39 / 0.65 / 0.36 / 0.53 / 0.41 |
+
+在**中文**语料上：BM25 中性（与中文合成消融一致），实体加成略负；Recall 绝对值低于小规模示例集
+是正常的——LoCoMo 对话长、事实分散，419 条记忆里还带时间前缀。原始数据：
+`mem0-runtime/logs/recall-locomo-zh.json`。
+
 #### LLM 生成的中文模拟语料（覆盖七类，待人工校验）
 
 LoCoMo 是英文，覆盖不到中文的称谓/否定/跨语言等场景，因此另用
