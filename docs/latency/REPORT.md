@@ -438,6 +438,9 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 **串行只剩 15.5ms P90**（≤20ms 预算），所需提前量 `36.3 + 15.5 − 20 ≈ 32ms`——
 ASR 稳定前缀只要比终稿早约 32ms 即可（本次模拟 50ms）。原始数据：`latency-prefetch-sim.json`。
 
+真实 HTTP 端到端（本机服务 `127.0.0.1:8099`，`BumiMemoryClient` 5 轮对照，含 HTTP/JSON/拼装）：
+**prefetch + prepare P50 13.2ms / P90 13.8ms**，直接 prepare（检索在串行路径上）P50 47.3ms / P90 59.2ms。
+
 仍未验证：真实 ASR 前缀的稳定时间与"前缀→终稿"编辑距离分布（§6），因此上面的提前量是模拟值。
 
 ---
