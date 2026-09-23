@@ -140,28 +140,33 @@ def point_id(text: str) -> str:
     return str(uuid.UUID(hashlib.sha1(text.encode("utf-8")).hexdigest()[:32]))
 
 
-def load_dataset(path: str) -> tuple[list[tuple[str, str, str]], list[str]]:
-    """读取外部召回回归语料：memories 是记忆原文，probes 是 (query, expected, group)。"""
+def load_dataset(path: str) -> tuple[list[tuple[str, tuple[str, ...], str]], list[str]]:
+    """读取外部召回回归语料：memories 是记忆原文，probes 是 (query, targets, group)。
+
+    expected 可以是字符串，也可以是字符串列表（多证据场景：任一命中即算召回）。
+    """
     import json as _json
 
     payload = _json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     memories = [str(item) for item in payload.get("memories", [])]
-    probes: list[tuple[str, str, str]] = []
+    probes: list[tuple[str, tuple[str, ...], str]] = []
     for item in payload.get("probes", []):
-        probes.append((str(item["query"]), str(item["expected"]),
-                       str(item.get("group", "未分组"))))
+        expected = item["expected"]
+        targets = tuple(str(x) for x in (expected if isinstance(expected, list) else [expected]))
+        probes.append((str(item["query"]), targets, str(item.get("group", "未分组"))))
     if not memories or not probes:
         raise ValueError("dataset 必须同时包含非空的 memories 与 probes")
-    missing = sorted({expected for _, expected, _ in probes if expected not in set(memories)})
+    known = set(memories)
+    missing = sorted({target for _, targets, _ in probes for target in targets if target not in known})
     if missing:
         raise ValueError(
             f"{len(missing)} 条标准答案不在 memories 里，无法计算 Recall；例如：{missing[0][:40]}")
     return probes, memories
 
 
-def build_corpus(fillers: int, probes: list[tuple[str, str, str]],
+def build_corpus(fillers: int, probes: list[tuple[str, tuple[str, ...], str]],
                  base_memories: list[str]) -> list[str]:
-    rows = [text for _, text, _ in probes] + DISTRACTORS + base_memories
+    rows = [text for _, targets, _ in probes for text in targets] + DISTRACTORS + base_memories
     for index in range(fillers):
         subject = SUBJECTS[index % len(SUBJECTS)]
         verb = VERBS[(index // len(SUBJECTS)) % len(VERBS)]
@@ -213,7 +218,7 @@ def main() -> int:
     user_id, agent_id = "ablation_user", "bumi_companion"
     filters = {"user_id": user_id, "agent_id": agent_id}
 
-    probes = PROBES
+    probes = [(query, (target,), group) for query, target, group in PROBES]
     base_memories: list[str] = []
     if args.dataset:
         probes, base_memories = load_dataset(args.dataset)
@@ -228,8 +233,12 @@ def main() -> int:
                 for text in corpus]
     started = time.perf_counter()
     vectors = memory.embedding_model.embed_batch(corpus, "add")
-    memory.vector_store.insert(vectors=vectors, payloads=payloads,
-                               ids=[point_id(text) for text in corpus])
+    ids = [point_id(text) for text in corpus]
+    # 分批 upsert：Qdrant Server 单请求 32MB 上限，LoCoMo 规模整批提交会 400。
+    for start in range(0, len(corpus), 500):
+        memory.vector_store.insert(vectors=vectors[start:start + 500],
+                                   payloads=payloads[start:start + 500],
+                                   ids=ids[start:start + 500])
     print(f"\n写入 {len(corpus)} 条记忆，用时 {(time.perf_counter() - started):.1f}s")
 
     # 按 mem0 写入记忆时的真实逻辑建实体库：从每条记忆抽实体，编码后写入 <collection>_entities
@@ -257,15 +266,16 @@ def main() -> int:
     started = time.perf_counter()
     if entity_texts:
         entity_vectors = memory.embedding_model.embed_batch(entity_texts, "add")
-        memory.entity_store.insert(
-            vectors=entity_vectors,
-            ids=[str(uuid.uuid4()) for _ in entity_texts],
-            payloads=[{
-                "data": text, "entity_type": etype,
-                "linked_memory_ids": sorted(entity_links[text.lower()]),
-                "user_id": user_id, "agent_id": agent_id,
-            } for text, etype in zip(entity_texts, entity_types)],
-        )
+        entity_ids = [str(uuid.uuid4()) for _ in entity_texts]
+        entity_payloads = [{
+            "data": text, "entity_type": etype,
+            "linked_memory_ids": sorted(entity_links[text.lower()]),
+            "user_id": user_id, "agent_id": agent_id,
+        } for text, etype in zip(entity_texts, entity_types)]
+        for start in range(0, len(entity_texts), 500):
+            memory.entity_store.insert(vectors=entity_vectors[start:start + 500],
+                                       ids=entity_ids[start:start + 500],
+                                       payloads=entity_payloads[start:start + 500])
     build_entity_ms = (time.perf_counter() - started) * 1000
     print(f"实体库：从 {len(corpus)} 条记忆抽出 {len(entity_texts)} 条实体记录"
           f"（中文记忆贡献 {chinese_memories_with_entities} 条，英文 {english_memories_with_entities} 条），"
@@ -306,8 +316,8 @@ def main() -> int:
         reciprocal: list[float] = []
         latencies: list[float] = []
         detail = []
-        for query, target, group in probes:
-            target_id = point_id(target)
+        for query, targets, group in probes:
+            target_ids = {point_id(target) for target in targets}
             hit_rank = 0
             for _ in range(args.repeats):
                 started = time.perf_counter()
@@ -316,8 +326,9 @@ def main() -> int:
                 latencies.append((time.perf_counter() - started) * 1000)
                 rows = rows.get("results", rows) if isinstance(rows, dict) else rows
                 ids = [str(row.get("id")) for row in (rows or [])]
-                if target_id in ids:
-                    hit_rank = ids.index(target_id) + 1
+                ranks = [index + 1 for index, item in enumerate(ids) if item in target_ids]
+                if ranks and (hit_rank == 0 or ranks[0] < hit_rank):
+                    hit_rank = min(ranks)
             per_group[group].append(1 if hit_rank else 0)
             reciprocal.append(1.0 / hit_rank if hit_rank else 0.0)
             detail.append((query, group, hit_rank))

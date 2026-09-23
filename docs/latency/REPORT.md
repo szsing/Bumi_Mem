@@ -643,6 +643,37 @@ $SRV tools/latency/recall_ablation.py --dataset /path/to/real.json \
 MRR 0.82、逐查询排名完全一致。真实语料建议放在 `~/mem0-runtime/recall-real/`（仓库外），
 跑完把 JSON 结果落到 `~/mem0-runtime/logs/`。
 
+#### 公开数据集 LoCoMo 回归（2026-09-23）
+
+项目里只有 LoCoMo 的脚本与 manifest，数据集文件不在盘上（manifest 指向另一台机器的
+`/home/legendre/.../locomo10.json`，`src/memory-benchmarks` 子模块为空）。本次从官方仓库
+`snap-research/locomo` 下载 `locomo10.json`（2.8MB，10 段长期对话 / 5882 条话语 / 1986 条 QA），
+用 `tools/latency/locomo_to_recall_dataset.py` 转成召回数据集：
+
+- memories = 每条话语，带会话时间与说话人（`[<sample_id>] [<session_time>] <speaker>: <text>`）；
+- probes = 每个带 evidence 的 QA，`expected` 是 evidence 指向的话语（多条 evidence 时为列表，
+  任一命中即算召回，工具已支持多目标）；group = LoCoMo 的 category；
+- 取 300 条 probe（cat1–cat5 各 60，轮询取样，结果可复现），其中 93 条是多证据。
+
+同一批数据在 GPU + Qdrant Server 上跑三档对照（top_k=5，每条 1 次）：
+
+| 配置 | Recall@5 | MRR | P50 | P90 |
+|---|---:|---:|---:|---:|
+| 语义 only | 0.513 | 0.345 | 34.5ms | 35.4ms |
+| **语义 + BM25** | **0.530** | **0.375** | 37.1ms | 37.9ms |
+| 完整（含实体加成） | 0.517 | 0.364 | **87.0ms** | 95.5ms |
+
+结论（与中文合成语料互补）：
+
+1. **BM25 在英文真实对话上有小正收益**（Recall +1.7pt、MRR +3.0pt，只贵约 2.6ms）→ 保持开启；
+2. **实体加成在这份公开数据上也是负收益**（Recall −1.3pt、MRR −1.1pt），却让 P50 从 37ms 涨到 87ms
+   （LoCoMo 查询是长英文句、实体多，加成开销更大）；
+3. 因此“关实体加成”在中文合成语料与英文公开数据集上结论一致。**但当前部署仍按保守策略保留
+   `BUMI_ENTITY_BOOST=on`**（见 §8.6），真实中文语料回归通过后再切换；切换是一行配置。
+
+原始数据：`mem0-runtime/logs/recall-locomo.json`；
+数据集与原始 LoCoMo 放在仓库外 `mem0-runtime/datasets/`。
+
 ### 8.3 尾延迟：稳态 P99 达标，真正的尾巴是后台整理
 
 - 稳态（20000 条，8 查询 × 100 次 = 800 样本，GPU + Server + 实体加成 off）：
@@ -708,10 +739,16 @@ P90 达标；P99 23.0ms 略超 20ms 预算，来自 SQLite/GC 抖动，验收建
 ```dotenv
 MEM0_EMBED_DEVICE="cuda"
 BUMI_QDRANT_URL="http://127.0.0.1:6333"
-BUMI_ENTITY_BOOST="off"
+BUMI_ENTITY_BOOST="on"          # 保守：代码默认值，暂不改线上行为
+BUMI_CONSOLIDATION_IDLE_SECONDS="2"
+BUMI_CONSOLIDATION_MAX_DEFER_SECONDS="60"
 BUMI_PYTHON="/data1/zhangran/.venvs/bumi-cuda/bin/python"
 BUMI_MEMORY_READ_TIMEOUT="0.2"
 ```
+
+注意 `BUMI_ENTITY_BOOST`：两份语料（中文合成 + LoCoMo）都显示它没有召回收益、只有时延
+（GPU 下 +50ms，LoCoMo P50 37→87ms），**改成 `off` 是检索 P90 进 60ms 的必要条件**；
+但当前按保守策略保留 `on`，等真实中文语料回归通过后再切换（一行配置 + 重启）。
 
 Qdrant Server 启动方式见 §7 第 5 条；正式环境建议用 systemd 托管并固定 storage 路径。
 验收顺序：

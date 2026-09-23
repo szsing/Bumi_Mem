@@ -50,7 +50,9 @@ def main() -> int:
     parser.add_argument("--port", default="8088")
     parser.add_argument("--embed-device", default="cuda", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--qdrant-url", default=None, help="设置后走 Qdrant Server")
-    parser.add_argument("--entity-boost", default="off", choices=["on", "off"])
+    parser.add_argument("--entity-boost", default="on", choices=["on", "off"],
+                        help="默认 on（保守，等于代码默认）；off 能把检索 P90 压进 60ms，"
+                             "但要先过真实语料召回回归（见 docs/latency/REPORT.md §8.2/8.6）")
     parser.add_argument("--memory-model", default="deepseek-chat")
     parser.add_argument("--memory-base-url", default="https://api.deepseek.com/v1")
     parser.add_argument("--force", action="store_true")
