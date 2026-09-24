@@ -55,7 +55,7 @@ def _provider_config(
         model_override
         or os.getenv(prefix + "MODEL")
         or os.getenv("DEEPSEEK_MODEL")
-        or "deepseek-chat"
+        or ("deepseek-flash" if purpose == "memory" else "deepseek-chat")
     )
     base_url = (
         base_url_override
@@ -78,6 +78,7 @@ def _provider_config(
         api_key=api_key,
         max_tokens=max_tokens,
         temperature=0.2 if purpose == "chat" else 0.0,
+        thinking_mode="disabled" if purpose == "memory" else None,
     )
 
 

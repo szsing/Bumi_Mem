@@ -18,7 +18,7 @@ class ServiceSettings:
     memory_api_key: str = field(repr=False)
     agent_id: str = 'bumi_test_agent'
     memory_provider: str = 'deepseek'
-    memory_model: str = 'deepseek-chat'
+    memory_model: str = 'deepseek-flash'
     memory_base_url: str = 'https://api.deepseek.com/v1'
     embed_device: str = 'auto'
     collection_name: str = 'bumi_mem_l3'
@@ -86,7 +86,7 @@ class ServiceSettings:
             memory_api_key=required('BUMI_MEMORY_API_KEY'),
             agent_id=os.getenv('BUMI_AGENT_ID', 'bumi_test_agent'),
             memory_provider=os.getenv('BUMI_MEMORY_PROVIDER', 'deepseek'),
-            memory_model=os.getenv('BUMI_MEMORY_MODEL', 'deepseek-chat'),
+            memory_model=os.getenv('BUMI_MEMORY_MODEL', 'deepseek-flash'),
             memory_base_url=os.getenv('BUMI_MEMORY_BASE_URL', 'https://api.deepseek.com/v1'),
             embed_device=os.getenv('MEM0_EMBED_DEVICE', 'auto'),
             collection_name=os.getenv('BUMI_COLLECTION_NAME', 'bumi_mem_l3'),
@@ -108,6 +108,14 @@ class ServiceSettings:
         )
 
 
+def memory_provider_config(settings: ServiceSettings):
+    from bumi_mem.providers import ProviderConfig
+    return ProviderConfig(settings.memory_provider, settings.memory_model,
+                          settings.memory_base_url, settings.memory_api_key,
+                          settings.summary_max_tokens, 0.0,
+                          thinking_mode='disabled' if settings.memory_provider == 'deepseek' else None)
+
+
 def build_service_engine(settings: ServiceSettings):
     """Loads server resources only at startup. Never constructs a Chat Provider."""
     if not settings.embed_model_path.is_dir():
@@ -120,13 +128,11 @@ def build_service_engine(settings: ServiceSettings):
     from bumi_mem.engine import BumiMemory, BumiMemoryConfig
     from bumi_mem.long_term import Mem0AdapterConfig, Mem0LongTermMemory
     from bumi_mem.memory_access import SerialMemoryAccess
-    from bumi_mem.providers import ProviderConfig, OpenAICompatibleProvider
+    from bumi_mem.providers import OpenAICompatibleProvider
     from bumi_mem.session_store import SQLiteSessionStore
     from bumi_mem.token_counter import ApproxTokenCounter
 
-    provider = ProviderConfig(settings.memory_provider, settings.memory_model,
-                              settings.memory_base_url, settings.memory_api_key,
-                              settings.summary_max_tokens, 0.0)
+    provider = memory_provider_config(settings)
     counter = ApproxTokenCounter()
     store = SQLiteSessionStore(settings.db_path)
     adapter = Mem0AdapterConfig(data_dir=settings.data_dir / 'bumi_mem_l3',

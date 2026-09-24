@@ -256,7 +256,9 @@ def test_auth_input_limits_extra_fields_and_old_routes(harness):
     body={'user_id':'A','previous_ai_reply':None,'query':'q'}
     for headers in ({},{'Authorization':'Bearer invalid'}):
         assert client.post('/v1/memory/context',json=body,headers=headers).status_code == 401
-    for invalid in ({**body,'agent_id':'other'}, {**body,'turn_id':'old-interface'},
+    # turn_id now selects the single-request protocol, so it is no longer an
+    # unknown extra field here; see tests/test_turn_context_api.py.
+    for invalid in ({**body,'agent_id':'other'}, {**body,'unknown_field':'x'},
                     {**body,'user_id':' A'}, {**body,'user_id':None}, {**body,'query':' '},
                     {**body,'query':'x'*16001}, {**body,'previous_ai_reply':'x'*64001}):
         assert client.post('/v1/memory/context',json=invalid,headers=AUTH).status_code == 422
@@ -298,7 +300,7 @@ def test_migrate_v4_speaker_identity_without_changing_extraction_owner(tmp_path)
     drain(new)
     assert memory.add_calls[0]['user_id'] == 'A'
     with sqlite3.connect(store.path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 8
 
 
 def test_sync_and_async_clients_only_use_context_route():

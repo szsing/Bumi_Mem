@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from bumi_mem.identity import require_id
 from bumi_mem.event_time import message_time
+from bumi_mem.turn_prompt import MAX_CLIENT_TURN_ID
 from bumi_mem.schemas import IdentityRequiredError
 from bumi_mem.service_settings import ServiceSettings, build_service_engine
 from bumi_mem.turn_store import TurnConflict, TurnNotFound
@@ -28,7 +29,58 @@ from bumi_mem.agent_protocol import (
 logger = logging.getLogger(__name__)
 
 
+class TurnContextRequest(BaseModel):
+    """One request per turn: previous confirmed reply + current question."""
+    model_config = ConfigDict(extra='forbid')
+    turn_id: str = Field(min_length=1, max_length=MAX_CLIENT_TURN_ID,
+                         description="Caller's unique ID for THIS request; keep it across network retries")
+    user_id: str = Field(min_length=1, max_length=128,
+                         description='Speaker of query only, never of the reply; __guest__ when unconfirmed')
+    query: str | None = Field(max_length=16000,
+                              description='Current user text; null settles the last reply without a new turn')
+    previous_ai_reply: str | None = Field(default=None, max_length=64000,
+                                          description='Previously CONFIRMED robot output, not an unspoken draft')
+    query_occurred_at: str | None = Field(default=None, max_length=64)
+    previous_reply_occurred_at: str | None = Field(default=None, max_length=64)
+
+    @field_validator('query_occurred_at', 'previous_reply_occurred_at')
+    @classmethod
+    def validate_time(cls, value):
+        return message_time(value) if value is not None else None
+
+    @field_validator('turn_id', 'user_id')
+    @classmethod
+    def validate_ids(cls, value):
+        try:
+            return require_id(value)
+        except IdentityRequiredError:
+            raise ValueError('must be an explicit stable printable ID') from None
+
+    @field_validator('query')
+    @classmethod
+    def validate_query(cls, value):
+        # An empty or blank query is not a settle-only request; require null.
+        if value is not None and not value.strip():
+            raise ValueError('query must be null or nonblank')
+        return value
+
+    @model_validator(mode='after')
+    def validate_time_pairing(self):
+        if self.query is None and self.query_occurred_at is not None:
+            raise ValueError('query timestamp requires a query')
+        if not (self.previous_ai_reply or '').strip() and self.previous_reply_occurred_at is not None:
+            raise ValueError('reply timestamp requires a nonempty reply')
+        return self
+
+
+class TurnContextResponse(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    turn_id: str
+    prompt: str
+
+
 class ContextRequest(BaseModel):
+    """Legacy exchange, kept only for existing callers; returns the old fields."""
     model_config = ConfigDict(extra='forbid')
     user_id: str = Field(min_length=1, max_length=128)
     previous_ai_reply: str | None = Field(default=None, max_length=64000,
@@ -142,7 +194,7 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             finally:
                 lock.release()
 
-    app = FastAPI(title='Bumi Agent Memory API', version='1.2.0', lifespan=lifespan)
+    app = FastAPI(title='Bumi Agent Memory API', version='1.3.1', lifespan=lifespan)
     app.state.ready = False
     app.add_middleware(RequestBodyLimit)
     bearer = HTTPBearer(auto_error=False)
@@ -188,11 +240,18 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             raise HTTPException(503, detail={'code': 'not_ready'})
         return {'status': 'ready', 'warmed_up': request.app.state.engine._warmup_elapsed_ms is not None}
 
-    @app.post('/v1/memory/context', response_model=ContextResponse | AgentPrefetchResponse | AgentPrepareResponse | AgentCompleteResponse | AgentEventResponse | AgentPendingResponse, dependencies=[Depends(authorize)], tags=['memory'])
-    def context(body: ContextRequest | AgentPrefetchRequest | AgentPrepareRequest | AgentCompleteRequest | AgentEventRequest | AgentPendingRequest, request: Request,
+    @app.post('/v1/memory/context', response_model=TurnContextResponse | ContextResponse | AgentPrefetchResponse | AgentPrepareResponse | AgentCompleteResponse | AgentEventResponse | AgentPendingResponse, dependencies=[Depends(authorize)], tags=['memory'])
+    def context(body: TurnContextRequest | ContextRequest | AgentPrefetchRequest | AgentPrepareRequest | AgentCompleteRequest | AgentEventRequest | AgentPendingRequest, request: Request,
                 idempotency_key: Annotated[str | None, Header(alias='Idempotency-Key', max_length=128)] = None):
         config = request.app.state.settings
         engine = request.app.state.engine
+        # Main path: one request per turn, identified by the caller's turn_id.
+        if isinstance(body, TurnContextRequest):
+            return TurnContextResponse.model_validate(engine.process_turn_context(
+                turn_id=body.turn_id, user_id=body.user_id, agent_id=config.agent_id,
+                query=body.query, previous_ai_reply=body.previous_ai_reply,
+                query_occurred_at=body.query_occurred_at,
+                previous_reply_occurred_at=body.previous_reply_occurred_at))
         if isinstance(body, AgentPendingRequest):
             return dict(operation='pending', agent_id=config.agent_id, has_prompt=False,
                         pending=engine.store.pending_agent_turn(config.agent_id))
