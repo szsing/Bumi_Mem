@@ -1,8 +1,8 @@
-> 当前版本为0.5.1 / API 1.3.1 / schema 8；主路径仍为每轮单次请求、仅返回turn_id与prompt。下文兼容流程不作为新接入要求。旧缓存与编号迁移见 `../single_turn_hardening/README.md`。
+> 当前主路径为0.6.0 / API 1.4.0 / schema 9：输入六字段不变，响应为turn_id/current_user/long_term_memory/short_term_memory。新接入不要再读取prompt。详见 `../agent_api/README.md` 和 `../structured_turn_response/README.md`。下文两次调用协议仅为兼容历史，不作为新接入要求。
 
-# bumi-agent 实际代码接入说明（Bumi_Mem v0.4 / schema 7）
+# bumi-agent 兼容协议说明（主路径请使用0.6.0结构化单次响应）
 
-> **这份文档描述的 `operation=prepare/complete/agent_event/pending` 两次调用协议现在是兼容路径，不是主路径。** 主路径已改为每轮一次请求、只返回 `{"turn_id", "prompt"}`，见 **[单接口记忆服务第 0 节](../agent_api/README.md)**。新接入请用主路径；本文内容仅供已按两次调用协议接线的调用方参考。两者不能混用同一个待结束轮次。
+> **这份文档描述的 `operation=prepare/complete/agent_event/pending` 两次调用协议现在是兼容路径，不是主路径。** 主路径已改为每轮一次请求，返回 `turn_id/current_user/long_term_memory/short_term_memory`，见 **[单接口记忆服务第 0 节](../agent_api/README.md)**。新接入请用主路径；本文内容仅供已按两次调用协议接线的调用方参考。两者不能混用同一个待结束轮次。
 
 核查对象：`Noetix-AI/bumi-agent` 提交 `212900a`，`requirements.txt` 固定 `pipecat-ai[silero]==1.8.0`。这份说明按该仓库的真实代码编写，不是官方 Mem0 插件的替代配置。
 
