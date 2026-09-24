@@ -1,3 +1,5 @@
+> 0.6.0只改变单次HTTP响应的表示：长期/短期按实际数据行结构化返回，不改变下述记忆所有权和生命周期语义。schema 9迁移见 `../structured_turn_response/README.md`。
+
 > v0.4 adds schema 7 and an explicit Agent turn/event protocol; the v0.3 memory semantics below remain. See `../bumi_agent_integration/README.md` for the actual Pipecat 1.8 Agent integration.
 
 # Companion memory contract (v0.3, SQLite schema 6)

@@ -1,20 +1,25 @@
 # Bumi_Mem
 
-> 0.5.1 修复单次 Prompt 的保存失败提示、来源时间、控制结果、预算与文本边界，以及新旧协议幂等碰撞。输入输出不变；主数据库升级到 schema 8。升级前先暂停 Agent、结算待处理轮次并备份数据，见 [升级说明](docs/single_turn_hardening/README.md)。
+> 0.6.0 将单次接口响应从一段Prompt字符串改为四个结构化字段：`turn_id`、`current_user`、`long_term_memory`、`short_term_memory`。输入六字段和每轮一次调用方式不变；数据库升级到schema 9，用于撤销0.5.x字符串缓存。详见 [接口文档](docs/agent_api/README.md)。
 
-## 服务器启动（0.5.1）
+## 服务器启动（0.6.0）
 
-按实际服务器目录部署见 **[服务器启动与 Agent 连接](docs/deployment/README.md)**。新增交互配置与预检脚本；DeepSeek 记忆摘要/抽取默认使用 `deepseek-flash` 并关闭思考模式，不改变 Agent 的回答模型。当前 API 为 1.3.1（单次请求主路径）。配置和两种密钥保存在 Git 目录外。
+部署路径、DeepSeek、Embedding、HTTPS入口和数据检查见 **[服务器启动与 Agent 连接](docs/deployment/README.md)**。当前API为1.4.0。配置与密钥保存在Git目录外。
 
 ## Agent 部门接入（单接口 HTTP 服务）
 
-**主路径：每轮一次请求，返回一条 prompt 字符串（OpenAPI 1.3.1）。** 唯一业务接口 `POST /v1/memory/context`，请求带 `turn_id`、`user_id`、`query`、`previous_ai_reply`：先补存上一轮机器人已确认输出，再保存当前用户问题，最后返回
+**主路径：每轮一次请求，返回结构化记忆（OpenAPI 1.4.0）。** 请求仍带 `turn_id`、`user_id`、`query`、`previous_ai_reply`及两个可选时间；服务先补存上一轮确认回复，再保存当前问题。响应顶层严格为：
 
 ```json
-{"turn_id": "session-abc:turn-000002", "prompt": "当前用户：…\n\n[长期记忆]\n…\n\n[短期对话]\n…"}
+{
+  "turn_id": "session-abc:turn-000002",
+  "current_user": "user_001",
+  "long_term_memory": [{"user_id":"user_001","content":"用户喜欢绿茶。","time":["2026-09-23T19:52:46+08:00"]}],
+  "short_term_memory": [{"role":"user","speaker_id":"user_001","content":"你还记得我喜欢哪种茶吗？","time":"2026-09-24T10:20:00+08:00"}]
+}
 ```
 
-`prompt` **只含检索到的记忆**，三段：身份/时间头部、`[长期记忆]`、`[短期对话]`。当前问题只出现一次且在短期末尾。**不下发人物设定、工具规则或使用说明**，也不再同时返回 `messages`、`memory_context`、`core_memory` 等重复内容，不带检索分数或内部任务 ID。Agent 从 `response["prompt"]` 取记忆侧上下文，**不要再叠加一遍相同的普通历史**；Agent 自己的人设、工具调用链和执行结果仍由 Agent 管理，这个字符串不覆盖它们。防注入和“不要声称已长期记住”等约束也改由 Agent 侧人设负责。第一轮 `previous_ai_reply=null`；结束时用新的 `turn_id` 加 `query=null` 补存最后回复，返回空 prompt。回答模型由对方调用，后台摘要和长期提取继续由我们负责。
+长期记忆每条只有 `user_id/content/time[]`；短期每条只有 `role/speaker_id/content/time`。当前query已是短期数组最后一项。Agent仍自行管理人设、工具和执行状态。末轮用新的turn_id与`query=null`补存，两个记忆数组为空。
 
 同一 URL 上另有两条**兼容路径**，只为已有调用方保留、不要用于新接入：不带 `turn_id` 的旧三字段 exchange（用 `Idempotency-Key` 头，返回 messages），以及 `operation=prepare/complete/agent_event/pending` 的两次调用协议（见 **[实际代码接入说明](docs/bumi_agent_integration/README.md)**）。三者不能混用同一个待结束轮次。Agent 仓库本身尚未接线。
 
