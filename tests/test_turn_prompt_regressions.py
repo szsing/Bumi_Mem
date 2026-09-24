@@ -10,8 +10,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bumi_mem.api import create_app
-
-SINGLE_RESPONSE_KEYS = {'turn_id', 'prompt', 'short_term', 'long_term', 'core_state'}
 from bumi_mem.schemas import MessageRecord, IdentityRequiredError
 from bumi_mem.turn_prompt import (render_turn_prompt, _inline_data, _time_notes,
     LONG_TERM_HEADER, SHORT_TERM_HEADER, PERSISTENCE_UNCONFIRMED,
@@ -40,7 +38,7 @@ def test_failed_core_write_is_visible_but_unrelated_boundary_is_preserved(harnes
     monkeypatch.setattr(store,'apply_semantic_turn',lambda **kw: (_ for _ in ()).throw(RuntimeError('simulated failure')))
     response=turn(client,'t2',query='请叫我小林',previous='好的')
     assert response.status_code==200
-    assert set(response.json()) == SINGLE_RESPONSE_KEYS
+    assert set(response.json())=={'turn_id','prompt'}
     long,short=sections(response.json()['prompt'])
     assert PERSISTENCE_UNCONFIRMED in long
     assert '不要评价外貌' in long
@@ -186,7 +184,7 @@ def test_legacy_prefix_and_single_id_are_truly_independent(harness):
     legacy=client.post('/v1/memory/context',headers=dict(AUTH,**{'Idempotency-Key':'turn:t1'}),json=legacy_body)
     assert legacy.status_code==200 and 'messages' in legacy.json()
     single=turn(client,'t1',query='same')
-    assert single.status_code == 200 and set(single.json()) == SINGLE_RESPONSE_KEYS
+    assert single.status_code==200 and set(single.json())=={'turn_id','prompt'}
     assert len(store.list_shared_messages('bot'))==2
     assert turn(client,'t1',query='same').json()==single.json()
     with store._connect() as c:
@@ -246,7 +244,7 @@ def test_v7_single_cache_migration_keeps_sources_but_revokes_old_prompt(tmp_path
     with pytest.raises(TurnConflict,match='request_protocol_ambiguous'):
         new.process_context(user_id='A',agent_id='bot',query='original',previous_ai_reply=None,idempotency_key='turn:t1')
     reply=new.process_turn_context(turn_id='t2',user_id='A',agent_id='bot',query='next',previous_ai_reply='actually spoken')
-    assert set(reply) == SINGLE_RESPONSE_KEYS
+    assert set(reply)=={'turn_id','prompt'}
     assert [m.content for m in upgraded.list_shared_messages('bot')]==['original','actually spoken','next']
     with upgraded._connect() as c:
         assert c.execute('PRAGMA user_version').fetchone()[0]==8
@@ -306,19 +304,14 @@ def test_new_namespace_concurrent_retries_are_still_exactly_one_write(harness):
     with ThreadPoolExecutor(max_workers=4) as pool:
         results=list(pool.map(lambda _:turn(client,'concurrent',query='same').json(),range(4)))
     assert all(r==results[0] for r in results)
-    assert set(results[0]) == SINGLE_RESPONSE_KEYS
+    assert set(results[0])=={'turn_id','prompt'}
     assert len(store.list_shared_messages('bot'))==1 and len(backend.search_calls)==1
 
 
-def test_settle_only_receipt_has_no_prompt_and_empty_structured_views(harness):
+def test_settle_only_receipt_has_same_two_fields_and_no_prompt(harness):
     client,_,store,*_=harness
     assert turn(client,'t1',query='hello').status_code==200
     first=turn(client,'flush',query=None,previous='bye')
     replay=turn(client,'flush',query=None,previous='bye')
-    body=first.json()
-    assert first.status_code==200 and set(body)==SINGLE_RESPONSE_KEYS
-    assert (body['turn_id'], body['prompt'])==('flush','')
-    assert (body['short_term'], body['long_term'], body['core_state'])==([],[],[])
-    # 补存请求重放返回同一份回执
-    assert replay.json()==body
+    assert first.status_code==200 and replay.json()==first.json()=={'turn_id':'flush','prompt':''}
     assert [m.content for m in store.list_shared_messages('bot')]==['hello','bye']

@@ -27,21 +27,14 @@ def sections(prompt):
     return long_term, short_term
 
 
-SINGLE_RESPONSE_KEYS = {'turn_id', 'prompt', 'short_term', 'long_term', 'core_state'}
-
-
-def test_first_round_without_previous_reply_returns_prompt_and_structured_fields(harness):
+def test_first_round_without_previous_reply_returns_only_two_fields(harness):
     client, engine, store, memory, chat, summary, _, _ = harness
     result = turn(client, 'session-abc:turn-1', query='你好')
     assert result.status_code == 200, result.text
     body = result.json()
-    assert set(body) == SINGLE_RESPONSE_KEYS
+    assert set(body) == {'turn_id', 'prompt'}
     assert body['turn_id'] == 'session-abc:turn-1'
     assert isinstance(body['prompt'], str)
-    # 结构化视图：本轮 query 出现在 short_term，且不带 carry-over 标记
-    assert [item['content'] for item in body['short_term']] == ['你好']
-    assert body['short_term'][0]['role'] == 'user' and body['short_term'][0]['carry_over'] is False
-    assert body['long_term'] == [] and body['core_state'] == []
     long_term, short_term = sections(body['prompt'])
     assert NO_LONG_TERM in long_term
     assert short_term == '[' + store.list_shared_messages('bot')[0].created_at + '] 用户 A：你好'
@@ -259,9 +252,7 @@ def test_settle_only_final_request_returns_empty_prompt(harness):
                          json={'turn_id': 't-final', 'user_id': 'A', 'query': None,
                                'previous_ai_reply': '最后一答'})
     assert result.status_code == 200, result.text
-    body = result.json()
-    assert {key: body[key] for key in ('turn_id', 'prompt')} == {'turn_id': 't-final', 'prompt': ''}
-    assert body['short_term'] == [] and body['long_term'] == [] and body['core_state'] == []
+    assert result.json() == {'turn_id': 't-final', 'prompt': ''}
     assert [m.content for m in store.list_shared_messages('bot')] == ['最后一问', '最后一答']
 
 
@@ -323,7 +314,7 @@ def test_legacy_exchange_still_returns_its_own_fields(harness):
                                   'previous_reply_saved', 'recall_status', 'consolidation_status', 'core_write'}
     # The new response never regains the legacy multi-context fields.
     new = turn(client, 't1', query='新协议问题', previous='旧协议回答').json()
-    assert set(new) == SINGLE_RESPONSE_KEYS
+    assert set(new) == {'turn_id', 'prompt'}
     assert [m.content for m in store.list_shared_messages('bot')] == [
         '旧协议问题', '旧协议回答', '新协议问题']
 
@@ -370,7 +361,7 @@ def test_openapi_documents_the_single_request_protocol(harness):
     assert set(request['properties']) == {'turn_id', 'user_id', 'query', 'previous_ai_reply',
                                           'query_occurred_at', 'previous_reply_occurred_at'}
     response = schema['components']['schemas']['TurnContextResponse']
-    assert set(response['properties']) == SINGLE_RESPONSE_KEYS
+    assert set(response['properties']) == {'turn_id', 'prompt'}
 
 
 def test_legacy_key_and_turn_id_share_no_idempotency_namespace(harness):
@@ -381,5 +372,5 @@ def test_legacy_key_and_turn_id_share_no_idempotency_namespace(harness):
     # Same literal ID, different protocol: a real new turn, not a replayed one.
     result = turn(client, 'shared-id', query='新协议问题', previous='旧协议回答')
     assert result.status_code == 200, result.text
-    assert set(result.json()) == SINGLE_RESPONSE_KEYS
+    assert set(result.json()) == {'turn_id', 'prompt'}
     assert len(store.list_shared_messages('bot')) == 3
