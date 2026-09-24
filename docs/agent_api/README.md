@@ -4,6 +4,9 @@
 
 > 记忆内容沿用 v0.3 契约：门控后的 L3 引用进入共享 L1，包含陌生身份、时间来源与 core_write；当前数据库是 schema 8。详细记忆语义见 [陪伴记忆契约](../companion_memory/README.md)。
 
+> 存储字段（`messages` / `shared_l1` / `shared_memory_refs` / `semantic_*`）与响应 JSON 的逐项对照、
+> 三条协议的实测样例、接入不变量，见 [响应格式规范](RESPONSE_FORMAT.md)。
+
 # 单接口记忆服务：Agent 接入与部署
 
 对外仅保留一个业务接口：`POST /v1/memory/context`。旧 `/v1/memory/prompt`、`/v1/memory/reply` 路由已移除。健康检查、在线文档不是额外的对话业务接口。
