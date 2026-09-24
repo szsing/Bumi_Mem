@@ -150,13 +150,19 @@ torch 下会静默回退）。
 
 原始数据：
 
-- `mem0-runtime/logs/latency-final-300.json` / `.txt`（300 条，8 查询 × 20 次 + 引擎前台）
-- `mem0-runtime/logs/latency-final-300-assembly.json` / `.txt`（300 条，串行拼装分解）
-- `mem0-runtime/logs/latency-final-5000.json` / `.txt`（5000 条，8 查询 × 20 次 + 引擎前台）
-- `mem0-runtime/logs/latency-final-5000-assembly.json` / `.txt`（5000 条，串行拼装分解）
-- `mem0-runtime/logs/latency-qdrant-scale.json` / `.txt`（Qdrant 本地检索规模伸缩）
-- §3.7 GPU：`mem0-runtime/logs/latency-gpu-300*.json|txt`、`latency-gpu-5000*.json|txt`、
-  `latency-qdrant-scale-gpu.json|txt`
+- `docs/latency/raw/latency-final-300.json`（300 条，8 查询 × 20 次 + 引擎前台）
+- `docs/latency/raw/latency-final-300-assembly.json`（300 条，串行拼装分解）
+- `docs/latency/raw/latency-final-5000.json`（5000 条，8 查询 × 20 次 + 引擎前台）
+- `docs/latency/raw/latency-final-5000-assembly.json`（5000 条，串行拼装分解）
+- `docs/latency/raw/latency-qdrant-scale.json`（Qdrant 本地检索规模伸缩）
+- §3.7 GPU：`docs/latency/raw/latency-gpu-300.json`、`latency-gpu-300-assembly.json`、
+  `latency-gpu-5000.json`、`latency-gpu-5000-assembly.json`、`latency-qdrant-scale-gpu.json`
+
+**本报告引用的原始 JSON 已随仓库提交在 [`docs/latency/raw/`](raw/INDEX.md)**——就是脚本 `--json` 的
+落盘产物按文件名原样复制，每份都自带 `environment`（实际生效的 `resolved_embed_device`、Qdrant 形态、
+集合、warmup）与逐样本时延数组，§3/§8 的每张表都能直接复算。文件清单、逐文件指纹与对应章节见
+[`raw/INDEX.md`](raw/INDEX.md)。仓库外 `~/mem0-runtime/logs/` 保留完整集合（含 `.txt` 人类可读版与
+探索性运行）。
 
 ### 3.1 总检索时延（`memory.search`，n=160）
 
@@ -379,7 +385,7 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 
 **质量证据（先证明可以关）**：
 
-- 消融实验 `mem0-runtime/logs/retrieval-ablation-20260922-184417.*`（317 条记忆 / 13 条查询）比较
+- 消融实验 `docs/latency/raw/retrieval-ablation-20260922-184417.json`（317 条记忆 / 13 条查询）比较
   「语义 only」「语义 + BM25」「完整（含实体加成）」三种配置，**Recall 0.92、MRR 0.71、逐查询命中排名
   三者完全相同**——两条旁路在中文语料上没有召回收益。
 - 本次在 20000 条 GPU + Server 上做 ID 级 A/B：8 条查询在实体加成 on/off 下返回的 top-5
@@ -404,7 +410,7 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 | 20000 | 63.0ms | **37.1ms** | −41% |
 
 `off` 后所有分查询的中位都落在 33–36ms；引擎前台 0.2s 截止三档 0/4 超时、`recall_status=ok`。
-原始数据：`latency-eboff-300.*`、`latency-eboff5000.*`、`latency-eboff20000.*`。
+原始数据：`docs/latency/raw/latency-eboff-300.json`、`latency-eboff5000.json`、`latency-eboff20000.json`。
 
 **结论：在 GPU + Qdrant Server + `BUMI_ENTITY_BOOST=off` 这一配置下，检索 P90 ≤60ms 达标**
 （35.0 / 35.9 / 37.1ms）。
@@ -436,7 +442,8 @@ path client）。写入改为 **500 条/批**——Server 单请求上限 32MB�
 
 复用结果 hit 24 / stale 0 / expired 0 / miss 0（100% 命中）。结论：检索 36ms 被移出串行路径，
 **串行只剩 15.5ms P90**（≤20ms 预算），所需提前量 `36.3 + 15.5 − 20 ≈ 32ms`——
-ASR 稳定前缀只要比终稿早约 32ms 即可（本次模拟 50ms）。原始数据：`latency-prefetch-sim.json`。
+ASR 稳定前缀只要比终稿早约 32ms 即可（本次模拟 50ms）。原始数据：
+`docs/latency/raw/latency-prefetch-sim.json`。
 
 真实 HTTP 端到端（本机服务 `127.0.0.1:8099`，`BumiMemoryClient` 5 轮对照，含 HTTP/JSON/拼装）：
 **prefetch + prepare P50 13.2ms / P90 13.8ms**，直接 prepare（检索在串行路径上）P50 47.3ms / P90 59.2ms。
@@ -580,6 +587,21 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 部署脚本：`scripts/qdrant_server.sh`（启停/状态/日志/copytruncate 轮转）、
 `scripts/make_service_env.py`（生成仓库外的 service.env）、`scripts/run_memory_service.sh`（起服务）。
 
+### 7.1 本任务的交付物清单
+
+| 类别 | 文件 |
+|---|---|
+| 报告 | `docs/latency/REPORT.md`（本文件） |
+| 原始结果 | `docs/latency/raw/`（33 份脚本落盘 JSON，逐文件指纹与对应章节见 `raw/INDEX.md`） |
+| 压测与召回工具 | `tools/latency/latency_bench.py`、`recall_ablation.py`、`locomo_to_recall_dataset.py`、`make_sim_dataset.py` |
+| 验收工具 | `tools/latency/preflight_check.py`、`scripts/qdrant_server.sh`、`scripts/make_service_env.py` |
+| 数据集 | `tools/latency/datasets/recall_locomo_zh.json`（§9 验收用）、`recall_sim_zh.json`、`recall_demo.json` |
+| 运行时功能 | `src/bumi_mem/prefetch.py`（流式前缀预取）、`BUMI_ENTITY_BOOST`（`src/bumi_mem/long_term.py`）、`BUMI_CONSOLIDATION_IDLE_SECONDS`（`src/bumi_mem/worker.py`） |
+| 测试 | `tests/test_prefetch.py`、`test_worker_idle_policy.py`、`test_entity_boost_policy.py` |
+
+下面 1–6 步就是本次全部运行命令（CPU 与 GPU 两套），§3、§8 的每一张表都由它们产生；
+原始 JSON 已随仓库提交，**核对数字不需要重跑**，重跑只是因为要换机器/换规模。
+
 ```bash
 # 0a. CPU 基线：依赖仓库 pyproject 的 runtime；脚本会自动 re-exec 到 ~/.venvs/bumi
 # 0b. GPU 复测：先建独立环境（不改 CPU 基线）
@@ -662,7 +684,7 @@ tools/latency/preflight_check.py --require-gpu --require-server \
   --require-entity-boost-off --collection bumi_latency_bench
 ```
 
-本次结果（`mem0-runtime/logs/preflight-gpu-server.json`）：11 项全部 PASS，退出码 0。
+本次结果（`docs/latency/raw/preflight-gpu-server.json`）：11 项全部 PASS，退出码 0。
 
 ### 8.2 召回回归：合成语料已过，真实语料按同一套流程
 
@@ -674,7 +696,7 @@ tools/latency/preflight_check.py --require-gpu --require-server \
 | `datasets/recall_sim_zh.json` | **LLM 生成**（DeepSeek） | 中文 | 七类场景覆盖 | 真实分布；且待人工校验 |
 | `datasets/recall_demo.json` | 手写小样本 | 中文 | 流程自检 | 任何统计结论 |
 | LoCoMo 原版 | **真实两人对话 + 人工标注 evidence** | 英文 | 跨域召回、证据级召回 | 中文表达、本产品场景 |
-| LoCoMo 中文子集 | 同上 + **机器翻译** | 中文 | 中文跨域召回、明显退化筛查 | 真实中文口语分布（机翻伪影） |
+| LoCoMo 中文子集（`tools/latency/datasets/recall_locomo_zh.json`，已提交） | 同上 + **机器翻译** | 中文 | 中文跨域召回、明显退化筛查 | 真实中文口语分布（机翻伪影） |
 | 真实用户语料（待补） | 我们自己的用户（脱敏） | 中文 | 最终验收 | — |
 
 LoCoMo 原始对话和 evidence 标注是真人真标注，**数据来源是真实的**；但中文版是我们机翻的，
@@ -746,8 +768,9 @@ MRR 0.82、逐查询排名完全一致。真实语料建议放在 `~/mem0-runtim
 3. 因此“关实体加成”在中文合成语料与英文公开数据集上结论一致。**但当前部署仍按保守策略保留
    `BUMI_ENTITY_BOOST=on`**（见 §8.6），真实中文语料回归通过后再切换；切换是一行配置。
 
-原始数据：`mem0-runtime/logs/recall-locomo.json`；
-数据集与原始 LoCoMo 放在仓库外 `mem0-runtime/datasets/`。
+原始数据：`docs/latency/raw/recall-locomo.json`（已随仓库提交）；
+上游整库文件 `locomo10.json` 与全量英文派生集放在仓库外 `mem0-runtime/datasets/`（未提交，
+理由与 sha256 见 [`raw/INDEX.md`](raw/INDEX.md)），按本节的命令可重建。
 
 #### LoCoMo 中文子集（规模更小，可选）
 
@@ -758,13 +781,16 @@ MRR 0.82、逐查询排名完全一致。真实语料建议放在 `~/mem0-runtim
 MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python \
 tools/latency/locomo_to_recall_dataset.py --samples 1 --max-probes 80 \
   --translate --batch-size 30 \
-  --out ~/mem0-runtime/datasets/recall_locomo_zh.json
+  --out tools/latency/datasets/recall_locomo_zh.json
 ```
 
 - `--samples N`：只取前 N 段对话（1 段 ≈ 420–590 条话语）；另有 `--max-memories` / `--max-probes` 控规模；
 - `--translate`：用 DeepSeek 逐批翻译，**先统一人名译法作为术语表**再翻正文，日期/数字保留；
   `expected` 直接复用译好的记忆原文，保证"逐字一致"这一约束不被翻译破坏；
-- 翻译结果缓存在 `~/mem0-runtime/datasets/locomo_zh_cache.json`，重跑不重复计费、结果可复现。
+- 翻译结果缓存在 `~/mem0-runtime/datasets/locomo_zh_cache.json`（仓库外），重跑不重复计费、结果可复现。
+
+产物已收进仓库：`tools/latency/datasets/recall_locomo_zh.json`（sha256 `14b3f3877a0d…`，
+419 条记忆 / 80 条查询），§9 的验收就是用它跑的，reviewer 不需要重新下载 LoCoMo 或再次调用翻译 API。
 
 本次产出：1 段对话 → **419 条记忆 / 80 条查询**（cat1–5 = 18/17/11/17/17，其中 24 条多证据），
 约 22 次翻译请求、耗时约 1.5 分钟。三档对照（top_k=5，每条 3 次）：
@@ -777,7 +803,7 @@ tools/latency/locomo_to_recall_dataset.py --samples 1 --max-probes 80 \
 
 在**中文**语料上：BM25 中性（与中文合成消融一致），实体加成略负；Recall 绝对值低于小规模示例集
 是正常的——LoCoMo 对话长、事实分散，419 条记忆里还带时间前缀。原始数据：
-`mem0-runtime/logs/recall-locomo-zh.json`。
+`docs/latency/raw/recall-locomo-zh.json`（含每档 240 个样本与分组召回）。
 
 #### LLM 生成的中文模拟语料（覆盖七类，待人工校验）
 
@@ -845,8 +871,9 @@ worker 不认领后台任务；空闲满窗口、或任务年龄超过最大延�
 > 或把整理放到独立进程（需 Qdrant Server + 第二份模型）。现阶段建议保留 `idle=2`（真实节奏实测 0 降级、
 > 不影响正确性）+ 生产打点统计 `recall_status=unavailable`，降级率不可接受再上抽取拆分。
 
-原始数据：`latency-eboff5000-assembly50.json`（修复前）与
-`latency-eboff5000-assembly50-idle.json`（修复后）。
+原始数据：`docs/latency/raw/latency-eboff5000-assembly50.json`（修复前）与
+`latency-eboff5000-assembly50-idle.json`（修复后）；上面口径修正那张表的三个文件是
+`latency-gap-idle2.json`、`latency-gap-idle0.json`、`latency-gap-sdk.json`。
 
 ### 8.4 串行拼装：50 轮复测
 
@@ -873,7 +900,7 @@ P90 达标；P99 23.0ms 略超 20ms 预算，来自 SQLite/GC 抖动，验收建
 上层顺序发送（`docs/agent_api/README.md` §5），所以真实并发来自“一个进程服务多个 agent”。
 建议按 agent 限定进程/队列深度，或对并发检索放宽截止；不要让一个进程同时服务大量 agent。
 两次结果的差异（32 vs 45）来自排队/调度抖动——真正的结论是**队列深度 × 单次耗时 > 截止时间时必然降级**，
-不是某个固定百分比。原始数据：`latency-eboff5000-concurrent.json`（修复前）与
+不是某个固定百分比。原始数据：`docs/latency/raw/latency-eboff5000-concurrent.json`（修复前）与
 `latency-eboff5000-concurrent-postfix.json`（修复后）。
 
 ### 8.6 固化配置清单与验收顺序
@@ -903,7 +930,7 @@ preflight_check.py（环境）
   → latency_bench --corpus N --repeats 20（检索 P90/P99）
   → latency_bench --assembly --assembly-repeats 50（串行 P90/P99）
   → latency_bench --concurrent 8（并发降级率）
-  → recall_ablation.py --dataset ~/mem0-runtime/datasets/recall_locomo_zh.json \
+  → recall_ablation.py --dataset tools/latency/datasets/recall_locomo_zh.json \
        --collection recall_locomo_zh --repeats 3（召回回归，结论见 §9）
 ```
 
@@ -949,8 +976,9 @@ curl -sS http://127.0.0.1:8088/health/ready
 ## 9. 召回验收记录（2026-09-23）
 
 **语料**（按项目决定，本阶段以 LoCoMo 中文子集作为"真实用户语料"的代理）：
-`~/mem0-runtime/datasets/recall_locomo_zh.json` —— 来源为公开数据集 LoCoMo（**真人两人对话 +
-人工标注 evidence**），取 1 段对话后**机器翻译**为中文；419 条记忆 / 80 条查询
+`tools/latency/datasets/recall_locomo_zh.json`（**已随仓库提交**，sha256 `14b3f3877a0d…`）——
+来源为公开数据集 LoCoMo（**真人两人对话 + 人工标注 evidence**），取 1 段对话后**机器翻译**为中文；
+419 条记忆 / 80 条查询
 （cat1–5 = 18/17/11/17/17，其中 24 条多证据）。生成方式、翻译缓存与语料分级见 §8.2。
 
 **环境**：H20 + `~/.venvs/bumi-cuda`（torch 2.8.0+cu128，`CUDA_VISIBLE_DEVICES=4`）+
@@ -979,7 +1007,7 @@ Qdrant Server 1.19.1；`top_k=5`、`threshold=0.1`、每条查询重复 3 次（
 启用预取后终稿后的串行段进一步降到 ~14ms（§3.10），是否需要取决于 Agent 侧 ASR 能给多少提前量
 （该分布由对方测定，见 §3.10 的 60ms 门槛）。
 
-原始数据：`mem0-runtime/logs/recall-locomo-zh.json`（含每档 240 个样本与分组召回）；
+原始数据：`docs/latency/raw/recall-locomo-zh.json`（含每档 240 个样本与分组召回）；
 运行命令见 §8.2。
 
 ---
