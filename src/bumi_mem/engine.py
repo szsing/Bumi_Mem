@@ -30,7 +30,8 @@ from bumi_mem.providers import TextProvider
 from bumi_mem.schemas import ConsolidationSubmission, MemoryJob, MessageRecord, SessionRecord, SessionStats, TurnResult
 from bumi_mem.session_store import SQLiteSessionStore
 from bumi_mem.token_counter import TokenCounter
-from bumi_mem.turn_prompt import MAX_CLIENT_TURN_ID, render_turn_prompt
+from bumi_mem.turn_prompt import MAX_CLIENT_TURN_ID
+from bumi_mem.turn_context import render_turn_context
 from bumi_mem.worker import MemoryWorker
 
 logger = logging.getLogger(__name__)
@@ -253,7 +254,7 @@ class BumiMemory(AgentEngineMixin):
         """Collect this turn's structured context inputs and apply its side effects.
 
         Returns the same rows both renderers consume; neither of them parses or
-        re-splits an assembled prompt string.
+        re-splits an assembled prompt string, nor parses an already-rendered response.
 
         prefetched：来自 operation=prefetch 的候选；命中时跳过这次检索，只做后处理。
         """
@@ -341,23 +342,21 @@ class BumiMemory(AgentEngineMixin):
                                            recalled=bundle['recalled'], core_write=bundle['core_write'],
                                            expected_epoch=bundle['epoch'])
 
-    def _turn_prompt_text(self, turn):
-        """Build the single-string prompt for the one-request-per-turn protocol."""
+    def _turn_context_payload(self, turn, *, client_turn_id):
+        """Build the structured four-field response for one single-turn request."""
         cached = self._cached_turn_prompt(turn)
-        if cached is not None and cached.get('prompt_text') is not None:
-            return cached['prompt_text']
+        if cached is not None and cached.get('context_payload') is not None:
+            return cached['context_payload']
         bundle = self._context_bundle(turn)
-        prompt = render_turn_prompt(
-            user_id=bundle['user_id'], agent_id=bundle['agent_id'], selected=bundle['selected'],
+        payload = render_turn_context(
+            turn_id=client_turn_id, user_id=bundle['user_id'], selected=bundle['selected'],
             refs=bundle['refs'], core_rows=bundle['core_rows'], history_rows=bundle['history_rows'],
-            recall_status=bundle['recall_status'], core_write=bundle['core_write'],
             max_reference_chars=self.context_builder.max_reference_chars)
-        # The turn must still leave 'preparing' so the next single request can
-        # settle it; only this protocol's string is cached for its own replay.
-        self.store.save_turn_prompt(turn['turn_id'], messages=[], recall_status=bundle['recall_status'],
-                                    recalled=bundle['recalled'], core_write=bundle['core_write'],
-                                    expected_epoch=bundle['epoch'], prompt_text=prompt)
-        return prompt
+        self.store.save_turn_prompt(
+            turn['turn_id'], messages=[], recall_status=bundle['recall_status'],
+            recalled=bundle['recalled'], core_write=bundle['core_write'],
+            expected_epoch=bundle['epoch'], context_payload=payload)
+        return payload
 
     def process_context(self, *, user_id: str, agent_id: str, previous_ai_reply: str | None,
                         query: str | None, idempotency_key: str | None = None,
@@ -414,7 +413,7 @@ class BumiMemory(AgentEngineMixin):
                              query_occurred_at: str | None = None,
                              previous_reply_occurred_at: str | None = None) -> dict[str, Any]:
         """One request per turn: settle the previous reply, save the current query,
-        and return a single ready-to-use prompt string.
+        and return four structured memory fields.
 
         turn_id is the caller's identifier for THIS request only. It provides
         per-request idempotency; it does not associate out-of-order replies.
@@ -455,14 +454,17 @@ class BumiMemory(AgentEngineMixin):
             if request['previous_turn_id']:
                 self._record_spoken_promise(request['previous_turn_id'], agent_id)
             # A settle-only request saves the last reply without a new question,
-            # so it has no current prompt to return.
-            prompt = ''
+            # so it has no current context arrays to return.
+            payload = {'turn_id': turn_id, 'current_user': user_id,
+                       'long_term_memory': [], 'short_term_memory': []}
             epoch = self.store.context_epoch(agent_id)
             if request['turn_id']:
-                prompt = self._turn_prompt_text(self.store.get_turn(request['turn_id'], agent_id))
+                internal_turn = self.store.get_turn(request['turn_id'], agent_id)
+                payload = self._turn_context_payload(internal_turn, client_turn_id=turn_id)
+                # Core updates can bump the shared context epoch while building.
                 epoch = self.store.get_turn(request['turn_id'], agent_id)['context_epoch']
-            return self.store.save_turn_context_response(request['request_id'], turn_id=turn_id,
-                                                         prompt=prompt, expected_epoch=epoch)
+            return self.store.save_turn_context_response(
+                request['request_id'], payload=payload, expected_epoch=epoch)
 
     def record_reply(self, *, turn_id: str, agent_id: str, reply: str | None = None,
                      status: str = 'completed') -> dict[str, Any]:

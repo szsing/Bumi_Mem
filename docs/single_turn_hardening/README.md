@@ -1,3 +1,5 @@
+> 本文记录0.5.1/schema 8的历史修复。当前0.6.0/schema 9已改为结构化响应，见 `../structured_turn_response/README.md`。
+
 # 单次 Prompt 修复与 schema 8 升级（2026-09-23）
 
 版本：Bumi_Mem 0.5.1 / HTTP API 1.3.1。**不改用户约定的六个输入字段、不增加调用次数，正常响应仍只有 turn_id 和 prompt。**

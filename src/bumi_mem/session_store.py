@@ -61,7 +61,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 8:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 9:
                 raise RuntimeError("Database schema is newer than this Bumi version; refusing to downgrade")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
@@ -197,9 +197,12 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                 conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
                 conn.execute("UPDATE context_requests SET response_json=NULL WHERE state!='revoked'")
             self.create_agent_tables(conn)
-            if conn.execute('PRAGMA user_version').fetchone()[0] < 8:
+            version = conn.execute('PRAGMA user_version').fetchone()[0]
+            if version < 8:
                 self.migrate_context_request_protocols(conn)
-            conn.execute('PRAGMA user_version=8')
+            if version < 9:
+                self.migrate_structured_turn_responses(conn)
+            conn.execute('PRAGMA user_version=9')
 
     @staticmethod
     def _session(row: sqlite3.Row | None) -> SessionRecord | None:

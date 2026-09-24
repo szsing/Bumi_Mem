@@ -19,11 +19,11 @@ class BumiMemoryClient:
     def turn_context(self, *, turn_id: str, user_id: str, query: str | None,
                      previous_ai_reply: str | None = None, query_occurred_at: str | None = None,
                      previous_reply_occurred_at: str | None = None) -> dict:
-        """Main path: one request per turn, returning {'turn_id', 'prompt'}.
+        """Main path: one request per turn, returning four structured fields.
 
         Reuse the SAME turn_id and body on a network retry; use a NEW turn_id for
         the next turn. query=None settles the last confirmed reply and returns an
-        empty prompt. Read the memory context from result['prompt'] as-is.
+        empty memory arrays. Consume result['long_term_memory'] and result['short_term_memory'].
         """
         result = self._http.post('/v1/memory/context', json=_turn_payload(
             turn_id, user_id, query, previous_ai_reply, query_occurred_at, previous_reply_occurred_at))
@@ -93,7 +93,7 @@ class AsyncBumiMemoryClient:
     async def turn_context(self, *, turn_id: str, user_id: str, query: str | None,
                            previous_ai_reply: str | None = None, query_occurred_at: str | None = None,
                            previous_reply_occurred_at: str | None = None) -> dict:
-        """Main path: one request per turn, returning {'turn_id', 'prompt'}."""
+        """Main path: one request per turn, returning four structured fields."""
         result = await self._http.post('/v1/memory/context', json=_turn_payload(
             turn_id, user_id, query, previous_ai_reply, query_occurred_at, previous_reply_occurred_at))
         result.raise_for_status()
@@ -187,7 +187,7 @@ def main():
     parser.add_argument('--query-occurred-at', default=None)
     parser.add_argument('--previous-reply-occurred-at', default=None)
     parser.add_argument('--legacy', action='store_true',
-                        help='Use the old multi-context exchange instead of the single prompt')
+                        help='Use the old multi-context exchange instead of the structured single-turn response')
     parser.add_argument('--idempotency-key', default=None, help='Legacy exchange only')
     args = parser.parse_args()
     with BumiMemoryClient(os.environ['BUMI_SERVICE_URL'], os.environ['BUMI_SERVICE_API_KEY']) as client:

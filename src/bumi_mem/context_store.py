@@ -17,9 +17,18 @@ def _json_object(value):
     return decoded if isinstance(decoded, dict) else None
 
 
-def _single_response(payload, client_id):
+def _prompt_single_response(payload, client_id):
+    """0.5.x response, retained only for safe migration detection."""
     return (isinstance(payload, dict) and set(payload) == {'turn_id', 'prompt'} and
             payload['turn_id'] == client_id and isinstance(payload['prompt'], str))
+
+
+def _structured_single_response(payload, client_id):
+    return (isinstance(payload, dict) and set(payload) == {
+                'turn_id', 'current_user', 'long_term_memory', 'short_term_memory'} and
+            payload['turn_id'] == client_id and isinstance(payload['current_user'], str) and
+            isinstance(payload['long_term_memory'], list) and
+            isinstance(payload['short_term_memory'], list))
 
 
 class ContextStoreMixin:
@@ -56,7 +65,8 @@ class ContextStoreMixin:
             client_id = key[len(LEGACY_TURN_REQUEST_PREFIX):]
             response = _json_object(row['response_json'])
             cached = _json_object(row['cached_turn_prompt'])
-            proven_single = _single_response(response, client_id) or (
+            proven_single = (_prompt_single_response(response, client_id) or
+                             _structured_single_response(response, client_id)) or (
                 response is None and cached is not None and isinstance(cached.get('prompt_text'), str))
             proven_legacy = (response is not None and response.get('request_id') == row['request_id']
                              and isinstance(response.get('messages'), list)) or (
@@ -78,6 +88,26 @@ class ContextStoreMixin:
         for agent_id in stale_agents:
             self._bump_context_epoch(conn, agent_id)
 
+    def migrate_structured_turn_responses(self, conn):
+        """v9: invalidate 0.5.x string responses without rewriting messages/L3."""
+        rows = conn.execute("SELECT request_id,agent_id,turn_id,response_json FROM context_requests "
+                            "WHERE request_kind='single'").fetchall()
+        stale_agents = set()
+        for row in rows:
+            payload = _json_object(row['response_json'])
+            if payload is None or _prompt_single_response(payload, (payload or {}).get('turn_id')):
+                conn.execute("UPDATE context_requests SET response_json=NULL,state='preparing' WHERE request_id=?",
+                             (row['request_id'],))
+                if row['turn_id']:
+                    conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE turn_id=?", (row['turn_id'],))
+                stale_agents.add(row['agent_id'])
+            elif not _structured_single_response(payload, payload.get('turn_id')):
+                conn.execute("UPDATE context_requests SET request_kind='ambiguous' WHERE request_id=?",
+                             (row['request_id'],))
+                stale_agents.add(row['agent_id'])
+        for agent_id in stale_agents:
+            self._bump_context_epoch(conn, agent_id)
+
     @staticmethod
     def _check_response_kind(row):
         if row['request_kind'] == 'ambiguous':
@@ -87,7 +117,8 @@ class ContextStoreMixin:
         payload = _json_object(row['response_json'])
         if row['request_kind'] == 'single':
             key = row['idempotency_key'] or ''
-            if not key.startswith(TURN_REQUEST_PREFIX) or not _single_response(payload, key[len(TURN_REQUEST_PREFIX):]):
+            if not key.startswith(TURN_REQUEST_PREFIX) or not _structured_single_response(
+                    payload, key[len(TURN_REQUEST_PREFIX):]):
                 raise TurnConflict('request_protocol_conflict')
         elif row['request_kind'] != 'legacy' or payload is None or (
                 payload.get('request_id') != row['request_id'] or not isinstance(payload.get('messages'), list)):
@@ -176,20 +207,22 @@ class ContextStoreMixin:
                          (query_occurred_at, previous_reply_occurred_at, request_id))
             return dict(conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone())
 
-    def save_turn_context_response(self, request_id, *, turn_id, prompt, expected_epoch=None):
-        """Persist the single-request protocol's two-field response for replay."""
+    def save_turn_context_response(self, request_id, *, payload, expected_epoch=None):
+        """Persist the structured four-field response for exact replay."""
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone()
-            if row['request_kind'] != 'single' or row['idempotency_key'] != TURN_REQUEST_PREFIX + turn_id:
+            turn_id = payload.get('turn_id') if isinstance(payload, dict) else None
+            if (row['request_kind'] != 'single' or not isinstance(turn_id, str) or
+                    row['idempotency_key'] != TURN_REQUEST_PREFIX + turn_id or
+                    not _structured_single_response(payload, turn_id)):
                 raise TurnConflict('request_protocol_conflict')
             self._check_context_request(conn, row)
             epoch = self._context_epoch(conn, row['agent_id'])
             if expected_epoch is not None and epoch != expected_epoch:
                 raise TurnConflict('shared_memory_context_changed')
-            result = {'turn_id': turn_id, 'prompt': prompt}
             conn.execute("UPDATE context_requests SET state='ready',response_json=?,context_epoch=? WHERE request_id=?",
-                         (json.dumps(result, ensure_ascii=False), epoch, request_id))
-            return result
+                         (json.dumps(payload, ensure_ascii=False), epoch, request_id))
+            return payload
 
     def save_context_response(self, request_id, *, messages, recall_status, core_write=None, expected_epoch=None):
         with self._connect(write=True) as conn:

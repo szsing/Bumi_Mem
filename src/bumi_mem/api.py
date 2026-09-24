@@ -73,10 +73,27 @@ class TurnContextRequest(BaseModel):
         return self
 
 
+class LongTermMemoryItem(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    user_id: str
+    content: str
+    time: list[str]
+
+
+class ShortTermMemoryItem(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    role: Literal['user', 'assistant', 'system']
+    speaker_id: str
+    content: str
+    time: str
+
+
 class TurnContextResponse(BaseModel):
     model_config = ConfigDict(extra='forbid')
     turn_id: str
-    prompt: str
+    current_user: str
+    long_term_memory: list[LongTermMemoryItem]
+    short_term_memory: list[ShortTermMemoryItem]
 
 
 class ContextRequest(BaseModel):
@@ -194,7 +211,7 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             finally:
                 lock.release()
 
-    app = FastAPI(title='Bumi Agent Memory API', version='1.3.1', lifespan=lifespan)
+    app = FastAPI(title='Bumi Agent Memory API', version='1.4.0', lifespan=lifespan)
     app.state.ready = False
     app.add_middleware(RequestBodyLimit)
     bearer = HTTPBearer(auto_error=False)
