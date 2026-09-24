@@ -40,6 +40,8 @@ bash scripts/setup_memory_service.sh
 - `service.env` 含 DeepSeek Key，**不要整份发给 Agent 部门**。
 - `agent-connection.env` 不含 DeepSeek Key，只含服务凭据、待填写的服务地址和预期 agent_id；通过私密渠道交付。
 - 默认 agent_id 为 `bumi_robot_001`，默认端口8088，默认仅监听127.0.0.1。
+  **端口是主机级资源、不按用户隔离**：同机多实例必须显式分配不同端口，不能假设 8088 空闲。
+  本机约定（2026-09-24）：8088 归 sunzhixing 的实例，我们的验收实例用 8099。
 - 数据使用新的联调目录，不自动继承你以前的记忆。要复用旧数据，先明确原 BUMI_DATA_DIR 和一致备份，不能只凭代码路径猜数据位置。
 - 默认设备auto，CUDA可用时选GPU，否则CPU；要禁止CPU回退，可在私有配置中改为 `MEM0_EMBED_DEVICE=cuda`。CPU不代表已经满足之前的60ms目标。
 
@@ -76,10 +78,13 @@ bash scripts/run_memory_service.sh
 保持这个进程运行，在另一个终端检查：
 
 ```bash
+# 端口以实际分配为准（8088 只是默认值）
 curl --fail-with-body http://127.0.0.1:8088/health/ready
 ```
 
-预期200，包含 `status=ready`、`warmed_up=true`。不应同时启动第二个进程共用同一数据目录。
+预期200，包含 `status=ready`、`warmed_up=true`。`/health/ready` 无法区分端口后面是谁的服务，
+需再用自己的 `BUMI_SERVICE_API_KEY` 打一次 prepare 核对返回的 `agent_id`。
+不应同时启动第二个进程共用同一数据目录。
 
 第一次先前台看启动报错。常驻测试可在确认成功后用tmux或nohup；正式服务建议由运维使用systemd等进程管理，并保证使用正确Python环境。不要把SSH窗口关闭后仍会运行当作默认保证。
 
@@ -91,6 +96,7 @@ curl --fail-with-body http://127.0.0.1:8088/health/ready
 
 ```dotenv
 BUMI_HOST=0.0.0.0
+# 改成实际分配的端口；同机多实例必须不同
 BUMI_PORT=8088
 ```
 
@@ -99,7 +105,7 @@ BUMI_PORT=8088
 Agent访问地址是服务器实际可达IP/域名，不是0.0.0.0；另一台机器也不能使用127.0.0.1指向你这台服务器。Base URL形状：
 
 ```text
-http://<Agent可访问的服务器IP>:8088
+http://<Agent可访问的服务器IP>:<实际分配的端口>
 ```
 
 把实际地址填入agent-connection.env。当前还没有提供可达IP，因此脚本故意不猜地址，也不自动修改防火墙。
