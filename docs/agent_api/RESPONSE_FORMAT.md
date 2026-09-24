@@ -14,7 +14,7 @@
 └─ Agent：operation=prefetch    ─┘    short_term[]   ← L1 共享窗口（原文 + 说话人 + 时间）
   （complete/agent_event/pending 只回执）  long_term[]    ← L3 引用（带 owner/时间/状态）
                                       core_state[]   ← 当前用户核心状态
-                                      recall_status / receipt(core_write)
+                                      recall_status / core_write（持久化回执）
                                       prompt（兼容：上述内容的可读字符串）
 ```
 
