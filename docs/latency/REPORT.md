@@ -8,6 +8,7 @@
 | 执行人 | 张冉 |
 | 被测版本 | Bumi_Mem `6315aaf`（main，schema 7 / v0.4 Agent API）、mem0 2.0.20 |
 | 压测脚本 | `tools/latency/latency_bench.py`（等价于本机 `~/.local/bin/bumi-latency-bench`） |
+| 交付物 | 新增 14 个文件（报告 / 6 个工具 / 2 个数据集 / 预取实现 / 3 个测试）；清单与运行命令见 §7.1–7.3 |
 | 结论 | **检索 P90 ≤ 60ms：达标**（GPU + Qdrant Server + `BUMI_ENTITY_BOOST=off`）：300/5000/20000 条 P90 = **35.0 / 35.9 / 37.1ms**；**串行拼装 ≤ 20ms：通过**（P90 14.2–15.5ms） |
 
 > 一句话结论：目标部署形态是 **H20 + GPU 编码 + Qdrant Server**。本报告给三档实测：CPU 基线、
@@ -573,12 +574,85 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 
 ## 7. 复现
 
-本目录三个工具：`latency_bench.py`（时延基准：检索/串行/并发/规模探针）、
-`recall_ablation.py`（召回对照：语义 / +BM25 / +实体加成）、
-`preflight_check.py`（验收前环境预检，见 §8.1）。
+本目录六个工具：`latency_bench.py`（时延基准：检索/串行/并发/预取对照/规模探针）、
+`recall_ablation.py`（召回对照：语义 / +BM25 / +实体加成，支持 `--dataset`）、
+`locomo_to_recall_dataset.py`（LoCoMo → 召回数据集，可裁剪 + 中文翻译）、
+`make_sim_dataset.py`（LLM 生成中文模拟召回集）、
+`preflight_check.py`（验收前环境预检 + 集合归属检查，见 §8.1/§8.7）。
 
 部署脚本：`scripts/qdrant_server.sh`（启停/状态/日志/copytruncate 轮转）、
 `scripts/make_service_env.py`（生成仓库外的 service.env）、`scripts/run_memory_service.sh`（起服务）。
+
+### 7.1 交付物清单
+
+相对 `origin/main`：**31 个文件变更（新增 14 / 修改 17），+4212 / −38，23 个提交**；测试从
+433 passed / 1 failed 变为 **452 passed / 0 failed**（`python -m pytest -q`）。
+
+| 类别 | 文件 |
+|---|---|
+| 报告 | `docs/latency/REPORT.md`（本文件） |
+| 压测与召回工具 | `tools/latency/latency_bench.py`、`recall_ablation.py`、`locomo_to_recall_dataset.py`、`make_sim_dataset.py` |
+| 验收工具 | `tools/latency/preflight_check.py`、`scripts/qdrant_server.sh`、`scripts/make_service_env.py` |
+| 数据集（仓库内） | `tools/latency/datasets/recall_demo.json`、`recall_sim_zh.json`（LoCoMo 原始与中文子集在仓库外 `~/mem0-runtime/datasets/`） |
+| 运行时功能 | `src/bumi_mem/prefetch.py`（流式前缀预取）；`long_term.py`（Qdrant Server / 实体加成开关）；`worker.py`+`session_store.py`+`engine.py`（整理让路、串行复用）；`agent_protocol.py`+`api.py`+`agent_engine.py`+`client.py`+`agent_bridge.py`（`operation=prefetch`） |
+| 测试 | `tests/test_prefetch.py`、`test_worker_idle_policy.py`、`test_entity_boost_policy.py` |
+
+### 7.2 按用途运行命令
+
+```bash
+# 环境（见 §7 上面的 0a/0b）；GPU+Server 的通用前缀
+export SRV="env -u ALL_PROXY -u all_proxy CUDA_VISIBLE_DEVICES=4 \
+  MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python \
+  BUMI_QDRANT_URL=http://127.0.0.1:6333 BUMI_ENTITY_BOOST=off \
+  BUMI_CONSOLIDATION_IDLE_SECONDS=2"
+
+# ① 时延基准（检索 P90/P99 + 分段）
+$SRV tools/latency/latency_bench.py --corpus 5000 --repeats 20 --with-engine --embed-device cuda \
+  --collection bench5000 --data-root ~/mem0-runtime/latency-bench-5000 \
+  --json ~/mem0-runtime/logs/latency-5000.json
+
+# ② 串行分解（独立进程）：验收用 50 轮
+$SRV tools/latency/latency_bench.py --assembly --embed-device cuda --collection bench5000 \
+  --data-root ~/mem0-runtime/latency-bench-5000 --assembly-repeats 50 \
+  --assembly-read-timeout 5.0 --json ~/mem0-runtime/logs/latency-5000-assembly50.json
+
+# ③ 并发（8 路）+ ④ 预取对照（模拟 50ms 提前量）
+$SRV tools/latency/latency_bench.py --corpus 5000 --with-engine --embed-device cuda \
+  --collection bench5000 --data-root ~/mem0-runtime/latency-bench-5000 \
+  --concurrent 8 --concurrent-rounds 10 \
+  --prefetch-sim --prefetch-rounds 3 --prefetch-lead-ms 50 \
+  --json ~/mem0-runtime/logs/latency-5000-concurrent-prefetch.json
+
+# ⑤ 存储层规模探针（随机向量，不需要语料）
+$SRV tools/latency/latency_bench.py --scale-probe 300,1000,3000,10000 \
+  --data-root ~/mem0-runtime/latency-scale --json ~/mem0-runtime/logs/latency-scale.json
+
+# ⑥ 召回回归：三套语料任选
+#   a) 手写小样本（流程自检）
+$SRV tools/latency/recall_ablation.py --dataset tools/latency/datasets/recall_demo.json \
+  --collection recall_demo --repeats 3 --json ~/mem0-runtime/logs/recall-demo.json
+#   b) LoCoMo 中文子集（验收用；先转换，见 §8.2）
+$SRV tools/latency/locomo_to_recall_dataset.py --samples 1 --max-probes 80 --translate \
+  --out ~/mem0-runtime/datasets/recall_locomo_zh.json
+$SRV tools/latency/recall_ablation.py --dataset ~/mem0-runtime/datasets/recall_locomo_zh.json \
+  --collection recall_locomo_zh --repeats 3 --json ~/mem0-runtime/logs/recall-locomo-zh.json
+#   c) LLM 生成的中文模拟集（七类覆盖，待人工校验）
+$MEM0_PYTHON tools/latency/make_sim_dataset.py --out ~/mem0-runtime/datasets/recall_sim_zh.json
+
+# ⑦ 验收前环境预检（含集合归属）
+$SRV tools/latency/preflight_check.py --require-gpu --require-server \
+  --require-entity-boost-off --collection bench5000 --agent-id bumi_robot_001 \
+  --require-collection-owner
+
+# ⑧ Qdrant Server 与服务的启停（见 §8.7）
+scripts/qdrant_server.sh start|stop|status|logs 50|rotate
+BUMI_SERVICE_ENV_FILE=~/mem0-runtime/memory-service/service.env bash scripts/run_memory_service.sh
+
+# ⑨ 测试
+python -m pytest -q
+```
+
+### 7.3 本报告各表所用的实际命令（含路径与结果文件对应）
 
 ```bash
 # 0a. CPU 基线：依赖仓库 pyproject 的 runtime；脚本会自动 re-exec 到 ~/.venvs/bumi
