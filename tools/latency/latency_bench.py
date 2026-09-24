@@ -116,6 +116,10 @@ def parse_args() -> argparse.Namespace:
                         help="分解计时时允许检索跑完的等待上限（默认 5s，只用于把检索与串行拼装分开）")
     parser.add_argument("--assembly-repeats", type=int, default=1,
                         help="分解计时的轮数（默认 1；验收建议 ≥50，首轮单独剔除）")
+    parser.add_argument("--turn-gap-ms", type=float, default=0.0,
+                        help="分解计时时每轮之间插入的静默间隔（模拟真实对话停顿）；0=背靠背")
+    parser.add_argument("--max-messages", type=int, default=None,
+                        help="引擎的 L1 窗口大小（默认用 CLI 默认值 20）；调小可逼出更多整理任务")
     parser.add_argument("--concurrent", type=int, default=0,
                         help="并发用户数（>0 时额外做并发压测：N 个用户同时 prepare_prompt）")
     parser.add_argument("--concurrent-rounds", type=int, default=5,
@@ -562,6 +566,8 @@ def _build_engine(data_dir: Path, args: argparse.Namespace, read_timeout: float)
     ]
     if args.embed_device:
         cli_args += ["--embed-device", args.embed_device]
+    if args.max_messages:
+        cli_args += ["--max-messages", str(args.max_messages)]
 
     original_argv = sys.argv
     try:
@@ -687,6 +693,8 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
     recorder = Recorder()
     wrap_method(engine.long_term, "search", recorder, "retrieval")
     wrap_method(engine.long_term, "search_with_timeout", recorder, "retrieval")
+    # 后台整理占 SDK 线程的那一段（摘要在 worker 线程，编码/写库在这里）
+    wrap_method(engine.long_term, "add_session", recorder, "consolidate_sdk")
     wrap_method(engine.store, "reserve_turn", recorder, "reserve_turn")
     wrap_method(engine.store, "semantic_context", recorder, "semantic_context")
     wrap_method(engine.store, "attach_memory_refs", recorder, "attach_refs")
@@ -710,10 +718,15 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
             retrieval = recorder.samples["retrieval"][before.get("retrieval", 0):]
             if retrieval:
                 serial.append(totals[-1] - sum(retrieval))
+            if args.turn_gap_ms:
+                # 真实对话里用户会停顿；停顿 ≥ 空闲窗口时后台整理才会开跑，
+                # 这正是"下一次开口撞上整理"的场景，必须能测。
+                time.sleep(args.turn_gap_ms / 1000)
 
     warm_serial = serial[1:]  # 首轮含进程冷启动，按验收口径单独看
     table_header(f"⑨ 前台一轮分解（{rounds} 轮 × {len(queries)} 查询，"
-                 f"检索等待上限 {args.assembly_read_timeout}s，串行=总时长-检索）")
+                 f"轮间静默 {args.turn_gap_ms:.0f}ms，检索等待上限 {args.assembly_read_timeout}s，"
+                 f"串行=总时长-检索）")
     print(fmt_row("完整 prepare_prompt", totals))
     for name, label in (
         ("retrieval", "L3 检索（可提前发起）"),
@@ -722,6 +735,7 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
         ("attach_refs", "召回引用落库"),
         ("build_context", "上下文拼装与渲染"),
         ("save_turn_prompt", "Prompt 持久化"),
+        ("consolidate_sdk", "后台整理占 SDK 线程"),
     ):
         values = recorder.samples.get(name, [])
         if values:
@@ -731,10 +745,14 @@ def measure_engine_decomposition(data_dir: Path, args: argparse.Namespace, queri
         print(fmt_row("串行关键路径（总-检索）", serial))
         print(fmt_row("串行（排除首轮冷启动）", warm_serial))
     print(f"{'recall_status 分布':<26} {dict(statuses)}")
+    blocked = [value for value in recorder.samples.get("retrieval", [])
+               if value > args.assembly_read_timeout * 1000]
+    print(f"{'检索超过等待上限的轮次':<26} {len(blocked)}/{len(totals)}")
     engine.close()
     return {
         "read_timeout": args.assembly_read_timeout,
         "rounds": rounds,
+        "turn_gap_ms": args.turn_gap_ms,
         "queries": queries,
         "total_ms": totals,
         "serial_ms": serial,

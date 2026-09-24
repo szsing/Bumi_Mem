@@ -7,52 +7,30 @@
 | 测试日期 | 2026-09-22 ~ 09-23 |
 | 执行人 | 张冉 |
 | 被测版本 | Bumi_Mem `6315aaf`（main，schema 7 / v0.4 Agent API）、mem0 2.0.20 |
-| 压测脚本 | `tools/latency/latency_bench.py`（等价于本机 `~/.local/bin/bumi-latency-bench`） |
-| 交付物 | 新增 14 个文件（报告 / 6 个工具 / 2 个数据集 / 预取实现 / 3 个测试）；清单与运行命令见 §7.1–7.3 |
+| 压测脚本 | `tools/latency/latency_bench.py`|
 | 结论 | **检索 P90 ≤ 60ms：达标**（GPU + Qdrant Server + `BUMI_ENTITY_BOOST=off`）：300/5000/20000 条 P90 = **35.0 / 35.9 / 37.1ms**；**串行拼装 ≤ 20ms：通过**（P90 14.2–15.5ms） |
 
-## 0. 一页纸摘要（给评审/上级）
-
-**验收指标全部达标**（判定依据与原始数据见 §9）：
-
-| 指标 | 预算 | 实测 | 判定 |
-|---|---|---|---|
-| 检索时延（预取分支） | P90 ≤ 60ms | 合成语料 300/5000/20000 条 = **35.0 / 35.9 / 37.1ms**；验收语料（LoCoMo 中文子集）**35.6ms** | ✅ |
-| 串行关键路径（ASR 终稿 → `memory_context`） | P90 ≤ 20ms | **13.3–15.5ms**（50 轮复测 P90 13.3ms）；HTTP 端到端 13.8ms | ✅ |
-| L1 当前轮落库 / Prompt 持久化 | P90 ≤ 10ms | 2.3ms / 1.2ms | ✅ |
-| 流式前缀预取（可选优化） | 检索 P90 ≤ 60ms | 预取本身 37.6ms；预取后终稿串行 **13.8ms**（HTTP 5 轮） | 可选，不进验收判定 |
-
-**验收通过配置**：
-
-```dotenv
-MEM0_EMBED_DEVICE="cuda"            # H20；torch 2.8.0+cu128
-BUMI_QDRANT_URL="http://127.0.0.1:6333"
-BUMI_ENTITY_BOOST="off"             # 消融 + ID 级 A/B 均无召回损失（§3.9/§9）
-BUMI_CONSOLIDATION_IDLE_SECONDS="2" # 后台整理让路：阻塞轮次 19/400 → 0（§8.3）
-BUMI_PYTHON="~/.venvs/bumi-cuda/bin/python"
-BUMI_PORT="8099"                    # 本机 8088 归 sunzhixing（§8.7）
-```
-
-**三个否决项 → 解法**：① CPU 查询编码 P90 64.4ms → **常驻 GPU**（23.1ms）；
-② 本地 Qdrant 精确扫描随规模线性（5000 条单路 89.6 / 82.5ms）→ **Qdrant Server**（4.0 / 1.6ms）；
-③ 实体加成多付一次编码（P90 26.3–29.5ms）且无召回收益 → **`BUMI_ENTITY_BOOST=off`**。
-另有后台整理抢占单 SDK 线程（4.8% 轮次被阻塞，最长 1s）→ **前台让路**（§8.3），修复后 0/400。
-
-**完整检索 P90 的演进（ms）**：
-
-| 配置 | 300 条 | 5000 条 | 20000 条 |
-|---|---:|---:|---:|
-| CPU 编码 + 本地 Qdrant | 156.8 | 393.2 | — |
-| GPU 编码 + 本地 Qdrant | 64.9 | 221.7 | — |
-| GPU 编码 + Qdrant Server | 62.2 | 66.8 | 63.0 |
-| **+ 实体加成 off（验收配置）** | **35.0** | **35.9** | **37.1** |
-
-**去哪看细节**：验收记录 §9｜召回语料分级与 LoCoMo 回归 §8.2｜锁/端口/归属边界 §8.7｜
-限制与未验证项 §6｜复现命令 §7.1–7.3｜流式前缀预取契约与实测 §3.10 + 附录 B｜交付物清单 §7.1。
-
-> 一句话：目标形态是 H20 + GPU 编码 + Qdrant Server；三档实测把问题收敛到"编码、规模、实体加成"
-> 三项并逐一解决，验收配置下检索 P90 35–37ms、串行 13–15ms，两项预算都达标。
-> CPU 基线（P90 156.8 / 393.2ms）保留在 §3.1–3.6，仅作对照。
+> 一句话结论：目标部署形态是 **H20 + GPU 编码 + Qdrant Server**。本报告给三档实测：CPU 基线、
+> GPU 复测、GPU + Qdrant Server 复测（`~/.venvs/bumi-cuda`，torch 2.8.0+cu128，`CUDA_VISIBLE_DEVICES=4`，
+> `BUMI_QDRANT_URL=http://127.0.0.1:6333`，Qdrant Server 1.19.1）。
+> 完整检索 P90 的演进：CPU 156.8/393.2ms → GPU+本地 client 64.9/221.7ms →
+> **GPU+Server 62.2/66.8/63.0ms（300/5000/20000 条）**：
+>
+> - **规模问题已经解决**：Qdrant Server 让 300→20000 条的检索 P90 基本持平（62.2/66.8/63.0ms），
+>   稠密路 P90 稳定在 4–6ms、BM25 路 1.6–1.9ms；本地 client 在 5000 条时这两项还是 89.6/82.5ms。
+> - **只剩实体加成这一项**：不含实体加成的查询 P90 只有 **36.4–40.9ms（三档全部达标）**，
+>   含实体加成的是 **63.3–67.5ms**；实体加成本身 P90 26.3–29.5ms，是一次额外的批量编码。
+>   把它并入同一次前向、后置到下一轮或低置信才触发，即可让所有查询进入 60ms。
+> - 串行关键路径 P90 **14.2ms（5000 条，Server）**，满足 ≤20ms；首轮冷启动 25–26ms 仍需预热或豁免。
+> - 尾延迟仍要盯：三档的 max 是 167.8/176.1/179.1ms，来自冷启动/单次慢样本，验收时建议同时看 P99。
+>
+> 结论：三个否决项全部解决——CPU 编码 → GPU、本地 client → Qdrant Server、实体加成移出热路径
+> （`BUMI_ENTITY_BOOST=off`，消融与 ID 级 A/B 都显示没有召回损失，见 §3.9）。**检索 P90 达标**
+> （35.0 / 35.9 / 37.1ms），串行拼装 14.2ms 达标。提前发起（附录 B）仍是把检索移出串行路径的独立优化，
+> 不是达标的前提。
+>
+> CPU 基线（`~/.venvs/bumi`，torch 2.8.0+cpu）保留在 §3.1–3.6：完整检索 P90 156.8ms（300 条）/
+> 393.2ms（5000 条），串行 P90 16.6 / 16.7ms。
 
 ---
 
@@ -595,85 +573,12 @@ GPU + Qdrant Server 复测已把结论推进到“只剩实体加成一项”，
 
 ## 7. 复现
 
-本目录六个工具：`latency_bench.py`（时延基准：检索/串行/并发/预取对照/规模探针）、
-`recall_ablation.py`（召回对照：语义 / +BM25 / +实体加成，支持 `--dataset`）、
-`locomo_to_recall_dataset.py`（LoCoMo → 召回数据集，可裁剪 + 中文翻译）、
-`make_sim_dataset.py`（LLM 生成中文模拟召回集）、
-`preflight_check.py`（验收前环境预检 + 集合归属检查，见 §8.1/§8.7）。
+本目录三个工具：`latency_bench.py`（时延基准：检索/串行/并发/规模探针）、
+`recall_ablation.py`（召回对照：语义 / +BM25 / +实体加成）、
+`preflight_check.py`（验收前环境预检，见 §8.1）。
 
 部署脚本：`scripts/qdrant_server.sh`（启停/状态/日志/copytruncate 轮转）、
 `scripts/make_service_env.py`（生成仓库外的 service.env）、`scripts/run_memory_service.sh`（起服务）。
-
-### 7.1 交付物清单
-
-相对 `origin/main`：**31 个文件变更（新增 14 / 修改 17），+4212 / −38，23 个提交**；测试从
-433 passed / 1 failed 变为 **452 passed / 0 failed**（`python -m pytest -q`）。
-
-| 类别 | 文件 |
-|---|---|
-| 报告 | `docs/latency/REPORT.md`（本文件） |
-| 压测与召回工具 | `tools/latency/latency_bench.py`、`recall_ablation.py`、`locomo_to_recall_dataset.py`、`make_sim_dataset.py` |
-| 验收工具 | `tools/latency/preflight_check.py`、`scripts/qdrant_server.sh`、`scripts/make_service_env.py` |
-| 数据集（仓库内） | `tools/latency/datasets/recall_demo.json`、`recall_sim_zh.json`（LoCoMo 原始与中文子集在仓库外 `~/mem0-runtime/datasets/`） |
-| 运行时功能 | `src/bumi_mem/prefetch.py`（流式前缀预取）；`long_term.py`（Qdrant Server / 实体加成开关）；`worker.py`+`session_store.py`+`engine.py`（整理让路、串行复用）；`agent_protocol.py`+`api.py`+`agent_engine.py`+`client.py`+`agent_bridge.py`（`operation=prefetch`） |
-| 测试 | `tests/test_prefetch.py`、`test_worker_idle_policy.py`、`test_entity_boost_policy.py` |
-
-### 7.2 按用途运行命令
-
-```bash
-# 环境（见 §7 上面的 0a/0b）；GPU+Server 的通用前缀
-export SRV="env -u ALL_PROXY -u all_proxy CUDA_VISIBLE_DEVICES=4 \
-  MEM0_PYTHON=$HOME/.venvs/bumi-cuda/bin/python \
-  BUMI_QDRANT_URL=http://127.0.0.1:6333 BUMI_ENTITY_BOOST=off \
-  BUMI_CONSOLIDATION_IDLE_SECONDS=2"
-
-# ① 时延基准（检索 P90/P99 + 分段）
-$SRV tools/latency/latency_bench.py --corpus 5000 --repeats 20 --with-engine --embed-device cuda \
-  --collection bench5000 --data-root ~/mem0-runtime/latency-bench-5000 \
-  --json ~/mem0-runtime/logs/latency-5000.json
-
-# ② 串行分解（独立进程）：验收用 50 轮
-$SRV tools/latency/latency_bench.py --assembly --embed-device cuda --collection bench5000 \
-  --data-root ~/mem0-runtime/latency-bench-5000 --assembly-repeats 50 \
-  --assembly-read-timeout 5.0 --json ~/mem0-runtime/logs/latency-5000-assembly50.json
-
-# ③ 并发（8 路）+ ④ 预取对照（模拟 50ms 提前量）
-$SRV tools/latency/latency_bench.py --corpus 5000 --with-engine --embed-device cuda \
-  --collection bench5000 --data-root ~/mem0-runtime/latency-bench-5000 \
-  --concurrent 8 --concurrent-rounds 10 \
-  --prefetch-sim --prefetch-rounds 3 --prefetch-lead-ms 50 \
-  --json ~/mem0-runtime/logs/latency-5000-concurrent-prefetch.json
-
-# ⑤ 存储层规模探针（随机向量，不需要语料）
-$SRV tools/latency/latency_bench.py --scale-probe 300,1000,3000,10000 \
-  --data-root ~/mem0-runtime/latency-scale --json ~/mem0-runtime/logs/latency-scale.json
-
-# ⑥ 召回回归：三套语料任选
-#   a) 手写小样本（流程自检）
-$SRV tools/latency/recall_ablation.py --dataset tools/latency/datasets/recall_demo.json \
-  --collection recall_demo --repeats 3 --json ~/mem0-runtime/logs/recall-demo.json
-#   b) LoCoMo 中文子集（验收用；先转换，见 §8.2）
-$SRV tools/latency/locomo_to_recall_dataset.py --samples 1 --max-probes 80 --translate \
-  --out ~/mem0-runtime/datasets/recall_locomo_zh.json
-$SRV tools/latency/recall_ablation.py --dataset ~/mem0-runtime/datasets/recall_locomo_zh.json \
-  --collection recall_locomo_zh --repeats 3 --json ~/mem0-runtime/logs/recall-locomo-zh.json
-#   c) LLM 生成的中文模拟集（七类覆盖，待人工校验）
-$MEM0_PYTHON tools/latency/make_sim_dataset.py --out ~/mem0-runtime/datasets/recall_sim_zh.json
-
-# ⑦ 验收前环境预检（含集合归属）
-$SRV tools/latency/preflight_check.py --require-gpu --require-server \
-  --require-entity-boost-off --collection bench5000 --agent-id bumi_robot_001 \
-  --require-collection-owner
-
-# ⑧ Qdrant Server 与服务的启停（见 §8.7）
-scripts/qdrant_server.sh start|stop|status|logs 50|rotate
-BUMI_SERVICE_ENV_FILE=~/mem0-runtime/memory-service/service.env bash scripts/run_memory_service.sh
-
-# ⑨ 测试
-python -m pytest -q
-```
-
-### 7.3 本报告各表所用的实际命令（含路径与结果文件对应）
 
 ```bash
 # 0a. CPU 基线：依赖仓库 pyproject 的 runtime；脚本会自动 re-exec 到 ~/.venvs/bumi
@@ -923,6 +828,23 @@ worker 不认领后台任务；空闲满窗口、或任务年龄超过最大延�
 | 串行 P99 / max | 23.0 / 39.4ms | **14.6 / 15.3ms** |
 | `recall_status` | 400 ok | 400 ok |
 
+> **⚠️ 口径修正（2026-09-24，评审指出）**：上表是**轮间无间隔（背靠背 ~50ms）**的工作负载。
+> 那种节奏下 2 秒空闲窗口永远不满足、整理任务根本不会启动，所以它只证明"用户连续说话时会让路"，
+> **不能代表真实对话（回合间隔常 >2s）**。补充测量（5000 条，窗口调到 4 条以逼出 24 个整理任务）：
+>
+> | 轮间静默 | `IDLE=2` | `IDLE=0`（旧行为） | 每任务占 SDK 线程 |
+> |---:|---:|---:|---:|
+> | 2000 / 2200 / 2500 / 5000ms | **0/48 阻塞** | 0/48 阻塞 | P50 716 / P90 945 / max 1073ms |
+>
+> 新增计时点显示：整理任务**占 SDK 线程只有 0.7–1.1s**（其余时间在 worker 线程调摘要模型），
+> 风险窗口就是这 ~0.9s。真实对话停顿 ≥2s 时，让路能把任务排进停顿里；但**若某轮恰好在任务占用
+> SDK 线程的那 0.9s 内到达，仍会被 0.2s 截止降级**，概率约为"该窗口 ÷ 回合间隔"（约每 10 轮一个任务）。
+> 本次样本（24 任务 / 48 轮）不足以证明"永不发生"。
+>
+> 要彻底消除需把 mem0 的**抽取 LLM 调用**从 SDK 线程移出（worker 线程先抽取，SDK 线程只做编码+写库），
+> 或把整理放到独立进程（需 Qdrant Server + 第二份模型）。现阶段建议保留 `idle=2`（真实节奏实测 0 降级、
+> 不影响正确性）+ 生产打点统计 `recall_status=unavailable`，降级率不可接受再上抽取拆分。
+
 原始数据：`latency-eboff5000-assembly50.json`（修复前）与
 `latency-eboff5000-assembly50-idle.json`（修复后）。
 
@@ -1021,23 +943,6 @@ curl -sS http://127.0.0.1:8088/health/ready
 
 本次验收实例：`127.0.0.1:8099`，`BUMI_ENTITY_BOOST=off`，长句 `prepare` 44–71ms（中位约 50ms），
 `recall_status=ok`；同一问句在 `on` 下稳态约 72ms。
-
-**锁与并发边界（哪一层有锁、哪一层没有）**：
-
-| 层 | 机制 | 保护 | 不保护 |
-|---|---|---|---|
-| HTTP 服务进程 | `FileLock(<db_path>.service.lock)`，`acquire(timeout=0)`，抢不到直接启动失败 | 同一个 `BUMI_DATA_DIR` 上起第二个服务进程 | 用不同数据目录指向同一 Qdrant 集合的两个服务 |
-| 本地 Qdrant（`path` 模式） | qdrant-client 的目录锁（"Storage folder … already accessed"） | 同一目录被第二个客户端/进程打开 | Qdrant Server 模式没有这层锁 |
-| SQLite | `PRAGMA journal_mode=WAL` + 写事务 | 同一会话库的并发写 | 跨库一致性 |
-| 引擎 / worker | 每 `(user_id, agent_id)` 的 `RLock`；`memory_worker_lease` 单 owner 租约（可续、会过期） | 同一现场轮次串行；后台整理只有一个执行者 | 多进程共享同一向量集合 |
-| SDK | `SerialMemoryAccess` 单线程队列 | mem0/Qdrant 客户端不会被并发调用 | 并发吞吐（会排队，见 §8.5） |
-| **Qdrant Server 的集合** | **没有锁** | — | 同名集合被两个部署同时写入（记忆混池） |
-
-实践规则：**每个部署用唯一的 `BUMI_COLLECTION_NAME`**（默认 `bumi_mem_l3` 与同机其他部署重名的
-风险最高），并在联调前用
-`preflight_check.py --collection <name> --agent-id <id> --require-collection-owner`
-确认集合里没有别的 agent 的点（只统计数量、不读内容）。本次实测 `bumi_mem_l3` 为 0 点、无外来
-agent；反向验证（用错 agent 认领一个 20000 点的集合）判 FAIL 并返回退出码 1。
 
 ---
 
