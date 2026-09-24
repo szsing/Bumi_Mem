@@ -21,10 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("mem0-locomo-server")
 
 ROOT = Path(
-    os.getenv(
-        "MEM0_REPRO_ROOT",
-        "/home/legendre/data/ZhixingSun/Bumi_Mem",
-    )
+    os.getenv("MEM0_REPRO_ROOT") or str(Path(__file__).resolve().parents[1])
 ).resolve()
 RUNTIME_ROOT = Path(os.getenv("MEM0_RUNTIME_ROOT", str(ROOT.parent / "mem0-runtime"))).resolve()
 MODEL_ROOT = Path(os.getenv("MEM0_MODEL_ROOT", str(ROOT.parent / "models"))).resolve()

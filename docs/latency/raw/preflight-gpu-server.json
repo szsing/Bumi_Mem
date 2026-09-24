@@ -1,0 +1,71 @@
+{
+  "results": [
+    {
+      "name": "python",
+      "ok": true,
+      "hard": true,
+      "detail": "/data1/zhangran/.venvs/bumi-cuda/bin/python (3.10.12)"
+    },
+    {
+      "name": "torch",
+      "ok": true,
+      "hard": true,
+      "detail": "2.8.0+cu128 cuda_build=12.8"
+    },
+    {
+      "name": "torch_cuda_available",
+      "ok": true,
+      "hard": true,
+      "detail": "devices=['NVIDIA H20']"
+    },
+    {
+      "name": "embed_device",
+      "ok": true,
+      "hard": true,
+      "detail": "requested=auto resolved=cuda"
+    },
+    {
+      "name": "embed_device_is_cuda",
+      "ok": true,
+      "hard": true,
+      "detail": "resolved=cuda"
+    },
+    {
+      "name": "embed_model",
+      "ok": true,
+      "hard": true,
+      "detail": "/data1/zhangran/models/Qwen3-Embedding-0.6B"
+    },
+    {
+      "name": "vector_backend",
+      "ok": true,
+      "hard": true,
+      "detail": "qdrant-server(http://127.0.0.1:6333)"
+    },
+    {
+      "name": "qdrant_reachable",
+      "ok": true,
+      "hard": true,
+      "detail": "collections=7"
+    },
+    {
+      "name": "qdrant_collection",
+      "ok": true,
+      "hard": false,
+      "detail": "eboff20000: points=20000"
+    },
+    {
+      "name": "entity_boost",
+      "ok": true,
+      "hard": true,
+      "detail": "off"
+    },
+    {
+      "name": "entity_boost_off",
+      "ok": true,
+      "hard": true,
+      "detail": "BUMI_ENTITY_BOOST=off"
+    }
+  ],
+  "failed": 0
+}

@@ -21,9 +21,9 @@ from bumi_mem.schemas import IdentityRequiredError
 from bumi_mem.service_settings import ServiceSettings, build_service_engine
 from bumi_mem.turn_store import TurnConflict, TurnNotFound
 from bumi_mem.agent_protocol import (
-    AgentPrepareRequest, AgentCompleteRequest, AgentEventRequest,
+    AgentPrepareRequest, AgentCompleteRequest, AgentEventRequest, AgentPrefetchRequest,
     AgentPrepareResponse, AgentCompleteResponse, AgentEventResponse,
-    AgentPendingRequest, AgentPendingResponse,
+    AgentPendingRequest, AgentPendingResponse, AgentPrefetchResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,8 +257,8 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             raise HTTPException(503, detail={'code': 'not_ready'})
         return {'status': 'ready', 'warmed_up': request.app.state.engine._warmup_elapsed_ms is not None}
 
-    @app.post('/v1/memory/context', response_model=TurnContextResponse | ContextResponse | AgentPrepareResponse | AgentCompleteResponse | AgentEventResponse | AgentPendingResponse, dependencies=[Depends(authorize)], tags=['memory'])
-    def context(body: TurnContextRequest | ContextRequest | AgentPrepareRequest | AgentCompleteRequest | AgentEventRequest | AgentPendingRequest, request: Request,
+    @app.post('/v1/memory/context', response_model=TurnContextResponse | ContextResponse | AgentPrefetchResponse | AgentPrepareResponse | AgentCompleteResponse | AgentEventResponse | AgentPendingResponse, dependencies=[Depends(authorize)], tags=['memory'])
+    def context(body: TurnContextRequest | ContextRequest | AgentPrefetchRequest | AgentPrepareRequest | AgentCompleteRequest | AgentEventRequest | AgentPendingRequest, request: Request,
                 idempotency_key: Annotated[str | None, Header(alias='Idempotency-Key', max_length=128)] = None):
         config = request.app.state.settings
         engine = request.app.state.engine
@@ -272,6 +272,8 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
         if isinstance(body, AgentPendingRequest):
             return dict(operation='pending', agent_id=config.agent_id, has_prompt=False,
                         pending=engine.store.pending_agent_turn(config.agent_id))
+        if isinstance(body, AgentPrefetchRequest):
+            return engine.prefetch_agent(request=body, agent_id=config.agent_id)
         if isinstance(body, AgentPrepareRequest):
             return engine.prepare_agent(request=body, agent_id=config.agent_id)
         if isinstance(body, AgentCompleteRequest):
