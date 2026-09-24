@@ -359,6 +359,46 @@ class BumiMemory(AgentEngineMixin):
                                     expected_epoch=bundle['epoch'], prompt_text=prompt)
         return prompt
 
+    @staticmethod
+    def _structured_context(*, selected, refs, core_rows) -> dict[str, Any]:
+        """把 L1 窗口 / L3 引用 / 核心状态摊平成给 Agent 的结构化 JSON。
+
+        不拼字符串、不重复 query：short_term 是渲染前的原文条目，long_term 是带 owner 的引用。
+        """
+        short_term = [{
+            'message_id': message.message_id,
+            'role': message.role,
+            'content': message.content,
+            'created_at': message.created_at,
+            'user_id': message.user_id or None,
+            'agent_id': message.agent_id or None,
+            'carry_over': bool(message.context_only),
+        } for message in selected]
+        long_term = [{
+            'owner_user_id': row.get('user_id'),
+            'memory_id': row.get('id') or row.get('memory_id'),
+            'memory': str(row.get('memory', row.get('text', row.get('data', '')))).strip(),
+            'fact_status': row.get('fact_status', 'use_original_time_and_qualifiers'),
+            'reference_status': row.get('reference_status', 'active'),
+            'created_at': row.get('created_at'),
+            'updated_at': row.get('updated_at'),
+        } for row in refs]
+        keys = ('category', 'attribute', 'value', 'qualifier', 'status', 'observed_at', 'source_role')
+        core_state = [{key: row[key] for key in keys if key in row} for row in core_rows]
+        return {'short_term': short_term, 'long_term': long_term, 'core_state': core_state}
+
+    def structured_context(self, *, user_id: str, agent_id: str) -> dict[str, Any]:
+        """当前窗口的结构化视图：L1（含 carry-over）+ 可见 L3 引用 + 当前用户核心状态。"""
+        l1 = self.store.list_shared_messages(agent_id)
+        selected = self.context_builder.select_l1(l1)
+        refs = self.store.shared_memory_refs(
+            agent_id, selected_message_ids=[message.message_id for message in selected])
+        try:
+            core_rows = self.store.semantic_context(user_id, agent_id)
+        except Exception:  # noqa: BLE001 - 核心状态不可读时不影响其余上下文
+            core_rows = []
+        return self._structured_context(selected=selected, refs=refs, core_rows=core_rows)
+
     def process_context(self, *, user_id: str, agent_id: str, previous_ai_reply: str | None,
                         query: str | None, idempotency_key: str | None = None,
                         query_occurred_at: str | None = None, previous_reply_occurred_at: str | None = None) -> dict[str, Any]:
@@ -457,12 +497,15 @@ class BumiMemory(AgentEngineMixin):
             # A settle-only request saves the last reply without a new question,
             # so it has no current prompt to return.
             prompt = ''
+            structured: dict[str, Any] = {'short_term': [], 'long_term': [], 'core_state': []}
             epoch = self.store.context_epoch(agent_id)
             if request['turn_id']:
                 prompt = self._turn_prompt_text(self.store.get_turn(request['turn_id'], agent_id))
                 epoch = self.store.get_turn(request['turn_id'], agent_id)['context_epoch']
+                structured = self.structured_context(user_id=user_id, agent_id=agent_id)
             return self.store.save_turn_context_response(request['request_id'], turn_id=turn_id,
-                                                         prompt=prompt, expected_epoch=epoch)
+                                                         prompt=prompt, expected_epoch=epoch,
+                                                         structured=structured)
 
     def record_reply(self, *, turn_id: str, agent_id: str, reply: str | None = None,
                      status: str = 'completed') -> dict[str, Any]:

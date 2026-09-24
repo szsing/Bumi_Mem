@@ -220,6 +220,10 @@ class AgentPrepareResponse(AgentModel):
     occurred_at: str
     messages: list[AgentChatMessage]
     memory_context: list[MemorySupplement]
+    # 结构化视图：短期窗口（L1，含 carry-over）、长期引用（L3，带 owner）、当前用户核心状态。
+    short_term: list[dict[str, Any]] = Field(default_factory=list)
+    long_term: list[dict[str, Any]] = Field(default_factory=list)
+    core_state: list[dict[str, Any]] = Field(default_factory=list)
     has_prompt: Literal[True] = True
     recall_status: Literal['ok', 'unavailable', 'deleting', 'disabled']
     core_write: dict[str, Any]

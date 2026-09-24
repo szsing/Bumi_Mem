@@ -77,6 +77,10 @@ class TurnContextResponse(BaseModel):
     model_config = ConfigDict(extra='forbid')
     turn_id: str
     prompt: str
+    # 结构化视图（与 prompt 同源）：短期窗口 / 长期引用 / 当前用户核心状态。
+    short_term: list[dict] = Field(default_factory=list)
+    long_term: list[dict] = Field(default_factory=list)
+    core_state: list[dict] = Field(default_factory=list)
 
 
 class ContextRequest(BaseModel):

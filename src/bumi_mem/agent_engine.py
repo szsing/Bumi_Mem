@@ -114,7 +114,8 @@ class AgentEngineMixin:
                         # The actual Agent owns tool/local-control history. This is
                         # only the memory-owned supplement, not a replacement history.
                         memory_context=supplement, has_prompt=True,
-                        recall_status=prepared['recall_status'], core_write=prepared['core_write'])
+                        recall_status=prepared['recall_status'], core_write=prepared['core_write'],
+                        **self.structured_context(user_id=turn['user_id'], agent_id=agent_id))
 
     def complete_agent(self, *, request: AgentCompleteRequest, agent_id: str) -> dict:
         if self._closed:

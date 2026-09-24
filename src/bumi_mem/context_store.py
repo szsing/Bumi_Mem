@@ -17,9 +17,22 @@ def _json_object(value):
     return decoded if isinstance(decoded, dict) else None
 
 
+SINGLE_RESPONSE_KEYS_V7 = {'turn_id', 'prompt'}
+SINGLE_RESPONSE_KEYS = {'turn_id', 'prompt', 'short_term', 'long_term', 'core_state'}
+
+
 def _single_response(payload, client_id):
-    return (isinstance(payload, dict) and set(payload) == {'turn_id', 'prompt'} and
-            payload['turn_id'] == client_id and isinstance(payload['prompt'], str))
+    """单轮协议的响应形态：v7 是两字段，当前是两字段 + 三个结构化记忆视图。"""
+    if not isinstance(payload, dict) or payload.get('turn_id') != client_id:
+        return False
+    if not isinstance(payload.get('prompt'), str):
+        return False
+    keys = set(payload)
+    if keys == SINGLE_RESPONSE_KEYS_V7:   # 旧缓存仍要在迁移/重放时认出来
+        return True
+    if keys != SINGLE_RESPONSE_KEYS:
+        return False
+    return all(isinstance(payload[key], list) for key in ('short_term', 'long_term', 'core_state'))
 
 
 class ContextStoreMixin:
@@ -176,8 +189,13 @@ class ContextStoreMixin:
                          (query_occurred_at, previous_reply_occurred_at, request_id))
             return dict(conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone())
 
-    def save_turn_context_response(self, request_id, *, turn_id, prompt, expected_epoch=None):
-        """Persist the single-request protocol's two-field response for replay."""
+    def save_turn_context_response(self, request_id, *, turn_id, prompt, expected_epoch=None,
+                                   structured=None):
+        """Persist the single-request protocol's response for replay.
+
+        structured = {'short_term': [...], 'long_term': [...], 'core_state': [...]}：
+        结构化的短期/长期记忆视图；prompt 保留为同一内容的可读字符串形态。
+        """
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM context_requests WHERE request_id=?', (request_id,)).fetchone()
             if row['request_kind'] != 'single' or row['idempotency_key'] != TURN_REQUEST_PREFIX + turn_id:
@@ -186,7 +204,11 @@ class ContextStoreMixin:
             epoch = self._context_epoch(conn, row['agent_id'])
             if expected_epoch is not None and epoch != expected_epoch:
                 raise TurnConflict('shared_memory_context_changed')
-            result = {'turn_id': turn_id, 'prompt': prompt}
+            structured = structured or {}
+            result = {'turn_id': turn_id, 'prompt': prompt,
+                      'short_term': structured.get('short_term', []),
+                      'long_term': structured.get('long_term', []),
+                      'core_state': structured.get('core_state', [])}
             conn.execute("UPDATE context_requests SET state='ready',response_json=?,context_epoch=? WHERE request_id=?",
                          (json.dumps(result, ensure_ascii=False), epoch, request_id))
             return result
