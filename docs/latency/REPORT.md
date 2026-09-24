@@ -927,6 +927,23 @@ curl -sS http://127.0.0.1:8088/health/ready
 本次验收实例：`127.0.0.1:8099`，`BUMI_ENTITY_BOOST=off`，长句 `prepare` 44–71ms（中位约 50ms），
 `recall_status=ok`；同一问句在 `on` 下稳态约 72ms。
 
+**锁与并发边界（哪一层有锁、哪一层没有）**：
+
+| 层 | 机制 | 保护 | 不保护 |
+|---|---|---|---|
+| HTTP 服务进程 | `FileLock(<db_path>.service.lock)`，`acquire(timeout=0)`，抢不到直接启动失败 | 同一个 `BUMI_DATA_DIR` 上起第二个服务进程 | 用不同数据目录指向同一 Qdrant 集合的两个服务 |
+| 本地 Qdrant（`path` 模式） | qdrant-client 的目录锁（"Storage folder … already accessed"） | 同一目录被第二个客户端/进程打开 | Qdrant Server 模式没有这层锁 |
+| SQLite | `PRAGMA journal_mode=WAL` + 写事务 | 同一会话库的并发写 | 跨库一致性 |
+| 引擎 / worker | 每 `(user_id, agent_id)` 的 `RLock`；`memory_worker_lease` 单 owner 租约（可续、会过期） | 同一现场轮次串行；后台整理只有一个执行者 | 多进程共享同一向量集合 |
+| SDK | `SerialMemoryAccess` 单线程队列 | mem0/Qdrant 客户端不会被并发调用 | 并发吞吐（会排队，见 §8.5） |
+| **Qdrant Server 的集合** | **没有锁** | — | 同名集合被两个部署同时写入（记忆混池） |
+
+实践规则：**每个部署用唯一的 `BUMI_COLLECTION_NAME`**（默认 `bumi_mem_l3` 与同机其他部署重名的
+风险最高），并在联调前用
+`preflight_check.py --collection <name> --agent-id <id> --require-collection-owner`
+确认集合里没有别的 agent 的点（只统计数量、不读内容）。本次实测 `bumi_mem_l3` 为 0 点、无外来
+agent；反向验证（用错 agent 认领一个 20000 点的集合）判 FAIL 并返回退出码 1。
+
 ---
 
 ## 9. 召回验收记录（2026-09-23）

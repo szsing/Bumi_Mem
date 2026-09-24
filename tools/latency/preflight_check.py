@@ -43,6 +43,14 @@ def http_json(url: str, timeout: float = 5.0):
         return json.loads(response.read().decode("utf-8"))
 
 
+def http_post_json(url: str, payload: dict, timeout: float = 5.0) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def collect(args) -> list[dict]:
     results: list[dict] = []
 
@@ -99,6 +107,19 @@ def collect(args) -> list[dict]:
                     detail = f"{args.collection}: 不存在"
                 results.append(check("qdrant_collection", present, detail,
                                      hard=args.require_collection))
+                if present and args.agent_id:
+                    # Qdrant Server 对集合没有写入锁：同名集合可能被另一个部署混写。
+                    # 只统计点数、不读取内容，用来确认集合归属。
+                    foreign = http_post_json(
+                        f"{url.rstrip('/')}/collections/{args.collection}/points/count",
+                        {"exact": True,
+                         "filter": {"must_not": [{"key": "agent_id",
+                                                  "match": {"value": args.agent_id}}]}})
+                    foreign_count = int(foreign["result"]["count"])
+                    results.append(check(
+                        "qdrant_collection_owner", foreign_count == 0,
+                        f"{args.collection}: 非 {args.agent_id} 的点数={foreign_count}",
+                        hard=args.require_collection_owner))
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
             results.append(check("qdrant_reachable", False, f"{type(exc).__name__}: {exc}",
                                  hard=args.require_server))
@@ -126,6 +147,10 @@ def main() -> int:
     parser.add_argument("--require-entity-boost-off", action="store_true",
                         help="要求 BUMI_ENTITY_BOOST=off（达标配置）")
     parser.add_argument("--collection", default=None, help="要检查的 Qdrant 集合名")
+    parser.add_argument("--agent-id", default=os.environ.get("BUMI_AGENT_ID"),
+                        help="用于检查集合归属的 agent_id（默认读 BUMI_AGENT_ID）")
+    parser.add_argument("--require-collection-owner", action="store_true",
+                        help="同名集合里存在其他 agent_id 时判为硬失败")
     parser.add_argument("--embed-device", default=None, choices=["auto", "cpu", "cuda"])
     parser.add_argument("--json", dest="json_out", default=None)
     args = parser.parse_args()
