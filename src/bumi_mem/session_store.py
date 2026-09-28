@@ -311,7 +311,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                             sum(m.token_count for m in real))
 
     def submit(self, session_id: str, *, reason: str, settings: dict[str, Any],
-               carryover_messages: int = 4, max_attempts: int = 3, legacy: bool = False) -> ConsolidationSubmission:
+               carryover_messages: int = 20, max_attempts: int = 3, legacy: bool = False) -> ConsolidationSubmission:
         """Freeze, snapshot, enqueue and rotate in ONE transaction (no model calls)."""
         with self._connect(write=True) as conn:
             return self._submit(conn, session_id, reason=reason, settings=settings,
@@ -367,13 +367,13 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                             sum(m.token_count for m in real))
 
     def submit_shared(self, session_id: str, *, reason: str, settings: dict[str, Any],
-                      carryover_messages: int = 4, max_attempts: int = 3) -> ConsolidationSubmission:
+                      carryover_messages: int = 20, max_attempts: int = 3) -> ConsolidationSubmission:
         """Rotate the agent window and enqueue separate owner snapshots atomically."""
         with self._connect(write=True) as conn:
             return self._submit_shared(conn, session_id, reason=reason, settings=settings,
                                        carryover_messages=carryover_messages, max_attempts=max_attempts)
 
-    def _submit_shared(self, conn, session_id, *, reason, settings, carryover_messages=4, max_attempts=3):
+    def _submit_shared(self, conn, session_id, *, reason, settings, carryover_messages=20, max_attempts=3):
         old = conn.execute('SELECT * FROM sessions WHERE session_id=?', (session_id,)).fetchone()
         if old is None:
             raise KeyError(session_id)

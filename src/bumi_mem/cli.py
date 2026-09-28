@@ -431,7 +431,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embed-device", choices=["auto", "cpu", "cuda"], default=os.getenv("MEM0_EMBED_DEVICE", "auto"))
     parser.add_argument("--max-messages", type=int, default=20)
     parser.add_argument("--max-l1-tokens", type=int, default=8000)
-    parser.add_argument("--carryover-messages", type=int, default=4)
+    parser.add_argument("--carryover-messages", type=int, default=20)
     parser.add_argument("--local-chunk-tokens", type=int, default=3500)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--search-threshold", type=float, default=0.1)

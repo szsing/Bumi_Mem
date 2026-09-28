@@ -41,7 +41,7 @@ role 保留为模型 API 的 user / assistant，归属使用 JSON 标头，消�
 
 1. 获取当前 agent 的进程内锁，串行化该 agent 下不同用户的完整问答。
 2. SQLite 单事务冻结该 agent 下所有当前个人会话，并按用户各自的非 context-only、非 memory_excluded 消息生成独立任务。
-3. 建立新的个人会话；共享窗口仅保留全局最后 `carryover_messages` 条引用（默认 4 条，约 2 轮），标为 context_only。
+3. 建立新的个人会话；共享窗口保留全局最近 `carryover_messages` 条有效消息引用（默认 20 条，约 10 轮），标为 context_only，构成跨会话滑动窗口。
 4. 提交事务后唤醒后台 worker；后台慢写期间，新用户仍能读到共享 carry-over。
 5. carry-over 仅供前台阅读，不重新整理、不写入后来的用户的长期快照。
 

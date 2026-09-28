@@ -27,7 +27,7 @@ class ServiceSettings:
     warmup_timeout: float = 120.0
     max_messages: int = 20
     max_l1_tokens: int = 8000
-    carryover_messages: int = 4
+    carryover_messages: int = 20
     top_k: int = 5
     search_threshold: float = 0.1
     summary_max_tokens: int = 512
@@ -93,7 +93,7 @@ class ServiceSettings:
             warmup_timeout=float(os.getenv('BUMI_MEMORY_WARMUP_TIMEOUT', '120')),
             max_messages=int(os.getenv('BUMI_MAX_MESSAGES', '20')),
             max_l1_tokens=int(os.getenv('BUMI_MAX_L1_TOKENS', '8000')),
-            carryover_messages=int(os.getenv('BUMI_CARRYOVER_MESSAGES', '4')),
+            carryover_messages=int(os.getenv('BUMI_CARRYOVER_MESSAGES', '20')),
             top_k=int(os.getenv('BUMI_TOP_K', '5')),
             search_threshold=float(os.getenv('BUMI_SEARCH_THRESHOLD', '0.1')),
             summary_max_tokens=int(os.getenv('BUMI_SUMMARY_MAX_TOKENS', '512')),

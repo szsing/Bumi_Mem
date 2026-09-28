@@ -23,7 +23,7 @@ logger = logging.getLogger("mem0-locomo-server")
 ROOT = Path(
     os.getenv(
         "MEM0_REPRO_ROOT",
-        "/home/legendre/data/ZhixingSun/Bumi_Mem",
+        str(Path(__file__).resolve().parent.parent),
     )
 ).resolve()
 RUNTIME_ROOT = Path(os.getenv("MEM0_RUNTIME_ROOT", str(ROOT.parent / "mem0-runtime"))).resolve()

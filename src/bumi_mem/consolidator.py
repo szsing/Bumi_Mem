@@ -19,7 +19,7 @@ from bumi_mem.token_counter import TokenCounter
 
 @dataclass(slots=True)
 class ConsolidatorConfig:
-    carryover_messages: int = 4
+    carryover_messages: int = 20
     local_chunk_tokens: int = 3500
     summary_max_tokens: int = 512
     max_attempts: int = 3

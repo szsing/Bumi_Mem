@@ -71,8 +71,10 @@ def test_twenty_message_boundary_is_global_and_owner_jobs_are_separate(tmp_path)
         assert len(rows) == 10
         assert all(m['user_id'] == (job.user_id if m['role'] == 'user' else '') and m['agent_id'] == 'bot' for m in rows)
     tail = store.list_shared_messages('bot')
-    assert len(tail) == 4 and all(m.context_only for m in tail)
-    assert [m.user_id for m in tail] == ['A','','B','']
+    assert len(tail) == 20 and all(m.context_only for m in tail)
+    assert [m.user_id for m in tail] == ['A', '', 'B', ''] * 5
+    assert [m.content.split('\n', 1)[-1] for m in tail] == \
+        [part for i in range(10) for part in (f'FACT_{i}', '测试回答')]
     assert engine.session_stats(user_id='B', agent_id='bot').effective_messages == 0
     drain(engine)
     assert all(store.get_job(j.job_id).status == 'succeeded' for j in jobs)
@@ -248,6 +250,48 @@ def test_no_recall_still_shares_short_context(tmp_path):
     assert 'public speech' in str(result.prompt_messages)
     assert result.recalled == [] and result.recall_status == 'disabled'
     assert len(backend.search_calls) == before
+
+
+def test_cross_session_window_is_a_true_sliding_window(tmp_path):
+    """A new session sees the newest valid messages across the rotation boundary, not just the old tail."""
+    engine, store, backend, _, _ = make_engine(tmp_path, max_messages=10)
+    for i in range(5):
+        chat(engine, 'A' if i % 2 == 0 else 'B', f'ROUND_{i}')
+    # 5 rounds = 10 messages = the boundary, so the window has already rotated once.
+    assert [j.reason for j in store.list_jobs(user_id='A', agent_id='bot')] == ['message_limit']
+    new_sid = store.get_open_session('A', 'bot').session_id
+    assert store.stats(new_sid).effective_messages == 0
+    seen = chat(engine, 'B', '接着说什么')
+    window = [m for m in seen.prompt_messages if '"speaker_role"' in m['content']]
+    texts = [m['content'].split('\n', 1)[-1] for m in window]
+    # The window spans the rotation: pre-rotation rounds are still visible.
+    assert 'ROUND_0' in texts and 'ROUND_4' in texts
+    # Contiguous, oldest-to-newest, no duplicate rows.
+    assert texts[-1] == '接着说什么'
+    assert len({m['content'] for m in window}) == len(window)
+    # Carried rows stay read-only; only messages written after rotation are real evidence.
+    shared = store.list_shared_messages('bot')
+    carried = [m for m in shared if m.content.split('\n', 1)[-1].startswith('ROUND_')]
+    assert carried and all(m.context_only for m in carried)
+    assert any(not m.context_only for m in shared)
+
+
+def test_cross_session_window_respects_user_isolation(tmp_path):
+    """Sliding-window rows keep their original owner labels; bridge copy is not fresh L3 evidence."""
+    engine, store, backend, _, _ = make_engine(tmp_path, max_messages=6)
+    chat(engine, 'A', 'A_TURN_1')
+    chat(engine, 'B', 'B_TURN_1')
+    chat(engine, 'A', 'A_TURN_2')
+    chat(engine, 'B', 'B_TRIGGER')  # 8th message crosses the 6-message boundary -> rotation
+    assert store.list_jobs(user_id='B', agent_id='bot')[0].reason == 'message_limit'
+    b = chat(engine, 'B', '你刚才听到什么')
+    window = [m for m in b.prompt_messages if '"speaker_role"' in m['content']]
+    owners = {m['content'].split('"user_id": "', 1)[1].split('"', 1)[0]
+              for m in window if '"user_id"' in m['content'].split('\n', 1)[0]}
+    assert owners == {'A', 'B'}
+    # Retrieval for this turn is scoped to the requesting user only.
+    assert [c['user_id'] for c in backend.search_calls][-1] == 'B'
+    assert b.recalled == [] or all(r.get('user_id', 'B') == 'B' for r in b.recalled)
 
 
 def test_v2_queued_snapshot_without_speaker_fields_still_executes(tmp_path):

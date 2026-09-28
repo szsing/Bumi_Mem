@@ -61,7 +61,7 @@ def test_twentieth_message_submits_and_rotates_before_l3_write(tmp_path):
     assert memory.add_calls == []
     assert store.get_session(receipt.session_id).status == 'processing'
     assert store.get_session(receipt.new_session_id).status == 'active'
-    assert store.stats(receipt.new_session_id).context_only_messages == 4
+    assert store.stats(receipt.new_session_id).context_only_messages == 20
     assert engine.worker.run_once()
     assert store.get_job(receipt.job_id).status == 'succeeded'
     assert len(memory.add_calls) == 1
