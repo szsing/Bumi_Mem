@@ -29,7 +29,8 @@ def _checked_id(value):
 class AgentModel(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
 
-    @field_validator('client_turn_id', 'turn_id', 'event_id', 'user_id', check_fields=False)
+    @field_validator('client_turn_id', 'turn_id', 'event_id', 'user_id', 'prefetch_id',
+                     check_fields=False)
     @classmethod
     def validate_id(cls, value):
         return _checked_id(value) if value is not None else None
@@ -86,12 +87,46 @@ class AgentPrepareRequest(AgentModel):
     user_id: str | None = Field(default=None, max_length=128)
     speaker: SpeakerIdentityInput | None = None
     occurred_at: str | None = Field(default=None, max_length=64)
+    # 可选：来自 operation=prefetch 的候选集；不匹配/过期/删除后都会静默重算。
+    prefetch_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator('query')
     @classmethod
     def nonblank_query(cls, value):
         if not value.strip():
             raise ValueError('a finalized transcript is required')
+        return value.strip()
+
+    @model_validator(mode='after')
+    def coherent_owner(self):
+        if self.speaker is None and self.user_id is None:
+            raise ValueError('provide a trusted user_id or speaker result')
+        if self.speaker is not None and self.user_id is not None and self.user_id != self.speaker.memory_user_id:
+            raise ValueError('user_id disagrees with the speaker identity')
+        return self
+
+    @property
+    def memory_user_id(self):
+        return self.speaker.memory_user_id if self.speaker is not None else self.user_id
+
+
+class AgentPrefetchRequest(AgentModel):
+    """流式前缀预取：在 ASR 稳定前缀上提前发起检索。
+
+    不写 L1、不建轮次、不发布引用；返回的 prefetch_id 交给随后的 prepare 复用。
+    """
+    operation: Literal['prefetch']
+    client_turn_id: str = Field(min_length=1, max_length=128)
+    query_prefix: str = Field(min_length=1, max_length=16000)
+    user_id: str | None = Field(default=None, max_length=128)
+    speaker: SpeakerIdentityInput | None = None
+    prefix_revision: int | None = Field(default=None, ge=0)
+
+    @field_validator('query_prefix')
+    @classmethod
+    def nonblank_prefix(cls, value):
+        if not value.strip():
+            raise ValueError('a non-empty streaming prefix is required')
         return value.strip()
 
     @model_validator(mode='after')
@@ -188,6 +223,19 @@ class AgentPrepareResponse(AgentModel):
     has_prompt: Literal[True] = True
     recall_status: Literal['ok', 'unavailable', 'deleting', 'disabled']
     core_write: dict[str, Any]
+
+
+class AgentPrefetchResponse(AgentModel):
+    """预取回执：只给状态与候选数，**不含 messages**，避免被误用为回答上下文。"""
+    operation: Literal['prefetch'] = 'prefetch'
+    prefetch_id: str | None = None
+    client_turn_id: str
+    user_id: str
+    agent_id: str
+    recall_status: Literal['ok', 'unavailable', 'deleting', 'not_requested']
+    candidate_count: int = Field(ge=0)
+    expires_in_ms: int = Field(ge=0)
+    took_ms: float = Field(ge=0)
 
 
 class AgentCompleteResponse(AgentModel):

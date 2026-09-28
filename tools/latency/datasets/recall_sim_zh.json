@@ -1,0 +1,124 @@
+{
+  "_comment": "LLM 生成（DeepSeek deepseek-chat，2026-09-23）+ 机械校验（expected 逐字等于某条 memory）。**待人工逐条校验**：其中“我生日是三月十二号吗？/我计划十月去敦煌吗？”把答案写进了查询，区分度弱，建议改写。",
+  "_generated_by": "tools/latency/make_sim_dataset.py",
+  "memories": [
+    "叫我小林就好。",
+    "别叫我宝宝，我不喜欢这个称呼。",
+    "我住在杭州西湖区。",
+    "我老家在成都。",
+    "我每天早上七点起床。",
+    "我生日是三月十二号。",
+    "我喜欢喝美式咖啡。",
+    "我现在不喝咖啡了，改喝红茶。",
+    "我计划十月去敦煌。",
+    "我打算明年春天去日本看樱花。",
+    "我不吃香菜。",
+    "我讨厌别人叫我全名。",
+    "I prefer oat milk in my latte.",
+    "My favorite season is autumn.",
+    "我每周三晚上去游泳。",
+    "我以前养过一只叫豆豆的猫。"
+  ],
+  "probes": [
+    {
+      "query": "该怎么称呼我？",
+      "expected": "叫我小林就好。",
+      "group": "称谓"
+    },
+    {
+      "query": "你该叫我什么？",
+      "expected": "别叫我宝宝，我不喜欢这个称呼。",
+      "group": "称谓"
+    },
+    {
+      "query": "我住在哪里？",
+      "expected": "我住在杭州西湖区。",
+      "group": "地点"
+    },
+    {
+      "query": "我老家是哪里的？",
+      "expected": "我老家在成都。",
+      "group": "地点"
+    },
+    {
+      "query": "我几点起床？",
+      "expected": "我每天早上七点起床。",
+      "group": "时间"
+    },
+    {
+      "query": "我生日是哪天？",
+      "expected": "我生日是三月十二号。",
+      "group": "时间"
+    },
+    {
+      "query": "我喜欢喝什么咖啡？",
+      "expected": "我喜欢喝美式咖啡。",
+      "group": "偏好"
+    },
+    {
+      "query": "我现在喜欢喝什么？",
+      "expected": "我现在不喝咖啡了，改喝红茶。",
+      "group": "偏好"
+    },
+    {
+      "query": "我十月有什么计划？",
+      "expected": "我计划十月去敦煌。",
+      "group": "计划"
+    },
+    {
+      "query": "我明年春天打算做什么？",
+      "expected": "我打算明年春天去日本看樱花。",
+      "group": "计划"
+    },
+    {
+      "query": "我不吃什么？",
+      "expected": "我不吃香菜。",
+      "group": "否定"
+    },
+    {
+      "query": "我讨厌别人怎么叫我？",
+      "expected": "我讨厌别人叫我全名。",
+      "group": "否定"
+    },
+    {
+      "query": "What does the user drink now?",
+      "expected": "我现在不喝咖啡了，改喝红茶。",
+      "group": "跨语言"
+    },
+    {
+      "query": "What kind of milk does the user prefer?",
+      "expected": "I prefer oat milk in my latte.",
+      "group": "跨语言"
+    },
+    {
+      "query": "What is the user's favorite season?",
+      "expected": "My favorite season is autumn.",
+      "group": "跨语言"
+    },
+    {
+      "query": "我每周三晚上去做什么？",
+      "expected": "我每周三晚上去游泳。",
+      "group": "偏好"
+    },
+    {
+      "query": "我以前养过什么宠物？",
+      "expected": "我以前养过一只叫豆豆的猫。",
+      "group": "否定"
+    },
+    {
+      "query": "我老家在成都吗？",
+      "expected": "我老家在成都。",
+      "group": "地点"
+    },
+    {
+      "query": "我生日是三月十二号吗？",
+      "expected": "我生日是三月十二号。",
+      "group": "时间"
+    },
+    {
+      "query": "我计划十月去敦煌吗？",
+      "expected": "我计划十月去敦煌。",
+      "group": "计划"
+    }
+  ]
+}

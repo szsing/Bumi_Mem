@@ -92,6 +92,52 @@ class Mem0AdapterConfig:
     memory_max_tokens: int = 4096
 
 
+def _vector_store_config(config: Mem0AdapterConfig) -> dict[str, Any]:
+    """Qdrant 后端配置：默认本地 path client；设置 BUMI_QDRANT_URL 时改用 Server。
+
+    本地 path client 是单进程精确扫描，只适合开发和小数据；生产/验收用
+    BUMI_QDRANT_URL=http://127.0.0.1:6333 走服务端 HNSW 与 payload 索引。
+    """
+    store: dict[str, Any] = {
+        "collection_name": config.collection_name,
+        "embedding_model_dims": config.embedding_dims,
+        "on_disk": True,
+    }
+    url = os.environ.get("BUMI_QDRANT_URL", "").strip()
+    if url:
+        store["url"] = url
+    else:
+        store["path"] = str(config.data_dir / "qdrant")
+    return store
+
+
+def _apply_entity_boost_policy(memory, *, mode: str | None = None) -> str:
+    """实体加成开关：BUMI_ENTITY_BOOST=on|off。
+
+    本地实测（docs/latency/REPORT.md §3.8 与 retrieval-ablation）：实体加成在中文语料上
+    对 Recall/MRR 没有贡献，却要在检索里多付一次批量编码（GPU 下 P90 26–30ms）。
+    off 只跳过检索热路径上的加成计算，实体库仍照常写入，随时可切回 on。
+    """
+    mode = (mode or os.environ.get("BUMI_ENTITY_BOOST", "on")).strip().lower()
+    if mode not in {"on", "off"}:
+        raise ValueError("BUMI_ENTITY_BOOST must be 'on' or 'off'")
+    if mode == "off":
+        if not hasattr(memory, "_compute_entity_boosts"):
+            # 这是 mem0 的内部方法；升级 SDK 后若改名/移除，必须显式失败，
+            # 否则会出现“以为关了、实际还在算”的静默时延回退。
+            raise RuntimeError(
+                "BUMI_ENTITY_BOOST=off 需要 mem0 的 Memory._compute_entity_boosts；"
+                "当前 mem0 版本不匹配，请复核 src/bumi_mem/long_term.py 的适配")
+        memory._compute_entity_boosts = lambda query_entities, filters: {}
+
+        async def _skip_async(query_entities, filters):
+            return {}
+
+        if hasattr(memory, "_compute_entity_boosts_async"):
+            memory._compute_entity_boosts_async = _skip_async
+    return mode
+
+
 class Mem0LongTermMemory:
     def __init__(self, llm: ProviderConfig, config: Mem0AdapterConfig) -> None:
         from bumi_mem.providers import ensure_explicit_mem0_route
@@ -130,15 +176,11 @@ class Mem0LongTermMemory:
                 },
                 "vector_store": {
                     "provider": "qdrant",
-                    "config": {
-                        "collection_name": config.collection_name,
-                        "embedding_model_dims": config.embedding_dims,
-                        "path": str(config.data_dir / "qdrant"),
-                        "on_disk": True,
-                    },
+                    "config": _vector_store_config(config),
                 },
             }
         )
+        self.entity_boost = _apply_entity_boost_policy(self.memory)
 
         if llm.thinking_mode is not None:
             from bumi_mem.providers import bind_provider_request_options

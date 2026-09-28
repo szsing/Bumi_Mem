@@ -4,6 +4,9 @@
 
 > 当前数据库schema 9；升级会撤销0.5.x字符串响应缓存，但不改写原消息或L3。详见 [结构化响应升级](../structured_turn_response/README.md)。
 
+> 存储字段（`messages` / `shared_l1` / `shared_memory_refs` / `semantic_*`）与响应 JSON 的逐项对照、
+> 三条协议的实测样例、接入不变量，见 [响应格式规范](RESPONSE_FORMAT.md)。
+
 # 单接口记忆服务：Agent接入
 
 ## 0. 主路径：单次请求 + 结构化响应
@@ -295,14 +298,20 @@ python -c 'import secrets; print(secrets.token_urlsafe(32))'
 | BUMI_DATA_DIR | 独立联调数据目录，首次不要接真实用户库 |
 | BUMI_EMBED_MODEL_PATH | 实际存在的本地 Qwen3-Embedding-0.6B 目录 |
 | MEM0_EMBED_DEVICE | cuda 强制 GPU，auto 允许 CPU 回退 |
+| BUMI_QDRANT_URL | 可选；设置后走 Qdrant Server（HNSW+payload 索引），不设置用本地 path client（仅开发/小数据） |
+| BUMI_ENTITY_BOOST | 可选；`off` 时检索热路径跳过实体加成（本地实测无召回收益、省一次编码，GPU 下约 26–30ms），默认 `on` |
+| BUMI_CONSOLIDATION_IDLE_SECONDS | 可选；有前台活动时后台整理让路的空闲窗口（秒），实测消除约 5% 的检索被阻塞，默认 `0`＝旧行为，建议 `2` |
+| BUMI_CONSOLIDATION_MAX_DEFER_SECONDS | 可选；后台整理最长可延后多少秒（防止长会话饿死整理），默认 `60` |
 | BUMI_AGENT_ID | 当前部署的共享现场 ID |
 | BUMI_SERVICE_API_KEY | 给 Agent 后端的服务密钥，至少 32 字符 |
 | BUMI_MEMORY_API_KEY | 我们自己的记忆摘要/提取 API Key，不分发给对方 |
 | BUMI_MEMORY_MODEL / BASE_URL | 我们的记忆模型与完整兼容 API 根路径 |
+| BUMI_HOST / BUMI_PORT | 服务监听地址与端口，默认 `127.0.0.1:8088`。**端口是主机级资源、不按用户隔离**：同机多实例必须显式分配不同端口，agent 的连接地址要写实际端口 |
 
 ```bash
 export BUMI_SERVICE_ENV_FILE=/data1/sunzhixing/mem0-runtime/secrets/memory_service.env
 bash scripts/run_memory_service.sh
+# 端口以实际分配为准（默认 8088，但同机可能已被其他实例/其他用户占用）
 curl -f http://127.0.0.1:8088/health/ready
 ```
 
@@ -344,9 +353,34 @@ async with AsyncBumiMemoryClient(service_url, service_key) as memory:
 
 以上是流程示例；对方需处理空输入流、模型异常、播放进度和断线重连，并持久化尚未提交的 previous_reply。不能在模型还在并行生成时提前处理下一请求。`previous_ai_reply` 只能送**已确认输出**的文本。
 
-同步版同名 `turn_context`，无 await。旧 exchange 的 `get_context` 保留但不建议新接入使用。命令行单次调用：
+`operation=prefetch` 的**流式前缀预取**写法（挂在 `prepare` 那条旧 exchange 兼容路径上；
+第 0 节的单次结构化主路径**目前不支持预取复用**，见下面的说明）：
+
+```python
+async with AsyncBumiMemoryClient(service_url, service_key) as memory:
+    cid = client_turn_id(run_id, timeline_turn_id)   # 同一轮固定不变
+    # ASR 给出稳定前缀时（稳定判据由 Agent 决定，不要传还在变的尾字）
+    hint = await memory.prefetch_turn(client_turn_id=cid, query_prefix=stable_prefix,
+                                      user_id=user_id)
+    # 终稿到达后带上 prefetch_id：命中则跳过检索，只做拼装（实测串行 P90 15.5ms）
+    prepared = await memory.prepare_turn(client_turn_id=cid, query=final_query,
+                                         user_id=user_id,
+                                         prefetch_id=hint.get('prefetch_id'))
+```
+
+前缀必须是终稿的前缀、增量 ≤ 12 字、3 秒内有效、身份/轮次一致；不满足会自动重算，
+预取失败也不影响 `prepare`。
+
+> **注意（合并后现状）**：预取复用只接在 `prepare` 上。第 0 节的单次结构化主路径
+> （`turn_context` / `process_turn_context`）目前不接受 `prefetch_id`，也就是说不走 `prepare`
+> 的接入方拿不到"检索提前发起"的收益。要把它接到主路径上需要给请求加一个可选
+> `prefetch_id` 并在线程里透传，目前**未实现**。
+
+同步版同名 `turn_context`，无 await。旧 exchange 的 `get_context` 保留但不建议新接入使用。
+命令行单次调用：
 
 ```bash
+# 用实际分配的地址；/health/ready 无法区分端口后面是谁的服务，联调前先用自己的密钥核对 agent_id
 export BUMI_SERVICE_URL=http://127.0.0.1:8088
 # 安全设置 BUMI_SERVICE_API_KEY，不要放入源码。
 python -m bumi_mem.client --user-id A --query '你好' --turn-id demo:turn-000001
