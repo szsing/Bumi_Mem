@@ -24,9 +24,18 @@
 使用 Python 3.10+；建议保留当前已验证的 Torch/CUDA 组合，在专用服务环境安装。本地验证使用 Python 3.12。执行：
 
 ```bash
-cd /实际上传的/Bumi_mem
+cd /data1/sunzhixing/Bumi_mem_2
 python -m pip install -e '.[server,runtime,test]'
 ```
+
+本机路径约定（服务器实测值，与旧框架对照时必须区分）：
+
+| 用途 | 路径 |
+|---|---|
+| 新框架 Graphiti | `/data1/sunzhixing/Bumi_mem_2` |
+| 旧框架 Mem0（对照基线，勿改） | `/data1/sunzhixing/Bumi_Mem` |
+
+注意：旧 checkout 目录名是 `Bumi_Mem`（大写 M），不是 `Bumi_mem`。
 
 `pyproject.toml` 固定 GitHub 的 `v0.31.0` 源码发布标签，而不是索引中更旧的包。该标签源码自身的包 metadata 标成 `0.32.0`，因此 `pip show graphiti-core` 显示 0.32.0 并不表示装了另外的 main；可检查安装来源：
 
@@ -67,6 +76,24 @@ docker compose -p bumi-graphiti -f scripts/neo4j.compose.yaml up -d
 ```
 
 Compose 使用 Neo4j 5.26.0 Community，数据目录持久化，HTTP/Bolt 仅绑定本机。默认端口为 7474/7687，如被占用，在配置中设置 `BUMI_NEO4J_HTTP_PORT`、`BUMI_NEO4J_BOLT_PORT` 并同步改 `BUMI_NEO4J_URI`。该脚本需要服务器已具备 Docker Compose；没有 Docker 时由部署环境提供兼容 Neo4j 并配置 URI，不自动安装系统服务。
+
+服务器现状（2026-10-15 实测）：**未安装 Docker**（`docker: command not found`），因此上面的 `docker compose` 命令在本机直接失败，不要反复尝试。本节末尾给出无 Docker 的独立 Neo4j 方案。
+
+端口有三个互不相同的来源，验收时不要混用：
+
+| 来源 | 值 | 说明 |
+|---|---|---|
+| 模块默认值 | `8088` | `src/bumi_mem/api.py:os.getenv('BUMI_PORT', '8088')` |
+| 本样例配置 | `18099` | `configs/graphiti.env.example` |
+| 实际启动值 | 以启动时 source 的私有配置为准 | `scripts/run_memory_service.sh` 会回显所用 Python 与配置 |
+
+本机 `8088` 已被既有实例占用（旧框架 `Bumi_Mem/.venv/... -m bumi_mem.api`，另有 nginx 记忆服务前置），实验**一律不使用 8088**。约定：旧系统测试实例 `18088`，新系统测试实例 `18099`。启动前先确认空闲：
+
+```bash
+ss -ltn | grep -E ':(18088|18099|7474|7687)\b' || echo '测试端口均空闲'
+```
+
+无需 Docker 的独立 Neo4j 方案见第 8 节。
 
 不要共用已有真实图数据库。通过 SSH 隧道访问浏览器：
 

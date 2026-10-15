@@ -74,6 +74,15 @@ L2 摘要也按个人快照生成，不能把混合现场摘要当作某个人�
 
 ## 本地回归
 
+服务器（Linux，旧框架对照基线）：
+
+```bash
+cd /data1/sunzhixing/Bumi_Mem
+.venv/bin/python -m pytest -q
+```
+
+Windows 本地开发环境（历史）：
+
 ```powershell
 cd D:\代码\Bumi_mem
 .\.venv\Scripts\python.exe -m pytest -q

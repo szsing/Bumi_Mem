@@ -417,7 +417,16 @@ v6 的历史迁移：在原 v5 的 context_requests、protocol 和机器人身�
 
 升级前停服务并备份完整 SQLite 数据（注意 WAL），回滚应恢复备份，不能用旧代码直接打开 v7。对话和幂等审计记录暂未自动清理；正在使用的 Prompt 缓存含个人记忆，需要保护数据库并制定保留期限。
 
-本地测试用真实 SQLite、FastAPI 测试客户端和模拟模型后端；不等于真实 GPU、模型准确率、Pipecat 语音或断电验收。运行：
+本地测试用真实 SQLite、FastAPI 测试客户端和模拟模型后端；不等于真实 GPU、模型准确率、Pipecat 语音或断电验收。
+
+服务器（Linux，旧框架对照基线）：
+
+```bash
+cd /data1/sunzhixing/Bumi_Mem
+.venv/bin/python -m pytest -q
+```
+
+Windows 本地开发环境（历史）：
 
 ```powershell
 cd D:\代码\Bumi_mem
