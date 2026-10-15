@@ -85,9 +85,18 @@ class SharedMemoryStoreMixin:
         with self._connect() as conn:
             return [r for r in rows if self._memory_allowed(conn, r, user_id, agent_id)]
 
-    def attach_memory_refs(self, *, user_id, agent_id, anchor_message_id, rows, generation, visible_message_ids=None):
+    def attach_memory_refs(self, *, user_id, agent_id, anchor_message_id, rows, generation,
+                           visible_message_ids=None, replace_user_refs=False):
         require_person(user_id)
         require_pair(user_id, agent_id)
+        if replace_user_refs and not rows:
+            # Nothing to publish and nothing to replace: do not take a write lock
+            # on the foreground read path just to confirm an empty change.
+            with self._connect() as conn:
+                stale = conn.execute("SELECT 1 FROM shared_memory_refs WHERE agent_id=? AND user_id=? "
+                                     "AND status='active' LIMIT 1", (agent_id, user_id)).fetchone()
+            if stale is None:
+                return
         with self._connect(write=True) as conn:
             scope = self._scope(conn, user_id, agent_id)
             if scope['generation'] != generation or scope['delete_pending']:
@@ -99,6 +108,21 @@ class SharedMemoryStoreMixin:
             # Defensive reclamation: L1 anchors alone define lifetime, no new TTL.
             conn.execute('DELETE FROM shared_memory_refs WHERE agent_id=? AND anchor_message_id NOT IN '
                          '(SELECT message_id FROM shared_l1 WHERE agent_id=?)', (agent_id, agent_id))
+            if replace_user_refs:
+                # Replace this user's previous recall refs with THIS turn's recall
+                # inside the same transaction that publishes them. Retired memories
+                # must not survive as fresh context, but a memory recalled again
+                # keeps its existing row instead of churning status/version.
+                kept = {reference_key(row) for row in rows}
+                if kept:
+                    placeholders = ','.join('?' for _ in kept)
+                    conn.execute('UPDATE shared_memory_refs SET status=\'superseded\' '
+                                 'WHERE agent_id=? AND user_id=? AND status=\'active\' '
+                                 f'AND memory_id NOT IN ({placeholders})',
+                                 (agent_id, user_id, *sorted(kept)))
+                else:
+                    conn.execute("UPDATE shared_memory_refs SET status='superseded' "
+                                 "WHERE agent_id=? AND user_id=? AND status='active'", (agent_id, user_id))
             for row in rows:
                 if (row.get('user_id'), row.get('agent_id')) != (user_id, agent_id):
                     raise MemoryScopeError('foreign memory cannot be published through another user gate')

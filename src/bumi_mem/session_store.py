@@ -401,8 +401,14 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
         if old['status'] != 'active':
             raise SessionBlockedError('only the active session can rotate shared L1')
         agent = old['agent_id']
+        # Carryover must honour the real L1 window. Either the effective window
+        # travels in the persisted snapshot, or the submission path states it
+        # explicitly; there is no silent fallback to a guessed default.
         if settings.get('backend') == 'graphiti':
-            carryover_messages = max(carryover_messages, settings.get('l1_max_messages', 20))
+            configured = settings.get('l1_max_messages')
+            if configured is None:
+                raise ValueError('Graphiti submissions require l1_max_messages in the job snapshot')
+            carryover_messages = max(carryover_messages, configured)
         self._assert_agent_idle(conn, agent)
         active = conn.execute("SELECT session_id FROM sessions WHERE agent_id=? AND status='active'",
                               (agent,)).fetchall()

@@ -165,7 +165,7 @@ def build_service_engine(settings: ServiceSettings):
         summary_provider=OpenAICompatibleProvider(provider), memory_provider_name=settings.memory_provider,
         memory_token_counter=counter, config=ConsolidatorConfig(backend='graphiti',
             extraction_turns=settings.extraction_turns, extraction_tokens=settings.extraction_tokens,
-            carryover_messages=max(settings.carryover_messages, settings.max_messages),
+            carryover_messages=settings.carryover_messages, l1_max_messages=settings.max_messages,
             local_chunk_tokens=settings.extraction_tokens, max_attempts=settings.max_attempts))
     return BumiMemory(store=store, long_term=access, chat_provider=None, consolidator=consolidator,
         chat_token_counter=counter, auto_start=False, config=BumiMemoryConfig(

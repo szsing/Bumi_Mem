@@ -316,13 +316,14 @@ class BumiMemory(AgentEngineMixin):
                 except Exception as exc:
                     logger.debug('L3 unavailable: %s', type(exc).__name__)
                     recall_status = 'unavailable'
-        if not self.config.semantic_state_enabled:
-            with self.store._connect(write=True) as conn:
-                conn.execute('DELETE FROM shared_memory_refs WHERE agent_id=? AND user_id=?', (agent_id, user_id))
-        if recalled:
+        # Recall references are refreshed as part of publishing this turn's
+        # recall, in one write transaction. A separate DELETE pass would add a
+        # second write transaction on the foreground read path for no gain.
+        if recalled or not self.config.semantic_state_enabled:
             self.store.attach_memory_refs(user_id=user_id, agent_id=agent_id,
                                           anchor_message_id=turn['source_message_id'], rows=recalled,
                                           generation=turn['generation'],
+                                          replace_user_refs=not self.config.semantic_state_enabled,
                                           visible_message_ids={m.message_id for m in self.context_builder.select_l1(
                                               self.store.list_shared_messages(agent_id))})
         # Successful recall is now represented by owner-labelled shared references.

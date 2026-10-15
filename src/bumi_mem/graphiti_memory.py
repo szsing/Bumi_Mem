@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from bumi_mem.providers import ProviderConfig, bind_provider_request_options
 from bumi_mem.schemas import (
     MemoryWriteUncertainError, RetryableMemoryError, canonical_messages_digest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -247,11 +250,16 @@ class GraphitiLongTermMemory:
         # search config (including its per-kind limits and BGE rerank) is used.
         result = await self.client.search_(query, group_ids=[group])
         rows = []
+        foreign = []
         for kind, values in [('edge', result.edges), ('node', result.nodes),
                              ('episode', result.episodes), ('community', result.communities)]:
             for item in values:
                 if item.group_id != group:
-                    raise RuntimeError('Graphiti returned a foreign namespace')
+                    # Never publish another namespace's content into this user's
+                    # context. One bad item must not discard a whole recall, but
+                    # a recurring leak must not stay silent either.
+                    foreign.append((kind, getattr(item, 'uuid', None), item.group_id))
+                    continue
                 raw = item.model_dump(mode='json')
                 text = raw.get('fact') or raw.get('summary') or raw.get('content') or raw.get('name')
                 if not text:
@@ -266,6 +274,12 @@ class GraphitiLongTermMemory:
                                  agent_id=agent_id, fact_status='historical_version' if historical else 'graphiti_record',
                                  metadata={'backend': 'graphiti', 'kind': kind, **times,
                                            'episode_uuids': raw.get('episodes', [])}))
+        if foreign:
+            logger.warning('Graphiti returned %d item(s) outside group %s (expected %s): %s',
+                           len(foreign), foreign[0][2], group,
+                           ', '.join(f'{kind}:{uuid}' for kind, uuid, _ in foreign[:10]))
+            self._audit_replay(group, {'job_id': f'search:{agent_id}'}, 'foreign_namespace',
+                               f'{len(foreign)} item(s) from foreign group_id={foreign[0][2]}; dropped')
         return rows
 
     async def build_due_communities(self):

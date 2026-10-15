@@ -152,7 +152,7 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
         config=ConsolidatorConfig(
             backend='graphiti', extraction_turns=int(os.getenv('BUMI_EXTRACTION_TURNS', '10')),
             extraction_tokens=int(os.getenv('BUMI_EXTRACTION_TOKENS', '8000')),
-            carryover_messages=max(args.carryover_messages, args.max_messages),
+            carryover_messages=args.carryover_messages, l1_max_messages=args.max_messages,
             local_chunk_tokens=int(os.getenv('BUMI_EXTRACTION_TOKENS', '8000')),
             summary_max_tokens=args.summary_max_tokens,
             max_attempts=args.memory_max_attempts,

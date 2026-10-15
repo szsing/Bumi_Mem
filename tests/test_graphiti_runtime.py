@@ -19,6 +19,8 @@ def graph_engine(path, *, rounds=3, l1=20, tokens=8000):
     engine.consolidator.config.backend = 'graphiti'
     engine.consolidator.config.extraction_turns = rounds
     engine.consolidator.config.extraction_tokens = tokens
+    # The effective L1 window is real configuration, not an implicit default.
+    engine.consolidator.config.l1_max_messages = l1
     return engine, store, memory, chat, summary
 
 
@@ -277,6 +279,7 @@ def uncertain_engine(tmp_path, long_term=None):
     engine.consolidator.config.backend = 'graphiti'
     engine.consolidator.config.extraction_turns = 1
     engine.consolidator.config.extraction_tokens = 8000
+    engine.consolidator.config.l1_max_messages = engine.config.max_messages
     return engine, store, memory
 
 
@@ -626,3 +629,158 @@ def test_retryable_preflight_error_returns_chunk_to_pending(tmp_path):
     assert store.chunks(job.job_id)[0]['status'] == 'pending'
     assert store.get_job(job.job_id).last_error
     assert not store.replay_authorization(store.chunks(job.job_id)[0]['chunk_id'])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 review items.
+# ---------------------------------------------------------------------------
+
+def test_per_message_time_and_source_reach_raw_episode_content(tmp_path, raw_episode_modules, caplog):
+    """Capture what is actually handed to RawEpisode and check per-message provenance."""
+    captured = {}
+
+    class Client:
+        async def add_episode_bulk(self, episodes, **kwargs):
+            captured['episodes'] = episodes
+            return types.SimpleNamespace(episodes=[types.SimpleNamespace(uuid='ep')], nodes=[], edges=[])
+
+    from bumi_mem.schemas import MessageRecord
+    records = [
+        MessageRecord(message_id='m1', session_id='s', sequence_no=1, role='user',
+                      content='我叫小星', token_count=1, created_at='2026-10-15T10:00:00+08:00',
+                      user_id='u', agent_id='a'),
+        MessageRecord(message_id='m2', session_id='s', sequence_no=2, role='assistant',
+                      content='你好小星', token_count=1, created_at='2026-10-15T10:00:05+08:00',
+                      user_id='u', agent_id='a'),
+        MessageRecord(message_id='m3', session_id='s', sequence_no=3, role='user',
+                      content='我喜欢三角龙', token_count=1, created_at='2026-10-15T10:01:00+08:00',
+                      user_id='u', agent_id='a'),
+    ]
+    messages = [r.to_extraction_message() for r in records]
+
+    async def run():
+        memory = adapter(tmp_path, Client())
+        await memory.add_session(user_id='u', agent_id='a', messages=messages,
+                                 metadata=dict(consolidation_id='k', job_id='j'))
+        content = captured['episodes'][0].content
+        # Every message's own timestamp and source id must be present, so a
+        # multi-turn batch is not flattened onto a single reference time.
+        for record in records:
+            assert record.created_at in content, f'missing time for {record.message_id}'
+            assert record.message_id in content, f'missing source id for {record.message_id}'
+        # Ordering is preserved end to end.
+        assert content.index('m1') < content.index('m2') < content.index('m3')
+        # Sanity: this is NOT merely "role: content".
+        assert content != '\n'.join(f"{m['role']}: {m['content'].split(chr(10),1)[-1]}" for m in messages)
+    asyncio.run(run())
+
+
+def test_l1_max_messages_is_real_configuration_not_a_hidden_default(tmp_path):
+    """A larger L1 window must take effect, and its absence must not default silently."""
+    engine, store, *_ = graph_engine(tmp_path, rounds=10, l1=30)
+    assert engine.consolidator.config.l1_max_messages == 30
+    # Submit explicitly: the snapshot carries the configured window.
+    receipt = engine.consolidator.submit(
+        engine.get_or_create_session(user_id='u1', agent_id='a1').session_id, reason='test')
+    job = store.get_job(receipt.job_id)
+    assert json.loads(job.payload_json)['settings']['l1_max_messages'] == 30
+    # A Graphiti submission with no configured window is refused, not guessed.
+    engine.consolidator.config.l1_max_messages = None
+    engine.consolidator.config.carryover_messages = 3
+    with pytest.raises(ValueError, match='l1_max_messages'):
+        engine.consolidator.submit(
+            engine.get_or_create_session(user_id='u2', agent_id='a1').session_id, reason='test')
+
+
+def test_smaller_carryover_does_not_shrink_the_l1_window(tmp_path):
+    """carryover below the window is raised to the window; the window is the floor."""
+    engine, store, *_ = graph_engine(tmp_path, rounds=2, l1=30)
+    engine.consolidator.config.carryover_messages = 4
+    for _ in range(6):
+        chat_turn(engine)
+    receipt = engine.memory_jobs(user_id='u1', agent_id='a1')[0]
+    new_sid = store.get_job(receipt.job_id).new_session_id
+    assert len(store.list_shared_messages('a1')) >= 4
+    assert store.stats(new_sid).context_only_messages >= 4
+
+
+def test_foreign_group_results_are_dropped_and_warned_not_fatal(tmp_path, caplog):
+    group = graph_group('u', 'a')
+
+    class Item:
+        def __init__(self, uuid, gid, **values):
+            self.uuid, self.group_id, self.values = uuid, gid, values
+
+        def model_dump(self, **kwargs):
+            return self.values
+
+    class Client:
+        async def search_(self, query, **kwargs):
+            return types.SimpleNamespace(
+                edges=[Item('e1', group, fact='我喜歡三角龍'), Item('leak', 'someone_else_group', fact='别人的秘密')],
+                nodes=[Item('n1', group, summary='小星')],
+                episodes=[Item('p1', 'another_group', content='别人的对话')],
+                communities=[Item('c1', group, summary='共同兴趣')])
+
+    async def run():
+        memory = adapter(tmp_path, Client())
+        import logging
+        with caplog.at_level(logging.WARNING):
+            rows = await memory.search(user_id='u', agent_id='a', query='恐龙')
+        # Legitimate results survive; nothing from a foreign namespace is published.
+        assert {r['id'] for r in rows} == {'edge:e1', 'node:n1', 'community:c1'}
+        assert all('别人的' not in r['memory'] for r in rows)
+        assert any('outside group' in r.message for r in caplog.records), 'a leak must not be silent'
+        # And it is recorded for later inspection.
+        assert 'foreign_namespace' in [e['event'] for e in memory.replay_audit(group)]
+    asyncio.run(run())
+
+
+def test_bge_reranker_subclass_matches_upstream_contract():
+    """Record the upstream contract instead of guessing that super() is required."""
+    graphiti_core = pytest.importorskip('graphiti_core')
+    from graphiti_core.cross_encoder import bge_reranker_client as bge
+    from graphiti_core.cross_encoder import client as base
+    import inspect
+    # Upstream BGERerankerClient sets only self.model and defines no other init state.
+    src = inspect.getsource(bge.BGERerankerClient.__init__)
+    assert 'self.model' in src
+    # The parent is a pure ABC: it declares no __init__ at all, so there is no
+    # parent initialisation for a subclass to skip.
+    parent_src = inspect.getsource(base.CrossEncoderClient)
+    assert 'def __init__' not in parent_src
+    assert 'abstractmethod' in parent_src
+    # Our local subclass therefore only needs to set the model path.
+    from bumi_mem.graphiti_memory import GraphitiLongTermMemory
+    local = inspect.getsource(GraphitiLongTermMemory.__init__)
+    assert 'CrossEncoder' in local and 'self.model' in local
+
+
+def test_recall_refs_are_replaced_in_one_write_transaction(tmp_path):
+    """Graphiti mode refreshes this user's recall refs without a second write pass."""
+    engine, store, memory, _, _ = make_engine(tmp_path)
+    engine.config.semantic_state_enabled = False
+    engine.consolidator.config.backend = 'graphiti'
+    engine.consolidator.config.extraction_turns = 99
+    engine.consolidator.config.l1_max_messages = engine.config.max_messages
+    memory.search_results = [{'id': 'dino', 'memory': '小星最喜欢三角龙'}]
+    result = engine.process_context(user_id='u1', agent_id='a1', query='我喜欢什么动物',
+                                      previous_ai_reply=None)
+    assert result['recall_status'] == 'ok'
+    selected = [m.message_id for m in store.list_shared_messages('a1')]
+    refs = store.shared_memory_refs('a1', selected_message_ids=selected)
+    assert [r['id'] for r in refs] == ['dino']  # refs expose the payload row plus ref_id
+    # A later turn that recalls nothing must retire the stale reference rather
+    # than leaving retired memory visible as fresh context.
+    memory.search_results = []
+    engine.process_context(user_id='u1', agent_id='a1', query='别的',
+                           previous_ai_reply='我喜欢三角龙')
+    assert store.shared_memory_refs('a1', selected_message_ids=[m.message_id for m in store.list_shared_messages('a1')]) == []
+    # Deletion protection is unchanged: a pending forget-all suppresses refs.
+    store.request_forget(user_id='u1', agent_id='a1', max_attempts=1)
+    with store._connect(write=True) as conn:
+        conn.execute('UPDATE memory_scopes SET delete_pending=1 WHERE user_id=? AND agent_id=?', ('u1', 'a1'))
+    memory.search_results = [{'id': 'dino', 'memory': '小星最喜欢三角龙'}]
+    engine.process_context(user_id='u1', agent_id='a1', query='还记得三角龙吗',
+                           previous_ai_reply='三角龙')
+    assert store.shared_memory_refs('a1', selected_message_ids=[m.message_id for m in store.list_shared_messages('a1')]) == []

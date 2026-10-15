@@ -23,6 +23,11 @@ class ConsolidatorConfig:
     extraction_turns: int = 10
     extraction_tokens: int = 8000
     carryover_messages: int = 20
+    # Effective L1 window for the Graphiti backend. Extraction frequency and the
+    # L1 window are deliberately separate knobs: changing one must not silently
+    # shrink the other. This travels in the persisted job snapshot, so a queued
+    # batch keeps the window it was submitted under.
+    l1_max_messages: int | None = None
     local_chunk_tokens: int = 3500
     summary_max_tokens: int = 512
     max_attempts: int = 3
@@ -31,6 +36,8 @@ class ConsolidatorConfig:
     def __post_init__(self) -> None:
         if self.extraction_turns <= 0 or self.extraction_tokens <= 0:
             raise ValueError('extraction limits must be positive')
+        if self.l1_max_messages is not None and self.l1_max_messages <= 0:
+            raise ValueError('l1_max_messages must be positive when set')
         if self.carryover_messages < 0 or self.local_chunk_tokens <= 0 or self.summary_max_tokens <= 0:
             raise ValueError('invalid consolidation size limits')
         if self.max_attempts < 1 or self.retry_base_seconds < 0:
