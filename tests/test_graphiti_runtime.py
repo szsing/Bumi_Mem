@@ -493,3 +493,136 @@ def test_journal_accepts_only_matching_grant_and_audits(tmp_path, raw_episode_mo
                                          metadata=meta, replay_authorization=good)
         assert client.calls == 2 and again == receipt
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Failure classification: "provably no write yet" vs "may have written".
+# Upstream add_episode_bulk persists the episode BEFORE calling the extraction
+# LLM, so a 429/timeout during extraction can never be assumed side-effect free.
+# ---------------------------------------------------------------------------
+
+from bumi_mem.schemas import RetryableMemoryError
+
+
+def test_preflight_failure_is_retryable_and_rolls_back_the_journal(tmp_path, raw_episode_modules):
+    class Client:
+        calls = 0
+
+        async def add_episode_bulk(self, episodes, **kwargs):
+            self.calls += 1
+            return types.SimpleNamespace(episodes=[types.SimpleNamespace(uuid='ep')], nodes=[], edges=[])
+
+    async def run():
+        client = Client()
+        memory = adapter(tmp_path, client)
+        # No observed_at: the reference time cannot be parsed, so nothing was sent.
+        with pytest.raises(RetryableMemoryError):
+            await memory.add_session(user_id='u', agent_id='a',
+                                     messages=[dict(role='user', content='x')],
+                                     metadata=dict(consolidation_id='k', job_id='j'))
+        assert client.calls == 0
+        with memory._db() as db:
+            rows = db.execute('SELECT COUNT(*) FROM ingestions').fetchone()[0]
+        assert rows == 0, 'a write that never started must not be left as an incomplete journal row'
+        assert 'not_sent' in [r['event'] for r in memory.replay_audit('k')]
+        # Because the journal was rolled back, a normal retry is allowed.
+        good = [dict(role='user', content='x', observed_at='2026-10-15T08:00:00+08:00')]
+        receipt = await memory.add_session(user_id='u', agent_id='a', messages=good,
+                                           metadata=dict(consolidation_id='k', job_id='j'))
+        assert client.calls == 1 and receipt[0]['episode_uuids'] == ['ep']
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure', [
+    RuntimeError('429 Too Many Requests'),
+    TimeoutError('read timeout'),
+    ConnectionError('connection reset'),
+])
+def test_partial_write_failure_is_never_auto_replayed(tmp_path, raw_episode_modules, failure):
+    class Client:
+        calls = 0
+
+        async def add_episode_bulk(self, episodes, **kwargs):
+            self.calls += 1
+            # The episode was already persisted upstream when this fires.
+            raise failure
+
+    async def run():
+        client = Client()
+        memory = adapter(tmp_path, client)
+        messages = [dict(role='user', content='我喜欢恐龙', observed_at='2026-10-15T08:00:00+08:00')]
+        meta = dict(consolidation_id='k', job_id='j', memory_generation=1)
+        with pytest.raises(MemoryWriteUncertainError):
+            await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        assert client.calls == 1
+        # Journal keeps the incomplete row, so a blind retry is refused.
+        with memory._db() as db:
+            state = db.execute('SELECT state FROM ingestions WHERE id=?', ('k',)).fetchone()[0]
+        assert state == 'writing'
+        with pytest.raises(MemoryWriteUncertainError, match='incomplete'):
+            await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        assert client.calls == 1
+        assert 'uncertain' in [r['event'] for r in memory.replay_audit('k')]
+    asyncio.run(run())
+
+
+def test_cancellation_keeps_incomplete_journal_and_does_not_become_uncertain(tmp_path, raw_episode_modules):
+    started = threading.Event()
+
+    class Client:
+        async def add_episode_bulk(self, episodes, **kwargs):
+            started.set()
+            raise asyncio.CancelledError()
+
+    async def run():
+        memory = adapter(tmp_path, Client())
+        messages = [dict(role='user', content='x', observed_at='2026-10-15T08:00:00+08:00')]
+        meta = dict(consolidation_id='k', job_id='j', memory_generation=1)
+        # Cancellation is control flow: it must propagate as CancelledError,
+        # never be swallowed and relabelled as an uncertain write.
+        with pytest.raises(asyncio.CancelledError):
+            await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        with memory._db() as db:
+            state = db.execute('SELECT state FROM ingestions WHERE id=?', ('k',)).fetchone()[0]
+        assert state == 'writing', 'an interrupted write must stay blocked from blind replay'
+        assert 'cancelled' in [r['event'] for r in memory.replay_audit('k')]
+        # Still refused without an explicit grant.
+        with pytest.raises(MemoryWriteUncertainError):
+            await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+    asyncio.run(run())
+
+
+def test_no_extra_retry_layer_around_the_sdk(tmp_path, raw_episode_modules):
+    """The SDK already retries the LLM call 4x; a wrapper must not multiply that."""
+    class Client:
+        calls = 0
+
+        async def add_episode_bulk(self, episodes, **kwargs):
+            self.calls += 1
+            raise RuntimeError('429')
+
+    async def run():
+        client = Client()
+        memory = adapter(tmp_path, client)
+        messages = [dict(role='user', content='x', observed_at='2026-10-15T08:00:00+08:00')]
+        meta = dict(consolidation_id='k', job_id='j', memory_generation=1)
+        with pytest.raises(MemoryWriteUncertainError):
+            await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        assert client.calls == 1, 'one caller attempt must map to exactly one SDK attempt'
+    asyncio.run(run())
+
+
+def test_retryable_preflight_error_returns_chunk_to_pending(tmp_path):
+    """End to end: a pre-write failure lets the consolidator retry normally."""
+    class NoTimestamp(FakeLongTermMemory):
+        def add_session(self, **kwargs):
+            raise RetryableMemoryError('graph backend not initialised')
+
+    engine, store, memory = uncertain_engine(tmp_path, long_term=NoTimestamp())
+    chat_turn(engine, '我叫小星')
+    job = engine.memory_jobs(user_id='u1', agent_id='a1')[0]
+    assert engine.worker.run_once()
+    # Retryable: the chunk goes back to pending and the job stays retryable.
+    assert store.chunks(job.job_id)[0]['status'] == 'pending'
+    assert store.get_job(job.job_id).last_error
+    assert not store.replay_authorization(store.chunks(job.job_id)[0]['chunk_id'])

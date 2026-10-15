@@ -18,7 +18,9 @@ from typing import Any
 
 from bumi_mem.identity import require_pair
 from bumi_mem.providers import ProviderConfig, bind_provider_request_options
-from bumi_mem.schemas import MemoryWriteUncertainError, canonical_messages_digest
+from bumi_mem.schemas import (
+    MemoryWriteUncertainError, RetryableMemoryError, canonical_messages_digest,
+)
 
 
 @dataclass(frozen=True)
@@ -152,31 +154,64 @@ class GraphitiLongTermMemory:
                     self._audit_replay(key, metadata, 'accepted', 'journal reopened under explicit grant')
                 db.execute('INSERT OR REPLACE INTO ingestions VALUES(?,?,?, ?,NULL,?)',
                            (key, group, 'writing', payload, time.time()))
+            # ---- pre-flight ---------------------------------------------------
+            # Building the raw episode and parsing the reference time never
+            # reaches the backend, so a failure here is provably free of graph
+            # side effects. The journal row is rolled back and the caller may
+            # retry normally.
             try:
-                # Message headers carry original timestamps and identities.
-                # No business extraction instructions or entity whitelist.
                 body = '\n'.join(f"{m['role']}: {m['content']}" for m in messages)
                 reference = datetime.fromisoformat(messages[0]['observed_at'])
-                result = await self.client.add_episode_bulk([
-                    RawEpisode(name=key, content=body, source=EpisodeType.message,
-                               source_description='Bumi conversation batch', reference_time=reference)
-                ], group_id=group)
+                episode = RawEpisode(name=key, content=body, source=EpisodeType.message,
+                                     source_description='Bumi conversation batch',
+                                     reference_time=reference)
+            except Exception as exc:
+                with self._db() as db:
+                    db.execute('DELETE FROM ingestions WHERE id=?', (key,))
+                self._audit_replay(key, metadata, 'not_sent',
+                                   f'pre-flight failed before any backend call: {type(exc).__name__}: {exc}')
+                raise RetryableMemoryError(f'Graphiti write never started: {exc}') from exc
+            # ---- the write itself ---------------------------------------------
+            # Upstream persists the episode BEFORE it calls the extraction LLM
+            # (add_nodes_and_edges_bulk precedes _extract_and_dedupe_nodes_bulk in
+            # add_episode_bulk), so from here on a failure can always have left a
+            # partial graph write behind, including a 429 or a read timeout. The
+            # SDK also owns a 4-attempt retry on the LLM call, so adding another
+            # automatic retry here would multiply attempts and duplicate episodes.
+            try:
+                result = await self.client.add_episode_bulk([episode], group_id=group)
+            except asyncio.CancelledError:
+                # Cancellation is control flow, not a write outcome. Keep the
+                # journal so a blind replay stays blocked, then propagate.
+                self._audit_replay(key, metadata, 'cancelled',
+                                   'write cancelled; incomplete journal retained')
+                raise
+            except BaseException as exc:
+                self._audit_replay(key, metadata, 'uncertain',
+                                   f'{type(exc).__name__}: {exc}')
+                raise MemoryWriteUncertainError(
+                    'Graphiti write outcome uncertain; episode persistence precedes extraction, '
+                    'so a partial write cannot be ruled out. Automatic replay disabled') from exc
+            # The graph write has landed. A receipt problem does not undo it.
+            try:
                 episodes = [e.uuid for e in result.episodes]
                 if not episodes:
                     raise RuntimeError('Graphiti returned no episode receipt')
                 receipt = [{'backend': 'graphiti', 'episode_uuids': episodes,
                             'node_uuids': [n.uuid for n in result.nodes],
                             'edge_uuids': [e.uuid for e in result.edges]}]
-                with self._db() as db:
-                    db.execute("UPDATE ingestions SET state='complete',result=? WHERE id=?",
-                               (json.dumps(receipt), key))
-                    db.execute('INSERT OR IGNORE INTO community_jobs(group_id) VALUES(?)', (group,))
-                if replay_authorization:
-                    self._audit_replay(key, metadata, 'succeeded', 'granted replay produced a receipt')
-                return receipt
-            except BaseException as exc:
-                self._audit_replay(key, metadata, 'failed', f'{type(exc).__name__}: {exc}')
-                raise MemoryWriteUncertainError('Graphiti write outcome uncertain; automatic replay disabled') from exc
+            except Exception as exc:
+                self._audit_replay(key, metadata, 'uncertain', f'receipt unusable: {exc}')
+                raise MemoryWriteUncertainError(
+                    'Graphiti write returned no usable receipt; the graph may already '
+                    'contain this batch. Automatic replay disabled') from exc
+            with self._db() as db:
+                db.execute("UPDATE ingestions SET state='complete',result=? WHERE id=?",
+                           (json.dumps(receipt), key))
+                db.execute('INSERT OR IGNORE INTO community_jobs(group_id) VALUES(?)', (group,))
+            if replay_authorization:
+                self._audit_replay(key, metadata, 'succeeded', 'granted replay produced a receipt')
+            return receipt
 
     def _assert_replay_grant(self, grant, key, user_id, agent_id, metadata, messages) -> None:
         """Refuse to re-enter an incomplete write without a valid single-use grant."""
