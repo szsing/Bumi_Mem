@@ -384,6 +384,8 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
         if old['status'] != 'active':
             raise SessionBlockedError('only the active session can rotate shared L1')
         agent = old['agent_id']
+        if settings.get('backend') == 'graphiti':
+            carryover_messages = max(carryover_messages, settings.get('l1_max_messages', 20))
         self._assert_agent_idle(conn, agent)
         active = conn.execute("SELECT session_id FROM sessions WHERE agent_id=? AND status='active'",
                               (agent,)).fetchall()

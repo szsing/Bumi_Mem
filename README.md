@@ -1,3 +1,5 @@
+> **Graphiti 实验版入口**：当前服务和 CLI 已切换为 Graphiti + Neo4j，保留 L1，关闭 semantic_state 旁路。请优先按 [Graphiti 部署与验收](docs/deployment/GRAPHITI.md) 安装、配置和测试；下方旧 Mem0 说明仅作历史对照，不适用于新服务。
+
 # Bumi_Mem
 
 > 0.6.0 将单次接口响应从一段Prompt字符串改为四个结构化字段：`turn_id`、`current_user`、`long_term_memory`、`short_term_memory`。输入六字段和每轮一次调用方式不变；数据库升级到schema 9，用于撤销0.5.x字符串缓存。详见 [接口文档](docs/agent_api/README.md)。

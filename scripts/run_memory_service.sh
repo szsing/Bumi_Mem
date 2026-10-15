@@ -11,13 +11,13 @@ if [[ -n "${BUMI_SERVICE_ENV_FILE:-}" ]]; then
   source "$BUMI_SERVICE_ENV_FILE"
   set +a
 fi
-export PYTHONPATH="$ROOT/src:$ROOT/src/mem0-new${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 cd "$ROOT"
 
 # 没配 BUMI_PYTHON 时按常见布局找一个可用的 venv，避免直接 exec 到不存在的 python。
 PYTHON="${BUMI_PYTHON:-}"
 if [[ -z "$PYTHON" ]]; then
-  WORKSPACE="${MEM0_WORKSPACE_ROOT:-$(cd "$ROOT/.." && pwd)}"
+  WORKSPACE="${BUMI_WORKSPACE_ROOT:-$(cd "$ROOT/.." && pwd)}"
   for candidate in \
     "$WORKSPACE/.venvs/bumi-cuda/bin/python" \
     "$WORKSPACE/.venvs/bumi/bin/python" \

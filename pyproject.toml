@@ -9,7 +9,7 @@ description = "Layered session and long-term memory for companion agents"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "mem0ai==2.0.20",
+  "graphiti-core[sentence-transformers] @ https://github.com/getzep/graphiti/archive/refs/tags/v0.31.0.zip",
   "openai>=2",
   "transformers>=5",
   "pydantic>=2,<3",
@@ -19,7 +19,7 @@ dependencies = [
 dev = ["pytest>=8"]
 server = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "filelock>=3.13"]
 client = ["httpx>=0.27,<1"]
-runtime = ["sentence-transformers>=5.2,<7", "fastembed>=0.3.1,<1", "spacy>=3.7,<4"]
+runtime = ["sentence-transformers>=5.2,<7"]
 test = ["pytest>=8", "fastapi>=0.115,<1", "httpx>=0.27,<1", "filelock>=3.13"]
 
 [project.scripts]
@@ -32,4 +32,4 @@ include = ["bumi_mem*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "src/mem0-new"]
+pythonpath = ["src"]

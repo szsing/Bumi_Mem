@@ -257,6 +257,14 @@ def create_app(settings: ServiceSettings | None = None, *, engine_factory=build_
             raise HTTPException(503, detail={'code': 'not_ready'})
         return {'status': 'ready', 'warmed_up': request.app.state.engine._warmup_elapsed_ms is not None}
 
+    @app.get('/v1/memory/debug', dependencies=[Depends(authorize)], tags=['debug'])
+    def graph_debug(user_id: str, request: Request):
+        require_id(user_id, 'user_id')
+        engine = request.app.state.engine
+        if not hasattr(engine.long_term, 'debug'):
+            raise HTTPException(404, detail={'code': 'graph_debug_unavailable'})
+        return engine.long_term.debug(user_id=user_id, agent_id=request.app.state.settings.agent_id)
+
     @app.post('/v1/memory/context', response_model=TurnContextResponse | ContextResponse | AgentPrefetchResponse | AgentPrepareResponse | AgentCompleteResponse | AgentEventResponse | AgentPendingResponse, dependencies=[Depends(authorize)], tags=['memory'])
     def context(body: TurnContextRequest | ContextRequest | AgentPrefetchRequest | AgentPrepareRequest | AgentCompleteRequest | AgentEventRequest | AgentPendingRequest, request: Request,
                 idempotency_key: Annotated[str | None, Header(alias='Idempotency-Key', max_length=128)] = None):

@@ -60,7 +60,13 @@ class TurnStoreMixin:
         stats = conn.execute('SELECT COUNT(*) AS n, COALESCE(SUM(m.token_count),0) AS tokens '
                              'FROM shared_l1 w JOIN messages m USING(message_id) '
                              'WHERE w.agent_id=? AND w.context_only=0', (agent_id,)).fetchone()
-        if stats['n'] >= max_messages or stats['tokens'] >= max_l1_tokens:
+        graph_token_boundary = False
+        if settings.get('backend') == 'graphiti':
+            pending_tokens = conn.execute(
+                "SELECT COALESCE(SUM(m.token_count),0) FROM messages m JOIN sessions s USING(session_id) "
+                "WHERE s.agent_id=? AND s.status='active' AND m.context_only=0", (agent_id,)).fetchone()[0]
+            graph_token_boundary = pending_tokens >= settings['extraction_tokens']
+        if graph_token_boundary or (settings.get('backend') != 'graphiti' and (stats['n'] >= max_messages or stats['tokens'] >= max_l1_tokens)):
             receipt = self._submit_shared(conn, sid, reason='unfinished_turn_boundary', settings=settings,
                                           carryover_messages=settings['carryover_messages'],
                                           max_attempts=settings['max_attempts'])
@@ -150,8 +156,18 @@ class TurnStoreMixin:
         stats = conn.execute('SELECT COUNT(*) AS n,COALESCE(SUM(m.token_count),0) AS tokens '
                              'FROM shared_l1 w JOIN messages m USING(message_id) '
                              'WHERE w.agent_id=? AND w.context_only=0', (agent_id,)).fetchone()
-        reason = ('message_limit' if stats['n'] >= max_messages else
-                  'token_limit' if stats['tokens'] >= max_l1_tokens else None)
+        if settings.get('backend') == 'graphiti':
+            completed = conn.execute(
+                "SELECT COUNT(*) FROM interaction_turns t JOIN sessions s USING(session_id) "
+                "WHERE s.agent_id=? AND s.status='active' AND t.status='completed'", (agent_id,)).fetchone()[0]
+            tokens = conn.execute(
+                "SELECT COALESCE(SUM(m.token_count),0) FROM messages m JOIN sessions s USING(session_id) "
+                "WHERE s.agent_id=? AND s.status='active' AND m.context_only=0", (agent_id,)).fetchone()[0]
+            reason = ('extraction_turn_limit' if completed >= settings['extraction_turns'] else
+                      'extraction_token_limit' if tokens >= settings['extraction_tokens'] else None)
+        else:
+            reason = ('message_limit' if stats['n'] >= max_messages else
+                      'token_limit' if stats['tokens'] >= max_l1_tokens else None)
         receipt = None
         consolidation_status = 'not_triggered'
         if reason:

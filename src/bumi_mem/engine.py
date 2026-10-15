@@ -23,7 +23,7 @@ from bumi_mem.turn_store import TurnConflict
 from bumi_mem.schemas import MemoryWriteReceipt, SavedMemory, MemoryWriteUncertainError, SessionBlockedError, MemoryScopeError
 from bumi_mem.consolidator import SessionConsolidator
 from bumi_mem.context import ContextBuilder
-from bumi_mem.long_term import LongTermMemory, Mem0LongTermMemory
+from bumi_mem.long_term import LongTermMemory
 from bumi_mem.memory_access import SerialMemoryAccess
 from bumi_mem.prefetch import RetrievalPrefetchCache
 from bumi_mem.providers import TextProvider
@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class BumiMemoryConfig:
+    semantic_state_enabled: bool = True  # Legacy harness only; Graphiti service disables it.
     max_messages: int = 20
     max_l1_tokens: int = 8000
     top_k: int = 5
@@ -59,7 +60,7 @@ class BumiMemory(AgentEngineMixin):
                  chat_provider: TextProvider | None, consolidator: SessionConsolidator,
                  chat_token_counter: TokenCounter, config: BumiMemoryConfig | None = None,
                  auto_start: bool = True) -> None:
-        if isinstance(long_term, Mem0LongTermMemory):
+        if type(long_term).__name__ == 'Mem0LongTermMemory':
             raise ValueError('Construct native Mem0 through SerialMemoryAccess(factory=...); '
                              'an already-created SDK may be bound to its original thread')
         self.store = store
@@ -192,6 +193,8 @@ class BumiMemory(AgentEngineMixin):
             return []
         rows = self._scoped_results(rows, user_id, agent_id)
         rows = self.store.filter_memory_rows(rows, user_id=user_id, agent_id=agent_id)
+        if not self.config.semantic_state_enabled:
+            return rows
         current = self.store.semantic_context(user_id=user_id, agent_id=agent_id)
         historical = bool(re.search(r'以前|过去|曾经|当时|去年|原来|\bpreviously\b|\bused to\b|\bin the past\b', query, re.I))
         result = []
@@ -261,7 +264,7 @@ class BumiMemory(AgentEngineMixin):
         user_id, agent_id, query = turn['user_id'], turn['agent_id'], turn['query']
         core_write = {'status': 'not_requested'}
         core_rows = []
-        if not is_guest(user_id):
+        if self.config.semantic_state_enabled and not is_guest(user_id):
             try:
                 source = next((m for m in self.store.list_messages(turn['session_id'])
                                if m.message_id == turn['source_message_id']), None)
@@ -280,14 +283,14 @@ class BumiMemory(AgentEngineMixin):
                 except Exception:
                     core_rows = []
         epoch = self.store.context_epoch(agent_id)
-        if not is_guest(user_id):
+        if self.config.semantic_state_enabled and not is_guest(user_id):
             try:
                 core_rows = self.store.semantic_context(user_id, agent_id)
             except Exception:
                 core_rows = []
                 core_write = {'status': 'failed', 'reason': 'core_read_unavailable'}
         history_rows = []
-        if not is_guest(user_id) and re.search(r'以前|过去|曾经|当时|原来|\bpreviously\b|\bused to\b', query, re.I):
+        if self.config.semantic_state_enabled and not is_guest(user_id) and re.search(r'以前|过去|曾经|当时|原来|\bpreviously\b|\bused to\b', query, re.I):
             try:
                 history_rows = self.store.semantic_history(user_id, agent_id)
             except Exception:
@@ -313,6 +316,9 @@ class BumiMemory(AgentEngineMixin):
                 except Exception as exc:
                     logger.debug('L3 unavailable: %s', type(exc).__name__)
                     recall_status = 'unavailable'
+        if not self.config.semantic_state_enabled:
+            with self.store._connect(write=True) as conn:
+                conn.execute('DELETE FROM shared_memory_refs WHERE agent_id=? AND user_id=?', (agent_id, user_id))
         if recalled:
             self.store.attach_memory_refs(user_id=user_id, agent_id=agent_id,
                                           anchor_message_id=turn['source_message_id'], rows=recalled,
@@ -584,6 +590,8 @@ class BumiMemory(AgentEngineMixin):
         Ordinary queued consolidation remains pending until that job completes.
         This method does not use an LLM or change retrieval/model settings.
         """
+        if getattr(self.long_term, 'backend_name', '') == 'graphiti':
+            raise NotImplementedError('Explicit remember is disabled for Graphiti')
         self.worker.note_foreground()
         require_person(user_id)
         if isinstance(contents, (str, bytes)) or not contents or any(not isinstance(x, str) or not x.strip() for x in contents):
@@ -635,6 +643,8 @@ class BumiMemory(AgentEngineMixin):
             return self.store.request_forget_memory(user_id=user_id, agent_id=agent_id, memory=row)
 
     def _record_spoken_promise(self, turn_id: str, agent_id: str) -> None:
+        if not self.config.semantic_state_enabled:
+            return
         turn = self.store.get_turn(turn_id, agent_id)
         if is_guest(turn['user_id']) or not turn.get('reply_message_id'):
             return

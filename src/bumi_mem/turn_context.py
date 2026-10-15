@@ -24,7 +24,7 @@ def memory_times(row: dict[str, Any]) -> list[str]:
     """Expose semantic/source times, never storage-only record update time."""
     metadata = row.get('metadata')
     metadata = metadata if isinstance(metadata, dict) else {}
-    values = [row.get('event_at'), metadata.get('event_at'), row.get('event_date'),
+    values = [metadata.get('valid_at'), metadata.get('invalid_at'), metadata.get('expired_at'), row.get('event_at'), metadata.get('event_at'), row.get('event_date'),
               metadata.get('event_date'), row.get('observed_at'), metadata.get('observed_at')]
     sources = metadata.get('source_messages')
     if isinstance(sources, list):

@@ -16,14 +16,22 @@ class ServiceSettings:
     embed_model_path: Path
     api_key: str = field(repr=False)
     memory_api_key: str = field(repr=False)
+    neo4j_uri: str = 'bolt://127.0.0.1:7687'
+    neo4j_user: str = 'neo4j'
+    neo4j_password: str = field(default='', repr=False)
+    reranker_model_path: Path = Path('/data1/sunzhixing/model/bge-reranker-v2-m3')
+    extraction_turns: int = 10
+    extraction_tokens: int = 8000
+    community_every: int = 5
+    graph_max_coroutines: int = 3
     agent_id: str = 'bumi_test_agent'
     memory_provider: str = 'deepseek'
     memory_model: str = 'deepseek-flash'
     memory_base_url: str = 'https://api.deepseek.com/v1'
     embed_device: str = 'auto'
     collection_name: str = 'bumi_mem_l3'
-    read_timeout: float = 0.2
-    explicit_recall_timeout: float = 1.0
+    read_timeout: float = 30.0
+    explicit_recall_timeout: float = 30.0
     warmup_timeout: float = 120.0
     max_messages: int = 20
     max_l1_tokens: int = 8000
@@ -63,6 +71,8 @@ class ServiceSettings:
                      'memory_max_tokens', 'local_chunk_tokens', 'max_attempts'):
             if getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive')
+        if min(self.extraction_turns, self.extraction_tokens, self.community_every, self.graph_max_coroutines) <= 0:
+            raise ValueError('Graphiti batch/community limits must be positive')
         if self.carryover_messages < 0 or not 0 <= self.search_threshold <= 1:
             raise ValueError('invalid carryover or search threshold')
         if not math.isfinite(self.retry_base_seconds) or self.retry_base_seconds < 0:
@@ -84,14 +94,22 @@ class ServiceSettings:
             embed_model_path=Path(required('BUMI_EMBED_MODEL_PATH')),
             api_key=required('BUMI_SERVICE_API_KEY'),
             memory_api_key=required('BUMI_MEMORY_API_KEY'),
+            neo4j_uri=os.getenv('BUMI_NEO4J_URI', 'bolt://127.0.0.1:7687'),
+            neo4j_user=os.getenv('BUMI_NEO4J_USER', 'neo4j'),
+            neo4j_password=required('BUMI_NEO4J_PASSWORD'),
+            reranker_model_path=Path(required('BUMI_RERANKER_MODEL_PATH')),
+            extraction_turns=int(os.getenv('BUMI_EXTRACTION_TURNS', '10')),
+            extraction_tokens=int(os.getenv('BUMI_EXTRACTION_TOKENS', '8000')),
+            community_every=int(os.getenv('BUMI_COMMUNITY_EVERY', '5')),
+            graph_max_coroutines=int(os.getenv('BUMI_GRAPH_MAX_COROUTINES', '3')),
             agent_id=os.getenv('BUMI_AGENT_ID', 'bumi_test_agent'),
             memory_provider=os.getenv('BUMI_MEMORY_PROVIDER', 'deepseek'),
             memory_model=os.getenv('BUMI_MEMORY_MODEL', 'deepseek-flash'),
             memory_base_url=os.getenv('BUMI_MEMORY_BASE_URL', 'https://api.deepseek.com/v1'),
-            embed_device=os.getenv('MEM0_EMBED_DEVICE', 'auto'),
+            embed_device=os.getenv('BUMI_EMBED_DEVICE', 'auto'),
             collection_name=os.getenv('BUMI_COLLECTION_NAME', 'bumi_mem_l3'),
-            read_timeout=float(os.getenv('BUMI_MEMORY_READ_TIMEOUT', '0.2')),
-            explicit_recall_timeout=float(os.getenv('BUMI_EXPLICIT_RECALL_TIMEOUT', '1.0')),
+            read_timeout=float(os.getenv('BUMI_MEMORY_READ_TIMEOUT', '30')),
+            explicit_recall_timeout=float(os.getenv('BUMI_EXPLICIT_RECALL_TIMEOUT', '30')),
             warmup_timeout=float(os.getenv('BUMI_MEMORY_WARMUP_TIMEOUT', '120')),
             max_messages=int(os.getenv('BUMI_MAX_MESSAGES', '20')),
             max_l1_tokens=int(os.getenv('BUMI_MAX_L1_TOKENS', '8000')),
@@ -117,43 +135,41 @@ def memory_provider_config(settings: ServiceSettings):
 
 
 def build_service_engine(settings: ServiceSettings):
-    """Loads server resources only at startup. Never constructs a Chat Provider."""
-    if not settings.embed_model_path.is_dir():
-        raise ValueError('BUMI_EMBED_MODEL_PATH must point to an existing local model directory')
-    # Set before importing the Mem0 SDK, disabling telemetry and automatic downloads.
-    os.environ['MEM0_TELEMETRY'] = 'False'
-    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    """Graphiti-only runtime. Never imports or constructs Mem0."""
     from bumi_mem.consolidator import ConsolidatorConfig, SessionConsolidator
     from bumi_mem.engine import BumiMemory, BumiMemoryConfig
-    from bumi_mem.long_term import Mem0AdapterConfig, Mem0LongTermMemory
-    from bumi_mem.memory_access import SerialMemoryAccess
+    from bumi_mem.async_memory_access import AsyncMemoryAccess
+    from bumi_mem.graphiti_memory import GraphitiConfig, GraphitiLongTermMemory
     from bumi_mem.providers import OpenAICompatibleProvider
     from bumi_mem.session_store import SQLiteSessionStore
     from bumi_mem.token_counter import ApproxTokenCounter
 
+    for path in (settings.embed_model_path, settings.reranker_model_path):
+        if not Path(path).is_dir():
+            raise ValueError(f'Expected existing local model directory: {path}')
+    if not settings.neo4j_password:
+        raise ValueError('BUMI_NEO4J_PASSWORD must be configured')
+    os.environ.setdefault('GRAPHITI_TELEMETRY_ENABLED', 'false')
     provider = memory_provider_config(settings)
     counter = ApproxTokenCounter()
     store = SQLiteSessionStore(settings.db_path)
-    adapter = Mem0AdapterConfig(data_dir=settings.data_dir / 'bumi_mem_l3',
-                                embed_model=settings.embed_model_path, embed_device=settings.embed_device,
-                                collection_name=settings.collection_name, memory_max_tokens=settings.memory_max_tokens)
-    access = SerialMemoryAccess(lambda: Mem0LongTermMemory(provider, adapter), read_timeout=settings.read_timeout)
-    consolidator = SessionConsolidator(
-        store=store, long_term=access, summary_provider=OpenAICompatibleProvider(provider),
-        memory_provider_name=settings.memory_provider, memory_token_counter=counter,
-        config=ConsolidatorConfig(carryover_messages=settings.carryover_messages,
-                                 local_chunk_tokens=settings.local_chunk_tokens,
-                                 summary_max_tokens=settings.summary_max_tokens,
-                                 max_attempts=settings.max_attempts,
-                                 retry_base_seconds=settings.retry_base_seconds))
-    return BumiMemory(store=store, long_term=access, chat_provider=None,
-                      consolidator=consolidator, chat_token_counter=counter, auto_start=False,
-                      config=BumiMemoryConfig(max_messages=settings.max_messages,
-                                             max_l1_tokens=settings.max_l1_tokens, top_k=settings.top_k,
-                                             search_threshold=settings.search_threshold,
-                                             memory_read_timeout=settings.read_timeout,
-                                             explicit_recall_timeout=settings.explicit_recall_timeout,
-                                             memory_warmup_timeout=settings.warmup_timeout,
-                                             prefetch_ttl_seconds=settings.prefetch_ttl_seconds,
-                                             prefetch_max_growth_chars=settings.prefetch_max_growth_chars))
+    with store._connect() as conn:
+        if conn.execute("SELECT 1 FROM memory_jobs WHERE COALESCE(json_extract(payload_json,'$.settings.backend'),'legacy') != 'graphiti' AND kind='consolidate' LIMIT 1").fetchone():
+            raise ValueError('This is a legacy data directory; select a NEW BUMI_DATA_DIR for the Graphiti experiment')
+    graph_config = GraphitiConfig(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password,
+        settings.data_dir / 'graphiti', settings.embed_model_path, settings.reranker_model_path,
+        device=settings.embed_device, community_every=settings.community_every,
+        max_coroutines=settings.graph_max_coroutines)
+    access = AsyncMemoryAccess(lambda: GraphitiLongTermMemory(provider, graph_config), read_timeout=settings.read_timeout)
+    consolidator = SessionConsolidator(store=store, long_term=access,
+        summary_provider=OpenAICompatibleProvider(provider), memory_provider_name=settings.memory_provider,
+        memory_token_counter=counter, config=ConsolidatorConfig(backend='graphiti',
+            extraction_turns=settings.extraction_turns, extraction_tokens=settings.extraction_tokens,
+            carryover_messages=max(settings.carryover_messages, settings.max_messages),
+            local_chunk_tokens=settings.extraction_tokens, max_attempts=settings.max_attempts))
+    return BumiMemory(store=store, long_term=access, chat_provider=None, consolidator=consolidator,
+        chat_token_counter=counter, auto_start=False, config=BumiMemoryConfig(
+            semantic_state_enabled=False, max_messages=settings.max_messages,
+            max_l1_tokens=settings.max_l1_tokens, memory_read_timeout=settings.read_timeout,
+            explicit_recall_timeout=settings.explicit_recall_timeout,
+            memory_warmup_timeout=settings.warmup_timeout))

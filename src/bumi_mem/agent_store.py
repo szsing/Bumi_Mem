@@ -107,7 +107,7 @@ class AgentStoreMixin:
             stats = conn.execute('SELECT COUNT(*) n,COALESCE(SUM(m.token_count),0) tokens FROM shared_l1 w '
                                  'JOIN messages m USING(message_id) WHERE w.agent_id=? AND w.context_only=0', (agent_id,)).fetchone()
             busy = conn.execute("SELECT 1 FROM interaction_turns WHERE agent_id=? AND status IN ('preparing','awaiting_reply')", (agent_id,)).fetchone()
-            if not busy and (stats['n'] >= max_messages or stats['tokens'] >= max_l1_tokens):
+            if settings.get('backend') != 'graphiti' and not busy and (stats['n'] >= max_messages or stats['tokens'] >= max_l1_tokens):
                 self._submit_shared(conn, sid, reason='agent_event_boundary', settings=settings,
                                     carryover_messages=settings['carryover_messages'], max_attempts=settings['max_attempts'])
             if request.kind == 'local_control':

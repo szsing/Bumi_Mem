@@ -208,7 +208,14 @@ def test_cli_build_defers_native_sdk_construction(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, '_token_counter', lambda _: FixedTokenCounter(1))
     monkeypatch.setattr(cli, 'OpenAICompatibleProvider', lambda _: FakeTextProvider())
     construction = []
-    monkeypatch.setattr(cli, 'Mem0LongTermMemory', lambda *a, **k: (construction.append(threading.get_ident()), FakeLongTermMemory())[1])
+    class Backend:
+        async def get_all(self, **kwargs):
+            return []
+        async def close(self):
+            pass
+    monkeypatch.setattr(cli, 'GraphitiLongTermMemory', lambda *a, **k: (construction.append(threading.get_ident()), Backend())[1])
+    for name in ('BUMI_NEO4J_PASSWORD', 'BUMI_EMBED_MODEL_PATH', 'BUMI_RERANKER_MODEL_PATH'):
+        monkeypatch.setenv(name, 'test')
     engine = cli.build_engine(args)
     try:
         assert construction == []

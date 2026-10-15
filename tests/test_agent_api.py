@@ -119,10 +119,16 @@ def test_second_http_process_cannot_open_same_data_directory(harness):
 
 def test_factory_constructs_only_memory_provider_and_defers_sdk(tmp_path, monkeypatch):
     import bumi_mem.providers as providers
-    import bumi_mem.long_term as ltm
+    import bumi_mem.graphiti_memory as ltm
     from bumi_mem.providers import FakeTextProvider
     created, native = [], []
-    backend = FakeLongTermMemory()
+    class AsyncBackend:
+        warmup_calls = []
+        async def warmup(self, *, query):
+            self.warmup_calls.append(query)
+        async def close(self):
+            pass
+    backend = AsyncBackend()
     def summary(config):
         created.append(config)
         return FakeTextProvider('memory')
@@ -130,10 +136,11 @@ def test_factory_constructs_only_memory_provider_and_defers_sdk(tmp_path, monkey
         native.append((config,adapter))
         return backend
     monkeypatch.setattr(providers,'OpenAICompatibleProvider',summary)
-    monkeypatch.setattr(ltm,'Mem0LongTermMemory',memory_factory)
+    monkeypatch.setattr(ltm,'GraphitiLongTermMemory',memory_factory)
     model = tmp_path/'model'; model.mkdir()
     config = ServiceSettings(data_dir=tmp_path/'data',embed_model_path=model,api_key=KEY,
-                             memory_api_key='memory-secret',memory_model='memory-model')
+                             memory_api_key='memory-secret',memory_model='memory-model',
+                             reranker_model_path=model,neo4j_password='test-neo4j')
     engine = build_service_engine(config)
     try:
         assert engine.chat_provider is None

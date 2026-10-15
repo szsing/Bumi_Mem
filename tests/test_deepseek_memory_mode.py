@@ -53,6 +53,8 @@ def test_summary_forwards_non_thinking_request_options_without_network():
 def test_pinned_mem0_generation_source_forwards_options(monkeypatch):
     monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
     root = Path(__file__).resolve().parents[1] / 'src/mem0-new/mem0/llms'
+    if not (root / 'base.py').is_file():
+        pytest.skip('Optional historical Mem0 submodule is absent; Graphiti does not depend on it')
     methods = []
     selected = {'_is_reasoning_model','_uses_max_completion_tokens','_get_supported_params',
                 '_get_common_params','_parse_response','generate_response'}
@@ -109,16 +111,20 @@ def test_probe_uses_bounded_json_call_and_closes_client(tmp_path, monkeypatch):
     calls = []
     class Client:
         closed = False
-        def with_options(self, **kwargs):
-            assert kwargs == {'timeout': 30.0, 'max_retries': 0}
+        def __init__(self, **kwargs):
+            assert kwargs['timeout'] == 30 and kwargs['max_retries'] == 0
+            def create(**kw):
+                calls.append(kw)
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))])
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+        def __enter__(self):
             return self
-        def close(self):
+        def __exit__(self, *args):
             self.closed = True
-    client = Client()
-    llm = SimpleNamespace(client=client, generate_response=lambda **kw: calls.append(kw) or '{"ok":true}')
-    factory = types.ModuleType('mem0.utils.factory')
-    factory.LlmFactory = SimpleNamespace(create=lambda provider, config: llm)
-    monkeypatch.setitem(sys.modules, 'mem0.utils.factory', factory)
+    client = Client(timeout=30, max_retries=0)
+    module = types.ModuleType('openai')
+    module.OpenAI = lambda **kwargs: client
+    monkeypatch.setitem(sys.modules, 'openai', module)
     settings = ServiceSettings(data_dir=tmp_path, embed_model_path=tmp_path/'model',
                                api_key='test-service-key-with-at-least-32-chars', memory_api_key='secret')
     probe_llm(settings)

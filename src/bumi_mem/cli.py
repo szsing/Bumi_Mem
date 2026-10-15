@@ -12,8 +12,8 @@ from urllib.request import urlopen
 from bumi_mem.consolidator import ConsolidatorConfig, SessionConsolidator
 from bumi_mem.engine import BumiMemory, BumiMemoryConfig
 from bumi_mem.identity import UserIdentity
-from bumi_mem.long_term import Mem0AdapterConfig, Mem0LongTermMemory
-from bumi_mem.memory_access import SerialMemoryAccess
+from bumi_mem.graphiti_memory import GraphitiConfig, GraphitiLongTermMemory
+from bumi_mem.async_memory_access import AsyncMemoryAccess
 from bumi_mem.paths import DATA_ROOT, MODEL_ROOT, PROJECT_ROOT, configure_runtime
 from bumi_mem.providers import OpenAICompatibleProvider, ProviderConfig
 from bumi_mem.schemas import ConsolidationSubmission, ProviderConfigurationError
@@ -128,17 +128,21 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
 
     db_path = Path(args.db_path).expanduser().resolve() if args.db_path else DATA_ROOT / "bumi_memory.sqlite3"
     store = SQLiteSessionStore(db_path)
-    adapter_config = Mem0AdapterConfig(
-        data_dir=DATA_ROOT / "bumi_mem_l3",
-        embed_model=MODEL_ROOT / "Qwen3-Embedding-0.6B",
-        embed_device=args.embed_device,
-        collection_name=args.collection_name,
-        memory_max_tokens=(args.memory_max_tokens if args.memory_max_tokens is not None else
-                           (512 if args.memory_provider == "local" else int(os.getenv("MEM0_MEMORY_MAX_TOKENS", "4096")))),
+    with store._connect() as conn:
+        if conn.execute("SELECT 1 FROM memory_jobs WHERE COALESCE(json_extract(payload_json,'$.settings.backend'),'legacy') != 'graphiti' AND kind='consolidate' LIMIT 1").fetchone():
+            raise ValueError('Legacy data directory: choose a NEW BUMI_DATA_DIR for Graphiti')
+    adapter_config = GraphitiConfig(
+        uri=os.getenv('BUMI_NEO4J_URI', 'bolt://127.0.0.1:7687'),
+        user=os.getenv('BUMI_NEO4J_USER', 'neo4j'),
+        password=os.environ['BUMI_NEO4J_PASSWORD'],
+        data_dir=DATA_ROOT / 'graphiti',
+        embed_model=Path(os.environ['BUMI_EMBED_MODEL_PATH']),
+        reranker_model=Path(os.environ['BUMI_RERANKER_MODEL_PATH']),
+        device=args.embed_device,
+        community_every=int(os.getenv('BUMI_COMMUNITY_EVERY', '5')),
     )
-    # Construct the native SDK on its owning thread, not on the CLI thread.
-    l3 = SerialMemoryAccess(lambda: Mem0LongTermMemory(memory_config, adapter_config),
-                            read_timeout=args.memory_read_timeout)
+    l3 = AsyncMemoryAccess(lambda: GraphitiLongTermMemory(memory_config, adapter_config),
+                           read_timeout=args.memory_read_timeout)
     consolidator = SessionConsolidator(
         store=store,
         long_term=l3,
@@ -146,8 +150,10 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
         memory_provider_name=args.memory_provider,
         memory_token_counter=memory_counter,
         config=ConsolidatorConfig(
-            carryover_messages=args.carryover_messages,
-            local_chunk_tokens=args.local_chunk_tokens,
+            backend='graphiti', extraction_turns=int(os.getenv('BUMI_EXTRACTION_TURNS', '10')),
+            extraction_tokens=int(os.getenv('BUMI_EXTRACTION_TOKENS', '8000')),
+            carryover_messages=max(args.carryover_messages, args.max_messages),
+            local_chunk_tokens=int(os.getenv('BUMI_EXTRACTION_TOKENS', '8000')),
             summary_max_tokens=args.summary_max_tokens,
             max_attempts=args.memory_max_attempts,
             retry_base_seconds=args.memory_retry_base_seconds,
@@ -160,6 +166,7 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
         consolidator=consolidator,
         chat_token_counter=chat_counter,
         config=BumiMemoryConfig(
+            semantic_state_enabled=False,
             max_messages=args.max_messages,
             max_l1_tokens=args.max_l1_tokens,
             top_k=args.top_k,
@@ -208,9 +215,9 @@ def _help() -> None:
   /help                  显示帮助
   /user <id>             开发用身份绑定/切换；生产由可信声纹前端提供
   /logout                清除当前身份，不删除其记忆
-  /remember <text>        明确写入长期记忆，校验后返回确认与 memory_id
-  /read <memory-id>       仅按当前用户读取指定记忆
-  /memories              查看当前 user/agent 的 L3
+  /remember <text>        Graphiti 模式停用；由对话批次自动抽取
+  /read <memory-id>       Graphiti 模式不提供旧式单条记录查询
+  /memories              Graphiti 模式请使用 /search 和图调试接口
   /search <query>        手动检索 L3
   /session               查看当前 L1 和后台任务
   /jobs                  查看后台任务状态和错误
@@ -222,9 +229,9 @@ def _help() -> None:
   /new                   轮转共享短期窗口，按用户分别保存整理任务
   /discard               清空本 agent 的共享 L1，不影响已提交任务
   /forget <memory-id>     按来源撤回单条记忆（逻辑删除；旧库无来源时使用 /forget-all）
-  /core                  查看自己的已确认核心/状态记忆
+  /core                  旧状态数据仅作对照，不参与 Graphiti 上下文
   /forget-all            屏蔽当前 user/agent 的 L3，取消旧写入并后台清理
-  /quit                  退出；save 只保证记录/任务落盘，不保证 L3 已整理完
+  /quit                  退出；未满批次保留到下次启动，不强制抽取
 """)
 
 
@@ -380,6 +387,9 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
                     print("已取消。")
                 continue
             if text == "/quit":
+                if engine.consolidator.config.backend == 'graphiti':
+                    print("已退出；未满批次已保存，下次对话继续累计。")
+                    return
                 stats = engine.session_stats(user_id=args.user_id, agent_id=args.agent_id)
                 if stats.effective_messages:
                     action = input("输入 save / discard / cancel（save 按用户保存任务；discard 清空本 agent 所有用户的共享短期上下文）：").strip().lower()
@@ -428,7 +438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-base-url", default=None)
     parser.add_argument("--db-path", default=None)
     parser.add_argument("--collection-name", default=os.getenv("BUMI_COLLECTION_NAME", "bumi_mem_l3"))
-    parser.add_argument("--embed-device", choices=["auto", "cpu", "cuda"], default=os.getenv("MEM0_EMBED_DEVICE", "auto"))
+    parser.add_argument("--embed-device", choices=["auto", "cpu", "cuda"], default=os.getenv("BUMI_EMBED_DEVICE", "auto"))
     parser.add_argument("--max-messages", type=int, default=20)
     parser.add_argument("--max-l1-tokens", type=int, default=8000)
     parser.add_argument("--carryover-messages", type=int, default=20)
@@ -438,7 +448,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-answer-tokens", type=int, default=512)
     parser.add_argument("--summary-max-tokens", type=int, default=512)
     parser.add_argument("--memory-max-tokens", type=int, default=None)
-    parser.add_argument("--memory-read-timeout", type=float, default=0.2)
+    parser.add_argument("--memory-read-timeout", type=float, default=30.0)
     parser.add_argument(
         "--memory-warmup-timeout",
         type=float,

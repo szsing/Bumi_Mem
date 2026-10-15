@@ -269,10 +269,11 @@ def test_auth_input_limits_extra_fields_and_old_routes(harness):
     assert response.status_code == 413
 
 
-def test_openapi_contains_one_business_endpoint_and_health_ready(harness):
+def test_openapi_contains_context_debug_and_health_ready(harness):
     client, *_ = harness
     schema=client.get('/openapi.json').json()
-    assert [path for path in schema['paths'] if path.startswith('/v1/')] == ['/v1/memory/context']
+    assert {path for path in schema['paths'] if path.startswith('/v1/')} == {'/v1/memory/context', '/v1/memory/debug'}
+    assert client.get('/v1/memory/debug', params={'user_id':'A'}).status_code == 401
     properties=schema['components']['schemas']['ContextRequest']['properties']
     assert set(properties) == {'user_id','previous_ai_reply','query',
                                'query_occurred_at','previous_reply_occurred_at'}

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Sequence
 
 from bumi_mem.long_term import LongTermMemory
@@ -19,6 +19,9 @@ from bumi_mem.token_counter import TokenCounter
 
 @dataclass(slots=True)
 class ConsolidatorConfig:
+    backend: str = 'legacy'
+    extraction_turns: int = 10
+    extraction_tokens: int = 8000
     carryover_messages: int = 20
     local_chunk_tokens: int = 3500
     summary_max_tokens: int = 512
@@ -26,6 +29,8 @@ class ConsolidatorConfig:
     retry_base_seconds: float = 5.0
 
     def __post_init__(self) -> None:
+        if self.extraction_turns <= 0 or self.extraction_tokens <= 0:
+            raise ValueError('extraction limits must be positive')
         if self.carryover_messages < 0 or self.local_chunk_tokens <= 0 or self.summary_max_tokens <= 0:
             raise ValueError('invalid consolidation size limits')
         if self.max_attempts < 1 or self.retry_base_seconds < 0:
@@ -48,7 +53,7 @@ class SessionConsolidator:
         # resumption with a different provider after a deployment change.
         return {**asdict(self.config), 'provider': self.memory_provider_name,
                 'summary_model': self.summary_provider.config.model,
-                'extraction_prompt': MEMORY_EXTRACTION_INSTRUCTIONS}
+                'extraction_prompt': None if self.config.backend == 'graphiti' else MEMORY_EXTRACTION_INSTRUCTIONS}
 
     @staticmethod
     def _chat_messages(messages: Sequence[MessageRecord]) -> list[dict[str, str]]:
@@ -100,6 +105,18 @@ class SessionConsolidator:
         for turn in rounds:
             size = sum(self.memory_token_counter.count_text(m.to_extraction_message()["content"]) + 4
                        for m in turn)
+            if self.config.backend == 'graphiti' and size > limit:
+                if chunk:
+                    chunks.append(chunk)
+                    chunk, tokens = [], 0
+                for message in turn:
+                    cost = self.memory_token_counter.count_text(message.to_extraction_message()['content']) + 4
+                    if chunk and tokens + cost > limit:
+                        chunks.append(chunk)
+                        chunk, tokens = [], 0
+                    chunk.append(message)
+                    tokens += cost
+                continue
             if chunk and tokens + size > limit:
                 chunks.append(chunk)
                 chunk, tokens = [], 0
@@ -108,6 +125,26 @@ class SessionConsolidator:
         if chunk:
             chunks.append(chunk)
         return chunks
+
+    def _bounded_graph_messages(self, messages, limit):
+        result = []
+        for message in messages:
+            rest = message.content
+            while rest:
+                lo, hi = 1, len(rest)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    view = replace(message, content=rest[:mid]).to_extraction_message()
+                    if self.memory_token_counter.count_text(view['content']) + 4 <= limit:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                fragment = replace(message, content=rest[:lo])
+                if self.memory_token_counter.count_text(fragment.to_extraction_message()['content']) + 4 > limit:
+                    raise ValueError('Graph extraction token budget is too small for a source header')
+                result.append(fragment)
+                rest = rest[lo:]
+        return result
 
     def submit(self, session_id: str, *, reason: str) -> ConsolidationSubmission:
         return self.store.submit_shared(session_id, reason=reason, settings=self._settings(),
@@ -149,7 +186,7 @@ class SessionConsolidator:
                                     retry_delay=0, retryable=False)
                 return
             session = self.store.get_session(job.session_id)
-            if session.summary_status not in ('success', 'fallback'):
+            if settings.get('backend') != 'graphiti' and session.summary_status not in ('success', 'fallback'):
                 try:
                     summary = self.summary_provider.generate(summary_messages(self._chat_messages(messages)),
                                                              max_tokens=settings['summary_max_tokens'], temperature=0.0).strip()
@@ -165,11 +202,19 @@ class SessionConsolidator:
                     self.store.save_job_summary(job.job_id, owner,
                                                 summary=f'会话包含 {user_count} 条用户消息和 {assistant_count} 条机器人消息',
                                                 provider=self.summary_provider.name, status='fallback', error=str(exc))
+            if settings.get('backend') == 'graphiti':
+                messages = self._bounded_graph_messages(messages, settings['local_chunk_tokens'])
             chunks = (self._local_chunks(messages, token_limit=settings['local_chunk_tokens'])
-                      if settings['provider'] == 'local' else ([messages] if messages else []))
+                      if settings['provider'] == 'local' or settings.get('backend') == 'graphiti' else ([messages] if messages else []))
             self.store.ensure_chunks(job.job_id, owner, [self._chat_messages(c) for c in chunks])
             persisted = self.store.chunks(job.job_id)
-            restored = self._restore_extraction_chunks(persisted, sources)
+            if settings.get('backend') == 'graphiti':
+                restored = [json.loads(c['messages_json']) for c in persisted]
+                source_ids = {m.message_id for m in sources}
+                if any(m.get('source_message_id') not in source_ids for chunk in restored for m in chunk):
+                    raise MemoryWriteUncertainError('Graph fragment has no original source anchor')
+            else:
+                restored = self._restore_extraction_chunks(persisted, sources)
             for chunk, extraction_messages in zip(persisted, restored):
                 self.store.assert_current(job.job_id, owner)
                 if chunk['status'] == 'succeeded':
@@ -190,7 +235,7 @@ class SessionConsolidator:
                     {'source_message_id': m['source_message_id'], 'observed_at': m.get('observed_at', '')}
                     for m in extraction_messages if m.get('source_message_id')]
                 prompt = settings['extraction_prompt']
-                if TEMPORAL_EXTRACTION_INSTRUCTIONS not in prompt:
+                if settings.get('backend') != 'graphiti' and TEMPORAL_EXTRACTION_INSTRUCTIONS not in prompt:
                     prompt += '\n\n' + TEMPORAL_EXTRACTION_INSTRUCTIONS
                 try:
                     events = self.long_term.add_session(user_id=job.user_id, agent_id=job.agent_id,
