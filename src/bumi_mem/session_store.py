@@ -8,6 +8,7 @@ with the new conversation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -19,8 +20,9 @@ from typing import Any, Iterator, Sequence
 from uuid import uuid4
 
 from bumi_mem.schemas import (
-    ConsolidationSubmission, JobCancelledError, MemoryJob, MessageRecord,
-    SessionBlockedError, SessionRecord, SessionStats,
+    ConsolidationSubmission, JobCancelledError, MemoryJob, MemoryWriteUncertainError,
+    MessageRecord, SessionBlockedError, SessionRecord, SessionStats,
+    canonical_messages_digest,
 )
 
 
@@ -123,6 +125,21 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                 CREATE TABLE IF NOT EXISTS memory_worker_lease (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
                     expires_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS chunk_replay_auth (
+                    chunk_id TEXT PRIMARY KEY REFERENCES memory_chunks(chunk_id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL REFERENCES memory_jobs(job_id),
+                    user_id TEXT NOT NULL, agent_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                    input_digest TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('issued','executing','consumed')),
+                    issued_at REAL NOT NULL, consumed_at REAL,
+                    attempt INTEGER NOT NULL DEFAULT 0, last_error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS chunk_replay_audit (
+                    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chunk_id TEXT NOT NULL, job_id TEXT NOT NULL, event TEXT NOT NULL,
+                    user_id TEXT NOT NULL, agent_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                    input_digest TEXT NOT NULL, at REAL NOT NULL, detail TEXT NOT NULL DEFAULT ''
                 );
             """)
             columns = {r['name'] for r in conn.execute('PRAGMA table_info(messages)')}
@@ -626,6 +643,123 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                 conn.execute('UPDATE sessions SET status=?,consolidation_status=?,last_error=? WHERE session_id=?',
                              ('failed' if state == 'failed' else 'processing', state, error, row['session_id']))
 
+    @staticmethod
+    def chunk_input_digest(messages: Sequence[dict[str, Any]]) -> str:
+        """Stable identity of a chunk's source payload.
+
+        Delegates to the shared helper so the durable grant and the backend's
+        re-computation can never drift apart.
+        """
+        return canonical_messages_digest(messages)
+
+    def _grant_replays(self, conn: sqlite3.Connection, job_row: sqlite3.Row,
+                       scope: sqlite3.Row) -> list[str]:
+        """Issue one single-use replay authorization per uncertain chunk.
+
+        Only chunks of THIS failed job qualify. Any authorization left over from
+        an earlier decision is replaced, so a consumed or executing grant can
+        never be handed out twice.
+        """
+        chunks = conn.execute("SELECT chunk_id,messages_json FROM memory_chunks "
+                              "WHERE job_id=? AND status IN ('writing','uncertain') "
+                              "ORDER BY chunk_index", (job_row['job_id'],)).fetchall()
+        granted: list[str] = []
+        for chunk in chunks:
+            digest = self.chunk_input_digest(json.loads(chunk['messages_json']))
+            conn.execute('DELETE FROM chunk_replay_auth WHERE chunk_id=?', (chunk['chunk_id'],))
+            conn.execute('INSERT INTO chunk_replay_auth(chunk_id,job_id,user_id,agent_id,generation,'
+                         "input_digest,status,issued_at,attempt) VALUES(?,?,?,?,?,?,'issued',?,0)",
+                         (chunk['chunk_id'], job_row['job_id'], job_row['user_id'], job_row['agent_id'],
+                          job_row['generation'], digest, time.time()))
+            conn.execute('INSERT INTO chunk_replay_audit(chunk_id,job_id,event,user_id,agent_id,generation,'
+                         "input_digest,at,detail) VALUES(?,?,'granted',?,?,?,?,?,'explicit allow_replay')",
+                         (chunk['chunk_id'], job_row['job_id'], job_row['user_id'], job_row['agent_id'],
+                          job_row['generation'], digest, time.time()))
+            conn.execute("UPDATE memory_chunks SET status='pending' WHERE chunk_id=?", (chunk['chunk_id'],))
+            granted.append(chunk['chunk_id'])
+        return granted
+
+    def take_replay_authorization(self, *, chunk_id: str, user_id: str, agent_id: str,
+                                  generation: int, input_digest: str) -> dict[str, Any]:
+        """Atomically claim a single-use replay authorization for one chunk.
+
+        The row moves issued -> executing before any backend call, so a second
+        caller cannot obtain the same grant. Scope, generation and input
+        identity are re-checked here and in the adapter; a mismatch is recorded
+        and refused rather than silently allowed.
+        """
+        # A refusal must be durable. Raising inside the write transaction would
+        # roll the audit row back with it, so the claim is resolved to a value
+        # first and the audit is committed in its own transaction afterwards.
+        refusal: tuple[str, str, str] | None = None
+        result: dict[str, Any] | None = None
+        with self._connect(write=True) as conn:
+            row = conn.execute('SELECT * FROM chunk_replay_auth WHERE chunk_id=?', (chunk_id,)).fetchone()
+            if row is None:
+                refusal = ('no authorization was issued for this chunk', '', input_digest)
+            elif row['status'] != 'issued':
+                refusal = (f"authorization already {row['status']}", row['job_id'], row['input_digest'])
+            elif (row['user_id'], row['agent_id']) != (user_id, agent_id):
+                refusal = ('authorization belongs to another user/agent scope', row['job_id'], row['input_digest'])
+            elif row['generation'] != generation:
+                refusal = ('authorization belongs to a superseded memory generation',
+                           row['job_id'], row['input_digest'])
+            elif row['input_digest'] != input_digest:
+                refusal = ('chunk input changed since the authorization was issued',
+                           row['job_id'], row['input_digest'])
+            else:
+                changed = conn.execute("UPDATE chunk_replay_auth SET status='executing' "
+                                       "WHERE chunk_id=? AND status='issued'", (chunk_id,)).rowcount
+                if changed != 1:
+                    refusal = ('authorization claimed concurrently', row['job_id'], row['input_digest'])
+                else:
+                    conn.execute('INSERT INTO chunk_replay_audit(chunk_id,job_id,event,user_id,agent_id,'
+                                 "generation,input_digest,at,detail) "
+                                 "VALUES(?,?,'claimed',?,?,?,?,?,'single-use grant claimed')",
+                                 (chunk_id, row['job_id'], user_id, agent_id, generation,
+                                  row['input_digest'], time.time()))
+                    result = {'chunk_id': chunk_id, 'job_id': row['job_id'], 'generation': generation,
+                              'attempt': row['attempt'] + 1, 'digest': row['input_digest'],
+                              'user_id': user_id, 'agent_id': agent_id}
+        if refusal is not None:
+            reason, refused_job, refused_digest = refusal
+            with self._connect(write=True) as conn:
+                conn.execute('INSERT INTO chunk_replay_audit(chunk_id,job_id,event,user_id,agent_id,'
+                             "generation,input_digest,at,detail) VALUES(?,?,'refused',?,?,?,?,?,?)",
+                             (chunk_id, refused_job, user_id, agent_id, generation,
+                              refused_digest, time.time(), reason))
+            raise MemoryWriteUncertainError('Replay refused: ' + reason)
+        return result
+
+    def record_replay_outcome(self, *, chunk_id: str, success: bool, detail: str = '') -> None:
+        """Consume the grant on success; on failure leave it burnt, never reusable."""
+        with self._connect(write=True) as conn:
+            row = conn.execute('SELECT * FROM chunk_replay_auth WHERE chunk_id=?', (chunk_id,)).fetchone()
+            if row is None:
+                raise MemoryWriteUncertainError('Replay authorization disappeared mid-flight')
+            if success:
+                conn.execute("UPDATE chunk_replay_auth SET status='consumed',consumed_at=?,attempt=attempt+1,"
+                             'last_error=NULL WHERE chunk_id=?', (time.time(), chunk_id))
+                event = 'consumed'
+            else:
+                conn.execute("UPDATE chunk_replay_auth SET attempt=attempt+1,last_error=? WHERE chunk_id=?",
+                             (detail[:500], chunk_id))
+                event = 'failed'
+            conn.execute('INSERT INTO chunk_replay_audit(chunk_id,job_id,event,user_id,agent_id,generation,'
+                         "input_digest,at,detail) VALUES(?,?,?,?,?,?,?,?,?)",
+                         (chunk_id, row['job_id'], event, row['user_id'], row['agent_id'],
+                          row['generation'], row['input_digest'], time.time(), detail[:500]))
+
+    def replay_authorization(self, chunk_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute('SELECT * FROM chunk_replay_auth WHERE chunk_id=?', (chunk_id,)).fetchone()
+            return dict(row) if row else None
+
+    def replay_audit(self, *, job_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                'SELECT * FROM chunk_replay_audit WHERE job_id=? ORDER BY audit_id', (job_id,))]
+
     def retry_job(self, job_id: str, *, user_id: str, agent_id: str, max_attempts: int = 3,
                   allow_replay: bool = False) -> MemoryJob:
         with self._connect(write=True) as conn:
@@ -640,7 +774,8 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
             if (uncertain or (row['last_error'] or '').startswith('Legacy partial')) and not allow_replay:
                 raise ValueError('write outcome is unknown; inspect L3, then explicitly confirm replay')
             if allow_replay:
-                conn.execute("UPDATE memory_chunks SET status='pending' WHERE job_id=? AND status IN ('writing','uncertain')", (job_id,))
+                # Per-chunk, scope-bound, single-use grants persisted with the reset.
+                self._grant_replays(conn, row, scope)
             conn.execute("UPDATE memory_jobs SET status='queued',max_attempts=?,available_at=?,owner=NULL,lease_until=NULL,updated_at=? WHERE job_id=?",
                          (row['attempts'] + max_attempts, time.time(), utcnow(), job_id))
         return self.get_job(job_id)

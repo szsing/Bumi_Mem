@@ -118,7 +118,9 @@ def adapter(tmp_path, client):
     result._write_lock = asyncio.Lock()
     with result._db() as db:
         db.executescript('''CREATE TABLE ingestions(id TEXT PRIMARY KEY,group_id TEXT,state TEXT,payload TEXT,result TEXT,created_at REAL);
-            CREATE TABLE community_jobs(group_id TEXT PRIMARY KEY,built INTEGER DEFAULT 0,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,error TEXT);''')
+            CREATE TABLE community_jobs(group_id TEXT PRIMARY KEY,built INTEGER DEFAULT 0,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,error TEXT);
+            CREATE TABLE replay_audit(audit_id INTEGER PRIMARY KEY AUTOINCREMENT,ingestion_id TEXT NOT NULL,job_id TEXT NOT NULL,
+                event TEXT NOT NULL,at REAL NOT NULL,detail TEXT NOT NULL DEFAULT '');''')
     return result
 
 
@@ -237,3 +239,257 @@ def test_deepseek_transport_options_preserve_async_call():
     assert asyncio.run(bound(messages=[], response_format={'type': 'json_object'})) == {'ok': True}
     assert calls[0]['extra_body'] == {'thinking': {'type': 'disabled'}}
     assert calls[0]['response_format'] == {'type': 'json_object'}
+
+
+# ---------------------------------------------------------------------------
+# Explicit replay authorization: per-chunk, scope-bound, single-use.
+# ---------------------------------------------------------------------------
+
+from bumi_mem.long_term import FakeLongTermMemory
+from bumi_mem.schemas import canonical_messages_digest
+
+
+class WriteThenFail(FakeLongTermMemory):
+    """Mirrors a lost response: the write may already have landed.
+
+    Fails only the FIRST attempt. That is what makes a granted replay able to
+    succeed later, and lets the tests distinguish "retry refused" from "retry
+    ran and failed again". The counter is per-instance so tests stay isolated.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    def add_session(self, **kwargs):
+        self.attempts += 1
+        if self.attempts > 1:
+            return super().add_session(**kwargs)
+        super().add_session(**kwargs)
+        raise OSError('response lost after the write may have landed')
+
+
+def uncertain_engine(tmp_path, long_term=None):
+    """One completed turn is enough to queue a batch whose write then fails."""
+    engine, store, memory, _, _ = make_engine(
+        tmp_path, long_term=long_term if long_term is not None else WriteThenFail())
+    engine.config.semantic_state_enabled = False
+    engine.consolidator.config.backend = 'graphiti'
+    engine.consolidator.config.extraction_turns = 1
+    engine.consolidator.config.extraction_tokens = 8000
+    return engine, store, memory
+
+
+def make_uncertain(tmp_path):
+    """Drive one real batch until its write outcome is unknown."""
+    engine, store, memory = uncertain_engine(tmp_path)
+    chat_turn(engine, '我叫小星，我最喜欢三角龙。')
+    job = engine.memory_jobs(user_id='u1', agent_id='a1')[0]
+    assert engine.worker.run_once()
+    assert store.get_job(job.job_id).status == 'failed'
+    chunks = store.chunks(job.job_id)
+    assert chunks and all(c['status'] == 'uncertain' for c in chunks)
+    return engine, store, memory, job, chunks
+
+
+def test_failed_write_plain_retry_refused_then_granted_replay_succeeds(tmp_path):
+    engine, store, memory, job, chunks = make_uncertain(tmp_path)
+    writes_before = len(memory.add_calls)
+    # (a) first failure left the outcome unknown
+    assert store.get_job(job.job_id).status == 'failed'
+    assert store.replay_authorization(chunks[0]['chunk_id']) is None
+    # (b) an ordinary retry cannot silently re-run an uncertain write
+    with pytest.raises(ValueError, match='unknown'):
+        engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1')
+    assert len(memory.add_calls) == writes_before
+    # (c) explicit authorization is issued and persisted with the reset
+    engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
+    for chunk in chunks:
+        grant = store.replay_authorization(chunk['chunk_id'])
+        assert grant['status'] == 'issued'
+        assert (grant['user_id'], grant['agent_id']) == ('u1', 'a1')
+        assert grant['generation'] == store.get_job(job.job_id).generation
+        # Granting authorizes the replay; it does not itself rewrite the chunk.
+        assert store.chunks(job.job_id)[0]['status'] == 'pending'
+    # (d) the granted replay executes for real and succeeds
+    assert engine.worker.run_once()
+    assert store.get_job(job.job_id).status == 'succeeded'
+    assert len(memory.add_calls) == writes_before + 1
+    assert memory.add_calls[-1]['replay_authorization'] is not None
+    for chunk in chunks:
+        assert store.chunks(job.job_id)[0]['status'] == 'succeeded'
+        assert store.replay_authorization(chunk['chunk_id'])['status'] == 'consumed'
+    events = [row['event'] for row in store.replay_audit(job_id=job.job_id)]
+    assert 'granted' in events and 'claimed' in events and 'consumed' in events
+
+
+def test_replay_grant_is_single_use(tmp_path):
+    engine, store, memory, job, chunks = make_uncertain(tmp_path)
+    engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
+    chunk_id = chunks[0]['chunk_id']
+    digest = store.chunk_input_digest(json.loads(chunks[0]['messages_json']))
+    grant = store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                            generation=store.get_job(job.job_id).generation,
+                                            input_digest=digest)
+    assert grant['chunk_id'] == chunk_id
+    # The same authorization cannot be claimed a second time.
+    with pytest.raises(MemoryWriteUncertainError, match='already executing'):
+        store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                        generation=store.get_job(job.job_id).generation,
+                                        input_digest=digest)
+    store.record_replay_outcome(chunk_id=chunk_id, success=True)
+    with pytest.raises(MemoryWriteUncertainError):
+        store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                        generation=store.get_job(job.job_id).generation,
+                                        input_digest=digest)
+
+
+def test_replay_failure_burns_grant_and_needs_a_new_one(tmp_path):
+    class FailAgain(WriteThenFail):
+        """Fails the initial write AND the first granted replay."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.replay_attempts = 0
+
+        def add_session(self, **kwargs):
+            if kwargs.get('replay_authorization') is not None:
+                self.replay_attempts += 1
+                if self.replay_attempts == 1:
+                    raise OSError('replay failed again')
+            return super().add_session(**kwargs)
+
+    engine, store, memory = uncertain_engine(tmp_path, long_term=FailAgain())
+    chat_turn(engine, '我叫小星')
+    job = engine.memory_jobs(user_id='u1', agent_id='a1')[0]
+    assert engine.worker.run_once()
+    chunk_id = store.chunks(job.job_id)[0]['chunk_id']
+    engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
+    assert engine.worker.run_once()
+    # The replay failed: still unknown, and the grant is burnt rather than reusable.
+    assert store.get_job(job.job_id).status == 'failed'
+    grant = store.replay_authorization(chunk_id)
+    assert grant['status'] == 'executing'
+    assert grant['attempt'] == 1 and grant['last_error']
+    with pytest.raises(MemoryWriteUncertainError):
+        store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                        generation=store.get_job(job.job_id).generation,
+                                        input_digest=store.chunk_input_digest(
+                                            json.loads(store.chunks(job.job_id)[0]['messages_json'])))
+    events = [row['event'] for row in store.replay_audit(job_id=job.job_id)]
+    assert events.count('granted') == 1 and 'failed' in events
+    # A fresh authorization is required before another attempt.
+    FailAgain.calls = 0
+    engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
+    assert store.replay_authorization(chunk_id)['status'] == 'issued'
+    assert engine.worker.run_once()
+    assert store.get_job(job.job_id).status == 'succeeded'
+
+
+def test_replay_grant_cannot_cross_scope_or_generation(tmp_path):
+    engine, store, memory, job, chunks = make_uncertain(tmp_path)
+    chunk_id = chunks[0]['chunk_id']
+    digest = store.chunk_input_digest(json.loads(chunks[0]['messages_json']))
+    generation = store.get_job(job.job_id).generation
+    engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
+    with pytest.raises(MemoryWriteUncertainError, match='another user/agent scope'):
+        store.take_replay_authorization(chunk_id=chunk_id, user_id='u2', agent_id='a1',
+                                        generation=generation, input_digest=digest)
+    with pytest.raises(MemoryWriteUncertainError, match='superseded memory generation'):
+        store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                        generation=generation + 1, input_digest=digest)
+    with pytest.raises(MemoryWriteUncertainError, match='input changed'):
+        store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                        generation=generation, input_digest='deadbeef')
+    # The refusals are recorded, and the grant is still unused and claimable.
+    refused = [r for r in store.replay_audit(job_id=job.job_id) if r['event'] == 'refused']
+    assert len(refused) == 3
+    assert store.replay_authorization(chunk_id)['status'] == 'issued'
+    assert store.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                          generation=generation, input_digest=digest)
+
+
+def test_replay_authorization_survives_restart(tmp_path):
+    from bumi_mem.session_store import SQLiteSessionStore
+    engine, store, memory, job, chunks = make_uncertain(tmp_path)
+    chunk_id = chunks[0]['chunk_id']
+    engine.retry_memory_job(job.job_id, user_id='u1', agent_id='a1', allow_replay=True)
+    digest = store.chunk_input_digest(json.loads(chunks[0]['messages_json']))
+    engine.close()
+    # A brand-new store over the same file still enforces single use.
+    reopened = SQLiteSessionStore(tmp_path / 'bumi.sqlite3')
+    assert reopened.replay_authorization(chunk_id)['status'] == 'issued'
+    grant = reopened.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                              generation=reopened.get_job(job.job_id).generation,
+                                              input_digest=digest)
+    assert grant['attempt'] == 1
+    reopened.record_replay_outcome(chunk_id=chunk_id, success=False, detail='process died')
+    assert reopened.replay_authorization(chunk_id)['status'] == 'executing'
+    with pytest.raises(MemoryWriteUncertainError):
+        reopened.take_replay_authorization(chunk_id=chunk_id, user_id='u1', agent_id='a1',
+                                          generation=reopened.get_job(job.job_id).generation,
+                                          input_digest=digest)
+
+
+def test_journal_refuses_incomplete_write_without_grant(tmp_path, raw_episode_modules):
+    class Client:
+        calls = 0
+
+        async def add_episode_bulk(self, episodes, **kwargs):
+            self.calls += 1
+            return types.SimpleNamespace(episodes=[types.SimpleNamespace(uuid='ep')], nodes=[], edges=[])
+
+    async def run():
+        client = Client()
+        memory = adapter(tmp_path, client)
+        messages = [dict(role='user', content='我喜欢恐龙', observed_at='2026-10-15T08:00:00+08:00')]
+        meta = dict(consolidation_id='batch1', job_id='job1', memory_generation=3)
+        await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        assert client.calls == 1
+        with memory._db() as db:                     # simulate an interrupted write
+            db.execute("UPDATE ingestions SET state='writing'")
+        with pytest.raises(MemoryWriteUncertainError, match='incomplete'):
+            await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        assert client.calls == 1                     # no blind re-entry
+    asyncio.run(run())
+
+
+def test_journal_accepts_only_matching_grant_and_audits(tmp_path, raw_episode_modules):
+    class Client:
+        calls = 0
+
+        async def add_episode_bulk(self, episodes, **kwargs):
+            self.calls += 1
+            return types.SimpleNamespace(episodes=[types.SimpleNamespace(uuid='ep')], nodes=[], edges=[])
+
+    async def run():
+        client = Client()
+        memory = adapter(tmp_path, client)
+        messages = [dict(role='user', content='我喜欢恐龙', observed_at='2026-10-15T08:00:00+08:00')]
+        meta = dict(consolidation_id='batch1', job_id='job1', memory_generation=3)
+        digest = canonical_messages_digest(messages)
+        good = dict(chunk_id='batch1', user_id='u', agent_id='a', generation=3, digest=digest)
+        await memory.add_session(user_id='u', agent_id='a', messages=messages, metadata=meta)
+        with memory._db() as db:
+            db.execute("UPDATE ingestions SET state='writing'")
+        # Wrong chunk, wrong scope, wrong generation and wrong input are all refused.
+        for bad in ({'digest': digest, 'user_id': 'u', 'agent_id': 'a', 'generation': 3},
+                    {**good, 'chunk_id': 'other'},
+                    {**good, 'user_id': 'someone_else'},
+                    {**good, 'generation': 4},
+                    {**good, 'digest': 'deadbeef'}):
+            with pytest.raises(MemoryWriteUncertainError):
+                await memory.add_session(user_id='u', agent_id='a', messages=messages,
+                                         metadata=meta, replay_authorization=bad)
+        assert client.calls == 1
+        # A matching grant reopens the write exactly once.
+        receipt = await memory.add_session(user_id='u', agent_id='a', messages=messages,
+                                           metadata=meta, replay_authorization=good)
+        assert client.calls == 2 and receipt[0]['episode_uuids'] == ['ep']
+        events = [row['event'] for row in memory.replay_audit('batch1')]
+        assert 'accepted' in events and 'succeeded' in events
+        # Once complete with identical input, the original receipt is returned.
+        again = await memory.add_session(user_id='u', agent_id='a', messages=messages,
+                                         metadata=meta, replay_authorization=good)
+        assert client.calls == 2 and again == receipt
+    asyncio.run(run())

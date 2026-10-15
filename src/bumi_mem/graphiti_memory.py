@@ -18,7 +18,7 @@ from typing import Any
 
 from bumi_mem.identity import require_pair
 from bumi_mem.providers import ProviderConfig, bind_provider_request_options
-from bumi_mem.schemas import MemoryWriteUncertainError
+from bumi_mem.schemas import MemoryWriteUncertainError, canonical_messages_digest
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,10 @@ class GraphitiLongTermMemory:
                     group_id TEXT PRIMARY KEY, built INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
                     error TEXT);
+                CREATE TABLE IF NOT EXISTS replay_audit (
+                    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ingestion_id TEXT NOT NULL, job_id TEXT NOT NULL, event TEXT NOT NULL,
+                    at REAL NOT NULL, detail TEXT NOT NULL DEFAULT '');
             ''')
         device = None if config.device == 'auto' else config.device
 
@@ -125,7 +129,8 @@ class GraphitiLongTermMemory:
         await self.client.embedder.create(query)
         await self.client.cross_encoder.rank(query, [query])
 
-    async def add_session(self, *, user_id, agent_id, messages, metadata, prompt=None):
+    async def add_session(self, *, user_id, agent_id, messages, metadata, prompt=None,
+                          replay_authorization=None):
         from graphiti_core.nodes import EpisodeType
         from graphiti_core.utils.bulk_utils import RawEpisode
         group = graph_group(user_id, agent_id)
@@ -139,9 +144,14 @@ class GraphitiLongTermMemory:
                     if previous[1] != payload:
                         raise MemoryWriteUncertainError('Ingestion identity reused with different source data')
                     if previous[0] == 'complete':
+                        # Already succeeded with identical input: return the original receipt.
                         return json.loads(previous[2])
-                    raise MemoryWriteUncertainError('Prior Graphiti ingestion is incomplete; inspect graph before replay')
-                db.execute('INSERT INTO ingestions VALUES(?,?,?, ?,NULL,?)', (key, group, 'writing', payload, time.time()))
+                    # Incomplete write. A replay may proceed ONLY with a grant that
+                    # the durable store issued for this exact chunk, scope and input.
+                    self._assert_replay_grant(replay_authorization, key, user_id, agent_id, metadata, messages)
+                    self._audit_replay(key, metadata, 'accepted', 'journal reopened under explicit grant')
+                db.execute('INSERT OR REPLACE INTO ingestions VALUES(?,?,?, ?,NULL,?)',
+                           (key, group, 'writing', payload, time.time()))
             try:
                 # Message headers carry original timestamps and identities.
                 # No business extraction instructions or entity whitelist.
@@ -161,9 +171,40 @@ class GraphitiLongTermMemory:
                     db.execute("UPDATE ingestions SET state='complete',result=? WHERE id=?",
                                (json.dumps(receipt), key))
                     db.execute('INSERT OR IGNORE INTO community_jobs(group_id) VALUES(?)', (group,))
+                if replay_authorization:
+                    self._audit_replay(key, metadata, 'succeeded', 'granted replay produced a receipt')
                 return receipt
             except BaseException as exc:
+                self._audit_replay(key, metadata, 'failed', f'{type(exc).__name__}: {exc}')
                 raise MemoryWriteUncertainError('Graphiti write outcome uncertain; automatic replay disabled') from exc
+
+    def _assert_replay_grant(self, grant, key, user_id, agent_id, metadata, messages) -> None:
+        """Refuse to re-enter an incomplete write without a valid single-use grant."""
+        if not grant:
+            raise MemoryWriteUncertainError(
+                'Prior Graphiti ingestion is incomplete; inspect the graph and issue an explicit replay')
+        if grant.get('chunk_id') != key:
+            raise MemoryWriteUncertainError('Replay grant belongs to a different chunk')
+        if (grant.get('user_id'), grant.get('agent_id')) != (user_id, agent_id):
+            raise MemoryWriteUncertainError('Replay grant belongs to another user/agent scope')
+        generation = metadata.get('memory_generation')
+        if generation is not None and grant.get('generation') != generation:
+            raise MemoryWriteUncertainError('Replay grant belongs to a superseded memory generation')
+        expected = canonical_messages_digest(messages)
+        if grant.get('digest') != expected:
+            raise MemoryWriteUncertainError('Replay grant input does not match the stored chunk')
+
+    def _audit_replay(self, key, metadata, event, detail) -> None:
+        with self._db() as db:
+            db.execute('INSERT INTO replay_audit(ingestion_id,job_id,event,at,detail) VALUES(?,?,?,?,?)',
+                       (key, str(metadata.get('job_id', '')), event, time.time(), detail[:500]))
+
+    def replay_audit(self, ingestion_id: str) -> list[dict]:
+        """Read back the journal's own replay trail (grants accepted/refused/outcome)."""
+        with self._db() as db:
+            rows = db.execute('SELECT event,at,detail FROM replay_audit '
+                              'WHERE ingestion_id=? ORDER BY audit_id', (ingestion_id,)).fetchall()
+        return [{'event': row[0], 'at': row[1], 'detail': row[2]} for row in rows]
 
     async def search(self, *, user_id, agent_id, query, **_legacy_options):
         group = graph_group(user_id, agent_id)

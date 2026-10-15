@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from bumi_mem.temporal import normalize_relative_dates
+
+
+def canonical_messages_digest(messages: Sequence[dict[str, Any]]) -> str:
+    """Stable digest of one chunk's source messages.
+
+    Single source of truth for replay authorization: the durable store binds a
+    grant to this digest, and the backend re-derives it before re-entering an
+    incomplete write, so a changed chunk can never inherit an old grant.
+    """
+    canonical = json.dumps([{k: m.get(k) for k in sorted(m)} for m in messages],
+                           ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode('utf8')).hexdigest()
 
 
 @dataclass(slots=True, frozen=True)

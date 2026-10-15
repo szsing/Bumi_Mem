@@ -64,13 +64,9 @@ class LongTermMemory(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def add_session(
-        self,
-        *,
-        user_id: str,
-        agent_id: str,
-        messages: Sequence[dict[str, str]],
-        metadata: dict[str, Any],
-        prompt: str,
+        self, *, user_id: str, agent_id: str, messages: Sequence[dict[str, str]],
+        metadata: dict[str, Any], prompt: str,
+        replay_authorization: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def get_all(self, *, user_id: str, agent_id: str) -> list[dict[str, Any]]: ...
@@ -221,13 +217,9 @@ class Mem0LongTermMemory:
             raise MemoryScopeError('metadata cannot override memory ownership or identity')
 
     def add_session(
-        self,
-        *,
-        user_id: str,
-        agent_id: str,
-        messages: Sequence[dict[str, str]],
-        metadata: dict[str, Any],
-        prompt: str,
+        self, *, user_id: str, agent_id: str, messages: Sequence[dict[str, str]],
+        metadata: dict[str, Any], prompt: str,
+        replay_authorization: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         require_pair(user_id, agent_id)
         self._check_metadata(metadata)
@@ -372,13 +364,9 @@ class FakeLongTermMemory:
         return self._rows_for_scope(self.memories.get((user_id, agent_id), [])[:top_k], user_id, agent_id)
 
     def add_session(
-        self,
-        *,
-        user_id: str,
-        agent_id: str,
-        messages: Sequence[dict[str, str]],
-        metadata: dict[str, Any],
-        prompt: str,
+        self, *, user_id: str, agent_id: str, messages: Sequence[dict[str, str]],
+        metadata: dict[str, Any], prompt: str,
+        replay_authorization: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         call = {
             "user_id": user_id,
@@ -386,6 +374,7 @@ class FakeLongTermMemory:
             "messages": [dict(item) for item in messages],
             "metadata": dict(metadata),
             "prompt": prompt,
+            "replay_authorization": replay_authorization,
         }
         self.add_calls.append(call)
         if self.fail_add_count > 0:

@@ -219,7 +219,8 @@ class SessionConsolidator:
                 self.store.assert_current(job.job_id, owner)
                 if chunk['status'] == 'succeeded':
                     continue
-                if chunk['status'] != 'pending':
+                prior_status = chunk['status']
+                if prior_status != 'pending':
                     raise MemoryWriteUncertainError('chunk write outcome unknown; explicit replay required')
                 if not extraction_messages:
                     self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='succeeded', events=[])
@@ -237,16 +238,33 @@ class SessionConsolidator:
                 prompt = settings['extraction_prompt']
                 if settings.get('backend') != 'graphiti' and TEMPORAL_EXTRACTION_INSTRUCTIONS not in prompt:
                     prompt += '\n\n' + TEMPORAL_EXTRACTION_INSTRUCTIONS
+                # An explicit replay authorization, if one was issued for exactly
+                # this chunk, is claimed once here and then consumed or burnt.
+                grant = None
+                if settings.get('backend') == 'graphiti' and self.store.replay_authorization(chunk['chunk_id']):
+                    grant = self.store.take_replay_authorization(
+                        chunk_id=chunk['chunk_id'], user_id=job.user_id, agent_id=job.agent_id,
+                        generation=job.generation,
+                        input_digest=self.store.chunk_input_digest(extraction_messages))
                 try:
                     events = self.long_term.add_session(user_id=job.user_id, agent_id=job.agent_id,
                                                        messages=extraction_messages, metadata=metadata,
-                                                       prompt=prompt)
+                                                       prompt=prompt, replay_authorization=grant)
                 except RetryableMemoryError as exc:
+                    if grant:
+                        self.store.record_replay_outcome(chunk_id=chunk['chunk_id'], success=False,
+                                                         detail=f'retryable failure during replay: {exc}')
                     self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='pending', error=str(exc))
                     raise
                 except Exception as exc:
+                    if grant:
+                        self.store.record_replay_outcome(chunk_id=chunk['chunk_id'], success=False,
+                                                         detail=f'{type(exc).__name__}: {exc}')
                     self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='uncertain', error=str(exc))
                     raise MemoryWriteUncertainError(f'Write outcome unknown: {exc}') from exc
+                if grant:
+                    self.store.record_replay_outcome(chunk_id=chunk['chunk_id'], success=True,
+                                                     detail='replay produced a receipt')
                 self.store.set_chunk(job.job_id, owner, chunk['chunk_id'], status='succeeded', events=events)
             self.store.finish_job(job.job_id, owner)
         except JobCancelledError:
