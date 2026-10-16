@@ -12,7 +12,7 @@ from typing import Any, Sequence
 from bumi_mem.schemas import MessageRecord
 from bumi_mem.turn_prompt import _core_description, _event_description, _memory_body, _STATUS_TEXT
 
-MAX_REFERENCE_CHARS = 6000
+MAX_REFERENCE_CHARS = 24000
 MAX_HISTORY_ROWS = 16
 
 
@@ -60,7 +60,8 @@ def _reference_item(row: dict[str, Any]) -> dict[str, Any] | None:
 
 def _bounded_references(refs, max_chars):
     selected, seen, used = [], set(), 0
-    for row in reversed(refs):
+    from bumi_mem.recall_context import selection_order
+    for row in selection_order(refs):
         item = _reference_item(row)
         if item is None:
             continue
@@ -73,7 +74,8 @@ def _bounded_references(refs, max_chars):
             continue
         selected.append(item)
         used += size
-    selected.reverse()
+    if not any((r.get("metadata") or {}).get("backend")=="graphiti" for r in refs):
+        selected.reverse()
     return selected
 
 

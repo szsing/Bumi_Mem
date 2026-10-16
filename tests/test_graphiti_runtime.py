@@ -180,9 +180,12 @@ def test_combined_search_keeps_all_kinds_and_temporal_state(tmp_path):
 
 def test_community_retry_does_not_reingest_and_watermark_survives_restart(tmp_path):
     class Client:
+        driver = types.SimpleNamespace(graph_operations_interface=None)
         calls = 0
         fail = True
         async def build_communities(self, **kwargs):
+            assert kwargs['driver'] is not self.driver
+            assert self.driver.graph_operations_interface is None
             self.calls += 1
             if self.fail:
                 raise RuntimeError('offline')
@@ -207,6 +210,7 @@ def test_community_retry_does_not_reingest_and_watermark_survives_restart(tmp_pa
 
 def test_community_waits_for_all_chunks_of_a_batch(tmp_path):
     class Client:
+        driver = types.SimpleNamespace(graph_operations_interface=None)
         calls = 0
         async def build_communities(self, **kwargs):
             self.calls += 1

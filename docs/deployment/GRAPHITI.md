@@ -16,6 +16,17 @@
 - Graphiti 在长期运行的事件循环上使用 async SDK；前台查询不在后台写入后排队。CPU/GPU/数据库资源仍会竞争，需要服务器实测。
 - 每个分组完成 5 批后执行一次后台 community 重建；多个待更新批次合并，失败至少 60 秒后重试。分组重建会清除旧 community，期间可暂时缺少 community 结果。抽取不因 community 失败被重新执行。
 - 写入中断标记 uncertain，不盲目自动重放。不承诺跨 SQLite 和 Neo4j 的 exactly-once。
+- JSON-object 返回在单次 LLM 请求的重试边界内按上游 response_model 校验。
+  合法 JSON 但缺字段/字段类型错误，与 JSON 解析失败共用上游最多 4 次预算；
+  不增加整批图写入重试，不补默认字段、不更改抽取提示词。预算耗尽仍保留 uncertain。
+  每次请求的原始返回、schema 校验结果和耗时保存到
+  `BUMI_DATA_DIR/graphiti/llm-diagnostics/*.json`（文件 mode 600）；
+  文件包含原始对话，应按私有运行数据保存，不能发布到 Git 或公共报告。
+- 社区标签传播保留上游同步算法的正常收敛结果；检测到重复状态或超过
+  `max(32, 4 × 节点数)` 次迭代时，改用逐节点更新、平票保留当前标签的
+  加权传播，避免多重边引发双周期死循环。计算在线程中运行，不阻塞 async loop。
+  这是显式的社区聚类修复，不是关闭社区，也不更换 LLM 社区摘要提示词。
+  证据写入 `graphiti/community-clustering/*.json`，含是否使用收敛分支与实际分组。
 
 ## 1. 上传与 Python 环境
 

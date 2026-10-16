@@ -52,7 +52,7 @@ class GraphitiLongTermMemory:
     def __init__(self, llm: ProviderConfig, config: GraphitiConfig):
         from graphiti_core import Graphiti
         from graphiti_core.llm_client.config import LLMConfig
-        from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+        from bumi_mem.graphiti_llm import ValidatedGraphitiClient
         from graphiti_core.embedder.client import EmbedderClient, EmbedderConfig
         from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
         from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -102,10 +102,10 @@ class GraphitiLongTermMemory:
                 # local path. Inherit its ranking implementation unchanged.
                 self.model = CrossEncoder(str(config.reranker_model), device=device, local_files_only=True)
 
-        self.llm_client = OpenAIGenericClient(
+        self.llm_client = ValidatedGraphitiClient(
             config=LLMConfig(model=llm.model, small_model=llm.model,
                              api_key=llm.api_key, base_url=llm.base_url),
-            structured_output_mode='json_object')
+            structured_output_mode='json_object', diagnostic_dir=config.data_dir / 'llm-diagnostics')
         # Preserve the configured provider transport mode without changing any
         # upstream extraction prompt, response schema or generation method.
         completions = self.llm_client.client.chat.completions
@@ -301,7 +301,10 @@ class GraphitiLongTermMemory:
                 # Serialize graph mutation; foreground search does not take
                 # this lock. The durable watermark coalesces pending rebuilds.
                 async with self._write_lock:
-                    await self.client.build_communities(group_ids=[group])
+                    from bumi_mem.graphiti_community import community_driver
+                    scoped_driver = community_driver(self.client.driver,
+                        self.config.data_dir / 'community-clustering')
+                    await self.client.build_communities(group_ids=[group], driver=scoped_driver)
                 with self._db() as db:
                     db.execute('UPDATE community_jobs SET built=?,attempts=0,next_at=0,error=NULL WHERE group_id=?', (count, group))
             except Exception as exc:

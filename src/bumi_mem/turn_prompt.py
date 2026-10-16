@@ -22,7 +22,7 @@ from bumi_mem.schemas import MessageRecord
 TURN_REQUEST_PREFIX = '\x1fturn:'
 LEGACY_TURN_REQUEST_PREFIX = 'turn:'
 MAX_CLIENT_TURN_ID = 120
-MAX_REFERENCE_CHARS = 6000
+MAX_REFERENCE_CHARS = 24000
 MAX_HISTORY_ROWS = 16
 PERSISTENCE_UNCONFIRMED = '本轮新信息未确认长期保存；以下仍保留可靠读取到的既有记忆。'
 REFERENCES_OMITTED = '部分长期引用未展示，以下不是全部可用记忆。'
@@ -57,7 +57,8 @@ _RECALL_NOTE = {
 
 
 def _memory_body(row: dict[str, Any]) -> str:
-    return str(row.get('memory', row.get('text', row.get('data', '')))).strip()
+    from bumi_mem.recall_context import reference_body
+    return reference_body(row)
 
 
 def _inline_data(value: Any) -> str:
@@ -172,9 +173,10 @@ def _reference_line(row: dict[str, Any]) -> str:
 
 def _bounded_reference_lines(refs, max_chars):
     lines, seen, used, omitted = [], set(), 0, False
-    # Match the existing request view: prefer the newest fitting references,
-    # retain chronological display, and never cut a fact or its time in half.
-    for row in reversed(refs):
+    # Keep shared anchors newest first and preserve per-kind Graphiti rank.
+    # Never cut a fact or its time in half.
+    from bumi_mem.recall_context import selection_order
+    for row in selection_order(refs):
         if not _memory_body(row) or row.get('reference_status', 'active') != 'active':
             continue
         line = _reference_line(row)
@@ -187,7 +189,7 @@ def _bounded_reference_lines(refs, max_chars):
             continue
         lines.append(line)
         used += size
-    return list(reversed(lines)), omitted
+    return lines if any((r.get("metadata") or {}).get("backend")=="graphiti" for r in refs) else list(reversed(lines)), omitted
 
 
 def _long_term_lines(*, user_id: str, refs: Sequence[dict[str, Any]],
