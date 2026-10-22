@@ -1,4 +1,4 @@
-"""OpenAI-compatible chat providers used for conversation and summarization."""
+"""OpenAI 兼容聊天提供者：用于对话和摘要。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,17 @@ from bumi_mem.schemas import ProviderConfigurationError
 
 @dataclass(slots=True, frozen=True)
 class ProviderConfig:
+    """LLM 提供者配置：模型、端点、凭据和生成参数。
+
+    属性:
+        provider:      提供者名称（'deepseek'/'local'）
+        model:         模型名称
+        base_url:      API Base URL
+        api_key:       API Key（repr 中隐藏）
+        max_tokens:    最大生成 token 数
+        temperature:   生成温度
+        thinking_mode: 思考模式（仅 DeepSeek 支持）
+    """
     provider: str
     model: str
     base_url: str
@@ -22,7 +33,11 @@ class ProviderConfig:
 
 
 def ensure_explicit_mem0_route():
-    # Pinned Mem0's OpenAI adapter otherwise overrides the configured host/key.
+    """确保 Mem0 的 OpenAI 适配器不会覆盖配置的 host/key。
+
+    锁定的 Mem0 OpenAI 适配器会覆盖显式配置的 host/key，
+    因此需要确保 OPENROUTER_API_KEY 未设置。
+    """
     if os.getenv('OPENROUTER_API_KEY'):
         raise ProviderConfigurationError('Unset OPENROUTER_API_KEY for this service; it would override the explicit Mem0 LLM route')
 

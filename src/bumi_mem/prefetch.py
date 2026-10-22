@@ -123,7 +123,11 @@ class RetrievalPrefetchCache:
             return 'hit', entry.rows, age_ms
 
     def invalidate_scope(self, *, user_id: str, agent_id: str) -> int:
-        """删除/更正后立即丢弃该作用域的预取；generation 校验只是兜底。"""
+        """删除/更正后立即丢弃该作用域的全部预取条目。
+
+        写入或遗忘操作导致检索结果失效时调用，generation 校验只是兜底。
+        返回被移除的条目数。
+        """
         with self._lock:
             stale = [key for key, item in self._entries.items()
                      if item.user_id == user_id and item.agent_id == agent_id]

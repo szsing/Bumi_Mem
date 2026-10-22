@@ -1,4 +1,5 @@
-"""Non-blocking chat orchestration with durable background memory submission."""
+# 本次改动（2026-10-21）：对话入口归一身份，隔离长期引用，切换用户撤销缓存，检索只发布当前身份授权材料。
+"""非阻塞对话编排 + 持久化后台记忆提交。"""
 from __future__ import annotations
 
 import hashlib
@@ -24,7 +25,7 @@ from bumi_mem.schemas import MemoryWriteReceipt, SavedMemory, MemoryWriteUncerta
 from bumi_mem.consolidator import SessionConsolidator
 from bumi_mem.context import ContextBuilder
 from bumi_mem.long_term import LongTermMemory
-from bumi_mem.memory_access import SerialMemoryAccess
+from bumi_mem.memory_access import SerialMemoryAccess, _is_fail_fast, _cause_chain_names
 from bumi_mem.prefetch import RetrievalPrefetchCache
 from bumi_mem.providers import TextProvider
 from bumi_mem.schemas import ConsolidationSubmission, MemoryJob, MessageRecord, SessionRecord, SessionStats, TurnResult
@@ -39,23 +40,36 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class BumiMemoryConfig:
+    registered_isolation: bool = False
     semantic_state_enabled: bool = True  # Legacy harness only; Graphiti service disables it.
     max_messages: int = 20
     max_l1_tokens: int = 8000
     top_k: int = 5
     search_threshold: float = 0.1
     max_answer_tokens: int = 512
-    memory_read_timeout: float = 0.2
-    explicit_recall_timeout: float = 1.0
+    memory_read_timeout: float = 0.06
+    explicit_recall_timeout: float = 0.2
     memory_warmup_enabled: bool = True
     memory_warmup_timeout: float = 120.0
     memory_warmup_query: str = "记忆系统预热"
     prefetch_ttl_seconds: float = 3.0
     prefetch_max_growth_chars: int = 12
     prefetch_max_entries: int = 256
+    long_term_degrade_enabled: bool = True
+    long_term_degrade_cooloff_seconds: float = 60.0
+    long_term_degrade_probe_timeout: float = 5.0
 
 
 class BumiMemory(AgentEngineMixin):
+    """主记忆引擎：非阻塞对话编排 + 持久化后台记忆提交。
+
+    核心职责：
+    - 管理会话和 L1 窗口
+    - 组装提示词（L3 检索 + 共享引用 + 核心状态 + L1 消息）
+    - 提交会话整理到后台作业队列
+    - 管理流式前缀预取缓存
+    - 启动/停止后台工作线程
+    """
     def __init__(self, *, store: SQLiteSessionStore, long_term: LongTermMemory,
                  chat_provider: TextProvider | None, consolidator: SessionConsolidator,
                  chat_token_counter: TokenCounter, config: BumiMemoryConfig | None = None,
@@ -65,8 +79,12 @@ class BumiMemory(AgentEngineMixin):
                              'an already-created SDK may be bound to its original thread')
         self.store = store
         self.config = config or BumiMemoryConfig()
+        if self.config.registered_isolation:
+            self.store.enable_isolation()
         self.long_term = (long_term if isinstance(long_term, SerialMemoryAccess) else
-                          SerialMemoryAccess(lambda: long_term, read_timeout=self.config.memory_read_timeout))
+                          SerialMemoryAccess(lambda: long_term, read_timeout=self.config.memory_read_timeout,
+                                            degrade_cooloff_seconds=self.config.long_term_degrade_cooloff_seconds,
+                                            degrade_probe_timeout=self.config.long_term_degrade_probe_timeout))
         self.chat_provider = chat_provider
         self.consolidator = consolidator
         self.consolidator.long_term = self.long_term
@@ -90,21 +108,37 @@ class BumiMemory(AgentEngineMixin):
             self.start()
 
     def _pair_lock(self, user_id: str, agent_id: str) -> threading.RLock:
+        """获取 agent 级别的可重入锁：同 agent 用户共享 L1，保持轮次和轮转连续。"""
         require_pair(user_id, agent_id)
-        # Same-agent users share L1: keep each user/assistant turn and rotation
-        # contiguous. Different agents can still run independently.
+        # 同 agent 用户共享 L1：保持每个 user/assistant 轮次和轮转连续。
+        # 不同 agent 可以独立运行。
         with self._locks_guard:
             return self._turn_locks.setdefault(agent_id, threading.RLock())
+
+    @property
+    def long_term_status(self) -> str:
+        """长期记忆可用性三态：'unchecked'/'ready'/'degraded'（委托 SerialMemoryAccess）。"""
+        return self.long_term.status
+
+    @property
+    def long_term_degraded(self) -> bool:
+        return self.long_term.degraded
 
     def start(self) -> float | None:
         if self._closed:
             raise RuntimeError('memory engine is closed')
         elapsed_ms = None
         if self.config.memory_warmup_enabled:
-            elapsed_ms = self.warmup(
-                query=self.config.memory_warmup_query,
-                timeout=self.config.memory_warmup_timeout,
-            )
+            try:
+                elapsed_ms = self.warmup(
+                    query=self.config.memory_warmup_query,
+                    timeout=self.config.memory_warmup_timeout,
+                )
+            except Exception as exc:
+                if _is_fail_fast(exc, lenient_unknown=True) or not self.config.long_term_degrade_enabled:
+                    raise
+                logger.warning('long-term memory warmup failed; starting in degraded mode '
+                               '(short-term only): %s', _cause_chain_names(exc))
         self.worker.start()
         return elapsed_ms
 
@@ -140,6 +174,7 @@ class BumiMemory(AgentEngineMixin):
 
     def get_or_create_session(self, *, user_id: str, agent_id: str) -> SessionRecord:
         require_pair(user_id, agent_id)
+        user_id = self.store.resolve_registered_user(user_id, agent_id)
         return self.store.get_or_create_session(user_id, agent_id)
 
     def _owned_session(self, session_id, user_id, agent_id):
@@ -169,6 +204,7 @@ class BumiMemory(AgentEngineMixin):
 
     def search_long_term(self, *, user_id: str, agent_id: str, query: str, read_timeout: float | None = None) -> list[dict[str, Any]]:
         require_pair(user_id, agent_id)
+        user_id = self.store.resolve_registered_user(user_id, agent_id)
         if is_guest(user_id):
             return []
         before = self.store.read_scope(user_id, agent_id)
@@ -176,6 +212,8 @@ class BumiMemory(AgentEngineMixin):
             return []
         search_args = dict(user_id=user_id, agent_id=agent_id, query=query,
                            top_k=self.config.top_k, threshold=self.config.search_threshold)
+        if self.store.isolation_enabled():
+            search_args.update(registered_isolation=True, registered_users=self.store.registered_users(agent_id))
         rows = (self.long_term.search(**search_args) if read_timeout is None else
                 self.long_term.search_with_timeout(timeout=read_timeout, **search_args))
         return self._finalize_recalled(rows, user_id=user_id, agent_id=agent_id,
@@ -187,8 +225,7 @@ class BumiMemory(AgentEngineMixin):
 
         预取复用走同一条路径——缓存里的候选也要重新校验，不能因为"提前算过"就跳过。
         """
-        # Deletion may have been requested while the read was executing. Drop
-        # stale rows before inspecting them so they can never enter user context.
+        # 读取执行期间可能已请求删除。丢弃过期行，防止进入用户上下文。
         if self.store.read_scope(user_id, agent_id) != expected_scope:
             return []
         rows = self._scoped_results(rows, user_id, agent_id)
@@ -211,10 +248,12 @@ class BumiMemory(AgentEngineMixin):
         self._scoped_results(recalled, user_id, agent_id)
         l1 = self.store.list_shared_messages(agent_id)
         selected = self.context_builder.select_l1(l1)
-        refs = self.store.shared_memory_refs(agent_id, selected_message_ids=[m.message_id for m in selected])
+        refs = (recalled if self.store.isolation_enabled() else
+                self.store.shared_memory_refs(agent_id, selected_message_ids=[m.message_id for m in selected]))
         return self.context_builder.build(recalled=recalled, l1_messages=l1,
                                           current_user_id=user_id, current_agent_id=agent_id, memory_only=memory_only,
-                                          shared_refs=refs, core_rows=core_rows or [], core_write=core_write, history_rows=history_rows or [])
+                                          shared_refs=refs, core_rows=core_rows or [], core_write=core_write,
+                                          history_rows=history_rows or [], current_recalled=recalled)
 
     def prepare_prompt(self, *, user_id: str, agent_id: str, query: str,
                        idempotency_key: str | None = None, ttl_seconds: float = 300.0,
@@ -224,6 +263,7 @@ class BumiMemory(AgentEngineMixin):
             raise RuntimeError('memory engine is closed')
         self.worker.note_foreground()
         require_pair(user_id, agent_id)
+        user_id = self.store.resolve_registered_user(user_id, agent_id)
         if not isinstance(query, str) or not query.strip() or len(query) > 16000:
             raise ValueError('query must contain 1..16000 characters')
         if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
@@ -239,6 +279,12 @@ class BumiMemory(AgentEngineMixin):
                 idempotency_key=idempotency_key, ttl_seconds=ttl_seconds,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
+            if self.store.isolation_switch(user_id,agent_id):
+                self.prefetch.clear()
+                with self.store._connect(write=True) as conn:
+                    conn.execute('UPDATE interaction_turns SET context_epoch=? WHERE turn_id=?',
+                        (self.store._context_epoch(conn,agent_id),turn['turn_id']))
+                turn = self.store.get_turn(turn['turn_id'],agent_id)
             self.worker.wake()  # a prior timed-out window may have rotated
             return self._prompt_for_turn(turn, recall_enabled=recall_enabled, memory_only=memory_only)
 
@@ -277,7 +323,7 @@ class BumiMemory(AgentEngineMixin):
             except Exception as exc:
                 logger.warning('semantic memory unavailable: %s', type(exc).__name__)
                 core_write = {'status': 'failed', 'reason': 'persistence_not_confirmed'}
-                # A rejected new key must not erase unrelated established boundaries.
+                # 被拒绝的新键不得擦除无关的已建立边界
                 try:
                     core_rows = self.store.semantic_context(user_id=user_id, agent_id=agent_id)
                 except Exception:
@@ -302,35 +348,45 @@ class BumiMemory(AgentEngineMixin):
                 recall_status = 'deleting'
             else:
                 try:
-                    if prefetched is not None:
+                    if prefetched is not None and not self.store.isolation_enabled():
                         # 复用预取候选：仍走同一套删除/作用域/核心冲突校验，
                         # 但不再触发一次新的检索（这正是串行路径只剩拼装的原因）。
                         recalled = self._finalize_recalled(
                             prefetched, user_id=user_id, agent_id=agent_id, query=query,
                             expected_scope=self.store.read_scope(user_id, agent_id))
                     else:
-                        explicit_recall = bool(re.search(r'还记得|记不记得|回忆|上次.{0,20}(说|聊|提)|\bremember\b|\blast time\b', query, re.I))
+                        # 记得.{0,6}吗 专门补上"你记得吗"这类不含"还/不"的疑问句——
+                        # 原来只认"还记得"/"记不记得"，漏掉了这个常见措辞。
+                        explicit_recall = bool(re.search(
+                            r'还记得|记不记得|记得.{0,6}吗|回忆|上次.{0,20}(说|聊|提)|\bremember\b|\blast time\b',
+                            query, re.I))
                         recalled = self.search_long_term(user_id=user_id, agent_id=agent_id, query=query,
                             read_timeout=self.config.explicit_recall_timeout if explicit_recall else None)
                     recall_status = 'ok'
+                    if not recalled:
+                        logger.debug('L3 search returned no results for this turn')
                 except Exception as exc:
-                    logger.debug('L3 unavailable: %s', type(exc).__name__)
+                    # 默认级别（不是 debug）：验收要求"发生几次降级，默认日志就能查到几条对应
+                    # 记录"，不能要求运维开 DEBUG 才看得到长期记忆被跳过。超时/短路/真实后端
+                    # 故障都走这里，每一轮都单独记一条，不只记第一次状态翻转的那一条。
+                    logger.warning('long-term memory recall skipped this turn: %s', _cause_chain_names(exc))
                     recall_status = 'unavailable'
         # Recall references are refreshed as part of publishing this turn's
         # recall, in one write transaction. A separate DELETE pass would add a
         # second write transaction on the foreground read path for no gain.
-        if recalled or not self.config.semantic_state_enabled:
+        if not is_guest(user_id) and (recalled or not self.config.semantic_state_enabled):
             self.store.attach_memory_refs(user_id=user_id, agent_id=agent_id,
                                           anchor_message_id=turn['source_message_id'], rows=recalled,
                                           generation=turn['generation'],
                                           replace_user_refs=not self.config.semantic_state_enabled,
                                           visible_message_ids={m.message_id for m in self.context_builder.select_l1(
                                               self.store.list_shared_messages(agent_id))})
-        # Successful recall is now represented by owner-labelled shared references.
+        # 成功检索现在由带所有者标签的共享引用表示
         self._owned_session(turn['session_id'], user_id, agent_id)
         l1 = self.store.list_shared_messages(agent_id)
         selected = self.context_builder.select_l1(l1)
-        refs = self.store.shared_memory_refs(agent_id, selected_message_ids=[m.message_id for m in selected])
+        refs = (recalled if self.store.isolation_enabled() else
+                self.store.shared_memory_refs(agent_id, selected_message_ids=[m.message_id for m in selected]))
         return dict(user_id=user_id, agent_id=agent_id, session_id=turn['session_id'], l1=l1,
                     selected=selected, refs=refs, core_rows=core_rows, core_write=core_write,
                     history_rows=history_rows, recalled=recalled, recall_status=recall_status, epoch=epoch)
@@ -344,7 +400,7 @@ class BumiMemory(AgentEngineMixin):
             recalled=[], l1_messages=bundle['l1'], current_user_id=bundle['user_id'],
             current_agent_id=bundle['agent_id'], memory_only=memory_only, shared_refs=bundle['refs'],
             core_rows=bundle['core_rows'], core_write=bundle['core_write'],
-            history_rows=bundle['history_rows'])
+            history_rows=bundle['history_rows'], current_recalled=bundle['recalled'])
         return self.store.save_turn_prompt(turn['turn_id'], messages=messages, recall_status=bundle['recall_status'],
                                            recalled=bundle['recalled'], core_write=bundle['core_write'],
                                            expected_epoch=bundle['epoch'])
@@ -358,7 +414,8 @@ class BumiMemory(AgentEngineMixin):
         payload = render_turn_context(
             turn_id=client_turn_id, user_id=bundle['user_id'], selected=bundle['selected'],
             refs=bundle['refs'], core_rows=bundle['core_rows'], history_rows=bundle['history_rows'],
-            max_reference_chars=self.context_builder.max_reference_chars)
+            max_reference_chars=self.context_builder.max_reference_chars,
+            current_recalled=bundle['recalled'])
         self.store.save_turn_prompt(
             turn['turn_id'], messages=[], recall_status=bundle['recall_status'],
             recalled=bundle['recalled'], core_write=bundle['core_write'],
@@ -373,6 +430,7 @@ class BumiMemory(AgentEngineMixin):
             raise RuntimeError('memory engine is closed')
         self.worker.note_foreground()
         require_pair(user_id, agent_id)
+        user_id = self.store.resolve_registered_user(user_id, agent_id)
         if query is not None and (not isinstance(query, str) or not query.strip() or len(query) > 16000):
             raise ValueError('query must be null or contain 1..16000 characters')
         if previous_ai_reply is not None and (not isinstance(previous_ai_reply, str) or len(previous_ai_reply) > 64000):
@@ -398,6 +456,12 @@ class BumiMemory(AgentEngineMixin):
                     MessageRecord.attributed_content('assistant', previous_ai_reply, '', agent_id, previous_reply_occurred_at or message_time())) + 4,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
+            if self.store.isolation_switch(user_id, agent_id):
+                self.prefetch.clear()
+                if request['turn_id']:
+                    with self.store._connect(write=True) as conn:
+                        conn.execute('UPDATE interaction_turns SET context_epoch=? WHERE turn_id=?',
+                            (self.store._context_epoch(conn,agent_id),request['turn_id']))
             self.worker.wake()
             if request['response_json']:
                 return json.loads(request['response_json'])
@@ -418,7 +482,7 @@ class BumiMemory(AgentEngineMixin):
     def process_turn_context(self, *, turn_id: str, user_id: str, agent_id: str,
                              query: str | None, previous_ai_reply: str | None = None,
                              query_occurred_at: str | None = None,
-                             previous_reply_occurred_at: str | None = None) -> dict[str, Any]:
+                             previous_reply_occurred_at: str | None = None, _control_hook=None) -> dict[str, Any]:
         """One request per turn: settle the previous reply, save the current query,
         and return four structured memory fields.
 
@@ -428,6 +492,7 @@ class BumiMemory(AgentEngineMixin):
         if self._closed:
             raise RuntimeError('memory engine is closed')
         require_pair(user_id, agent_id)
+        user_id = self.store.resolve_registered_user(user_id, agent_id)
         require_id(turn_id, 'turn_id')
         if len(turn_id) > MAX_CLIENT_TURN_ID:
             raise ValueError(f'turn_id must contain at most {MAX_CLIENT_TURN_ID} characters')
@@ -455,20 +520,27 @@ class BumiMemory(AgentEngineMixin):
                     MessageRecord.attributed_content('assistant', previous_ai_reply, '', agent_id, previous_reply_occurred_at or message_time())) + 4,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
+            if self.store.isolation_switch(user_id, agent_id):
+                self.prefetch.clear()
+                if request['turn_id']:
+                    with self.store._connect(write=True) as conn:
+                        conn.execute('UPDATE interaction_turns SET context_epoch=? WHERE turn_id=?',
+                            (self.store._context_epoch(conn,agent_id),request['turn_id']))
+            if _control_hook is not None:
+                _control_hook(request)
             self.worker.wake()
             if request['response_json']:
                 return json.loads(request['response_json'])
             if request['previous_turn_id']:
                 self._record_spoken_promise(request['previous_turn_id'], agent_id)
-            # A settle-only request saves the last reply without a new question,
-            # so it has no current context arrays to return.
+            # 仅结算请求：保存上一轮回复但不开始新轮次，无当前上下文数组可返回
             payload = {'turn_id': turn_id, 'current_user': user_id,
                        'long_term_memory': [], 'short_term_memory': []}
             epoch = self.store.context_epoch(agent_id)
             if request['turn_id']:
                 internal_turn = self.store.get_turn(request['turn_id'], agent_id)
                 payload = self._turn_context_payload(internal_turn, client_turn_id=turn_id)
-                # Core updates can bump the shared context epoch while building.
+                # 核心更新可能在构建期间提升共享上下文代数
                 epoch = self.store.get_turn(request['turn_id'], agent_id)['context_epoch']
             return self.store.save_turn_context_response(
                 request['request_id'], payload=payload, expected_epoch=epoch)
@@ -517,7 +589,7 @@ class BumiMemory(AgentEngineMixin):
                                                       max_tokens=self.config.max_answer_tokens).strip()
                 result = self.record_reply(turn_id=turn['turn_id'], agent_id=agent_id, reply=answer)
             except Exception:
-                # Do not release an already persisted response or hide the original error.
+                # 不得释放已持久化的响应或隐藏原始错误
                 try:
                     self.record_reply(turn_id=turn['turn_id'], agent_id=agent_id, status='failed')
                 except Exception:
@@ -550,7 +622,7 @@ class BumiMemory(AgentEngineMixin):
         return self.store.shared_stats(agent_id, session_id=session.session_id)
 
     def get_memories(self, *, user_id: str, agent_id: str) -> list[dict[str, Any]]:
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         require_pair(user_id, agent_id)
         before = self.store.read_scope(user_id, agent_id)
         if before[1]:
@@ -561,7 +633,7 @@ class BumiMemory(AgentEngineMixin):
         return self.store.filter_memory_rows(self._scoped_results(rows, user_id, agent_id), user_id=user_id, agent_id=agent_id)
 
     def forget_all(self, *, user_id: str, agent_id: str) -> MemoryJob:
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         with self._pair_lock(user_id, agent_id):
             # 预取候选必须随删除立即失效（generation 校验是兜底，不是唯一防线）。
             self.prefetch.invalidate_scope(user_id=user_id, agent_id=agent_id)
@@ -571,13 +643,13 @@ class BumiMemory(AgentEngineMixin):
             return job
 
     def memory_jobs(self, *, user_id: str, agent_id: str) -> list[MemoryJob]:
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         require_pair(user_id, agent_id)
         return self.store.list_jobs(user_id=user_id, agent_id=agent_id)
 
     def retry_memory_job(self, job_id: str, *, user_id: str, agent_id: str,
                          allow_replay: bool = False) -> MemoryJob:
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         require_pair(user_id, agent_id)
         job = self.store.retry_job(job_id, user_id=user_id, agent_id=agent_id,
                                   max_attempts=self.consolidator.config.max_attempts, allow_replay=allow_replay)
@@ -594,7 +666,7 @@ class BumiMemory(AgentEngineMixin):
         if getattr(self.long_term, 'backend_name', '') == 'graphiti':
             raise NotImplementedError('Explicit remember is disabled for Graphiti')
         self.worker.note_foreground()
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         if isinstance(contents, (str, bytes)) or not contents or any(not isinstance(x, str) or not x.strip() for x in contents):
             raise ValueError('contents must contain nonempty memory strings')
         observed_at = message_time(observed_at)
@@ -617,7 +689,7 @@ class BumiMemory(AgentEngineMixin):
             return MemoryWriteReceipt(user_id, agent_id, records, datetime.now(timezone.utc).isoformat(), before[0])
 
     def read_memory(self, *, user_id: str, agent_id: str, memory_id: str) -> dict[str, Any] | None:
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         require_pair(user_id, agent_id)
         before = self.store.read_scope(user_id, agent_id)
         if before[1]:
@@ -635,7 +707,7 @@ class BumiMemory(AgentEngineMixin):
 
     def forget_memory(self, *, user_id: str, agent_id: str, memory_id: str) -> dict[str, Any]:
         """Source-aware logical deletion. Use forget_all for backend physical erasure."""
-        require_person(user_id)
+        require_person(self.store.resolve_registered_user(user_id,agent_id))
         with self._pair_lock(user_id, agent_id):
             self.prefetch.invalidate_scope(user_id=user_id, agent_id=agent_id)
             row = self.read_memory(user_id=user_id, agent_id=agent_id, memory_id=memory_id)
@@ -649,7 +721,7 @@ class BumiMemory(AgentEngineMixin):
         turn = self.store.get_turn(turn_id, agent_id)
         if is_guest(turn['user_id']) or not turn.get('reply_message_id'):
             return
-        # Never promote a delayed response based on a revoked prompt to new evidence.
+        # 永不将基于已撤销提示的延迟响应提升为新证据
         with self.store._connect() as conn:
             source = conn.execute('SELECT * FROM messages WHERE message_id=? AND memory_excluded=0',
                                   (turn['reply_message_id'],)).fetchone()

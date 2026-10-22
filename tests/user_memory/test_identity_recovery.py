@@ -95,8 +95,8 @@ def test_user_switch_shares_l1_but_keeps_scoped_memory(tmp_path):
     direct_context, shared_context = b.prompt_messages[0]['content'].split('[共享 L3 引用 / shared memory references]\n', 1)
     assert 'A_ONLY_COFFEE' not in direct_context
     refs = json.loads(shared_context.split('\n', 1)[0])
-    assert any(r['owner_user_id'] == 'A' and r['memory'] == 'A_ONLY_COFFEE' for r in refs)
-    assert any(r['owner_user_id'] == 'B' and r['memory'] == 'B_ONLY_TEA' for r in refs)
+    assert any(r['user_id'] == 'A' and r['content'] == 'A_ONLY_COFFEE' for r in refs)
+    assert any(r['user_id'] == 'B' and r['content'] == 'B_ONLY_TEA' for r in refs)
     assert [r['memory'] for r in b.recalled] == ['B_ONLY_TEA']
     assert '"user_id": "A"' in joined and '"user_id": "B"' in joined
 

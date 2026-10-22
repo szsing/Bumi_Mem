@@ -1,3 +1,4 @@
+"""测试 DeepSeek 记忆模式：验证 DeepSeek 提供者的配置和路由逻辑。"""
 from types import SimpleNamespace
 import json
 import ast

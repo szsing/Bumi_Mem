@@ -10,6 +10,14 @@ import httpx
 
 
 class BumiMemoryClient:
+    """单端点记忆客户端：不执行模型调用，不进行本地对话推断。
+
+    使用方式：
+    - turn_context()：主路径，每轮一次请求，返回四个结构化字段
+    - get_context()：旧版接口，保持向后兼容
+    - agent_request()：发送 prepare/complete/agent_event 操作
+    - prepare_turn()/prefetch_turn()/complete_turn()：Agent 协议的便捷方法
+    """
     def __init__(self, base_url: str, api_key: str, *, timeout: float = 10.0,
                  transport: httpx.BaseTransport | None = None):
         self._http = httpx.Client(base_url=base_url.rstrip('/'),

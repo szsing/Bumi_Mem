@@ -1,3 +1,4 @@
+"""测试记忆适配器和迁移：验证 Mem0LongTermMemory 的初始化、搜索和遗留数据恢复。"""
 from pathlib import Path
 import sqlite3
 import sys
@@ -193,7 +194,8 @@ def test_read_result_is_dropped_even_if_delete_completes_during_read(tmp_path):
     assert engine.search_long_term(user_id='u1',agent_id='a1',query='q') == []
 
 
-def test_cli_build_defers_native_sdk_construction(tmp_path, monkeypatch):
+@pytest.mark.parametrize('reranker_fp16', [True, False])
+def test_cli_build_defers_native_sdk_construction(tmp_path, monkeypatch, reranker_fp16):
     import bumi_mem.cli as cli
     from bumi_mem.long_term import FakeLongTermMemory
     from bumi_mem.providers import FakeTextProvider, ProviderConfig
@@ -208,12 +210,18 @@ def test_cli_build_defers_native_sdk_construction(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, '_token_counter', lambda _: FixedTokenCounter(1))
     monkeypatch.setattr(cli, 'OpenAICompatibleProvider', lambda _: FakeTextProvider())
     construction = []
+    configs = []
     class Backend:
         async def get_all(self, **kwargs):
             return []
         async def close(self):
             pass
-    monkeypatch.setattr(cli, 'GraphitiLongTermMemory', lambda *a, **k: (construction.append(threading.get_ident()), Backend())[1])
+    def make_backend(provider, config):
+        construction.append(threading.get_ident())
+        configs.append(config)
+        return Backend()
+    monkeypatch.setattr(cli, 'GraphitiLongTermMemory', make_backend)
+    monkeypatch.setenv('BUMI_RERANKER_FP16', 'on' if reranker_fp16 else 'off')
     for name in ('BUMI_NEO4J_PASSWORD', 'BUMI_EMBED_MODEL_PATH', 'BUMI_RERANKER_MODEL_PATH'):
         monkeypatch.setenv(name, 'test')
     engine = cli.build_engine(args)
@@ -221,6 +229,7 @@ def test_cli_build_defers_native_sdk_construction(tmp_path, monkeypatch):
         assert construction == []
         engine.long_term.get_all(user_id='u', agent_id='a')
         assert construction[0] != threading.get_ident()
+        assert configs[0].reranker_fp16 is reranker_fp16
     finally:
         engine.close()
 

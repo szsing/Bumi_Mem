@@ -1,7 +1,7 @@
-"""Small, dependency-free helpers for the actual Noetix bumi-agent repository.
+"""Agent 桥接辅助函数：无依赖、无网络 I/O 的载荷构建和上下文合并。
 
-No Pipecat imports, no audio/model initialization, no network IO in speech/control
-callbacks. Queue the returned frozen payload and send it from a worker/outbox.
+不导入 Pipecat，不初始化音频/模型，不在 speech/control 回调中执行网络 I/O。
+将返回的冻结载荷入队，由 worker/outbox 发送。
 """
 from __future__ import annotations
 
@@ -9,28 +9,32 @@ from copy import deepcopy
 from datetime import datetime, tzinfo
 from collections.abc import Mapping
 
-GUEST_USER_ID = '__guest__'
-MEMORY_BLOCK_PREFIX = '[Bumi memory supplement]\n'
+GUEST_USER_ID = '__guest__'              # 陌生/未识别用户的保留 ID
+MEMORY_BLOCK_PREFIX = '[Bumi memory supplement]\n'  # 记忆补充块的标识前缀
 
 
 def _id(value):
+    """校验并返回合法的稳定 ID：1~128 个可打印字符，且首尾不能是空白。"""
     if not isinstance(value, str) or not value or value != value.strip() or len(value) > 128 or not value.isprintable():
         raise ValueError('a stable printable ID of 1..128 characters is required')
     return value
 
 
 def client_turn_id(session_id: str, timeline_turn_id: str) -> str:
-    """Timeline counters restart: prefix them with a persisted run/session ID."""
+    """组合会话 ID 和时间线轮次 ID 为全局唯一的客户端轮次 ID。
+
+    时间线计数器会在重启后归零，因此需要用持久化的 session_id 作为前缀。
+    """
     _id(session_id)
     _id(timeline_turn_id)
     return _id(session_id + ':' + timeline_turn_id)
 
 
 def timeline_occurred_at(timeline, *, timezone_info: tzinfo | None = None) -> str:
-    """Keep the conversation's LOCAL day for yesterday/today normalization.
+    """保留对话的本地日期，用于 昨天/今天 归一化。
 
-    Supply its timezone explicitly if the robot OS timezone is not the user's
-    timezone. Never replace the wall-clock input with a monotonic stopwatch.
+    如果机器人 OS 时区与用户时区不同，需显式提供 timezone_info。
+    永远不要用单调秒表替代挂钟输入。
     """
     timestamp = timeline.speech_started_wall_time
     if timezone_info is not None:
@@ -39,7 +43,7 @@ def timeline_occurred_at(timeline, *, timezone_info: tzinfo | None = None) -> st
 
 
 def speaker_for_memory(identity, *, enabled: bool, mode: str) -> dict:
-    """Shadow/disabled identification must not silently enable personal memory."""
+    """构建说话人身份载荷。shadow/disabled 模式不得静默启用个人记忆。"""
     if not enabled or mode != 'label':
         return {'status': 'disabled'}
     if identity is None:
@@ -54,13 +58,26 @@ def speaker_for_memory(identity, *, enabled: bool, mode: str) -> dict:
     profile = _id(data.get('profile_id'))
     if profile == GUEST_USER_ID:
         raise ValueError('a matched speaker cannot use the reserved guest category')
-    # Do not send biometric scores, model internals, or mutable display labels.
+    # 不发送生物识别分数、模型内部信息或可变显示标签
     return {'status': 'matched', 'profile_id': profile}
 
 
 def prepare_payload(*, query: str, request_turn_id: str, identity=None,
                     identity_enabled: bool = False, identity_mode: str = 'shadow',
                     occurred_at: str | None = None, prefetch_id: str | None = None) -> dict:
+    """构建 prepare 操作载荷：终稿文本提交给记忆服务进行检索和上下文组装。
+
+    参数:
+        query:            终稿文本（已稳定的完整转录，不支持原始音频）
+        request_turn_id:  请求轮次 ID
+        identity:         说话人身份对象
+        identity_enabled: 是否启用身份识别
+        identity_mode:    身份模式（'shadow'/'label'）
+        occurred_at:      事件发生时间（ISO 8601）
+        prefetch_id:      预取 ID（若前缀预取成功则复用其结果）
+    返回:
+        prepare 操作载荷字典
+    """
     if not isinstance(query, str) or not query.strip():
         raise ValueError('memory requires a finalized text transcript; raw audio bypass is unsupported')
     result = {'operation': 'prepare', 'client_turn_id': _id(request_turn_id), 'query': query.strip(),
@@ -68,7 +85,7 @@ def prepare_payload(*, query: str, request_turn_id: str, identity=None,
     if occurred_at is not None:
         result['occurred_at'] = occurred_at
     if prefetch_id is not None:
-        result['prefetch_id'] = _id(prefetch_id)
+        result['prefetch_id'] = _id(prefetch_id)  # 复用预取结果
     return result
 
 
@@ -99,8 +116,8 @@ def settled_speech_snapshot(speech, *, occurred_at: str | None = None) -> dict:
     """
     if not speech.settled:
         raise ValueError('speech has not settled; do not submit generated text')
-    # Speech settlement does not establish the final LLM/tool task outcome.
-    # Join this evidence with the coordinator's explicit outcome before sending.
+    # 语音结算不建立最终 LLM/工具任务结果
+    # 将此证据与协调器的显式结果合并后再发送
     result = {'reply': speech.committed_text,
               'speech': {'delivery_basis': 'dds_successful_publish',
                          'alignment_covers_output': bool(speech.alignment_covers_output()),
@@ -120,13 +137,25 @@ def complete_payload_from_speech(*, turn_id: str, speech, status: str,
 
 
 def local_control_payload(*, event_id: str, history_message: dict, occurred_at=None) -> dict:
-    """Use ConversationState's settled program-owned event, not user/LLM claims."""
+    """构建本地控制事件载荷：将程序拥有的 settled 事件转为记忆服务可接受的格式。
+
+    只接受 ConversationState 中已确认的 program-owned 事件（role='system'），
+    不接受用户或 LLM 伪造的控制指令。
+
+    参数:
+        event_id:         事件唯一 ID
+        history_message:  历史消息字典（必须 role='system'，content 为 JSON）
+        occurred_at:      事件发生时间
+    返回:
+        agent_event 操作载荷字典
+    """
     import json
     if history_message.get('role') != 'system':
         raise ValueError('expected a program-owned local control event')
     event = json.loads(history_message['content'])
     if event.pop('event', None) != 'local_control':
         raise ValueError('not a local_control event')
+    # 剥离 event 字段后剩余部分作为 control 内容
     result = {'operation': 'agent_event', 'event_id': _id(event_id), 'kind': 'local_control', 'control': event}
     if occurred_at is not None:
         result['occurred_at'] = occurred_at
@@ -135,10 +164,10 @@ def local_control_payload(*, event_id: str, history_message: dict, occurred_at=N
 
 def merge_agent_context(agent_messages: list[dict], response: dict, *, expected_user_id: str,
                         expected_client_turn_id: str) -> list[dict]:
-    """Return a request-only view; never mutate ConversationAgent.history/tools.
+    """将记忆补充块合并到 Agent 消息列表中，返回只读视图，不修改原始 history/tools。
 
-    Reuse the SAME accepted response on every tool round of one user turn. Do not
-    call prepare again when _stream_current_turn enters another tool iteration.
+    同一用户轮次的每个 tool 迭代应复用同一个已接受的响应，
+    不要在 _stream_current_turn 进入下一个 tool 迭代时再次调用 prepare。
     """
     if (response.get('operation') != 'prepare' or not response.get('has_prompt') or
             response.get('user_id') != expected_user_id or
@@ -159,12 +188,12 @@ def merge_agent_context(agent_messages: list[dict], response: dict, *, expected_
 
 def cold_start_spoken_history(response: dict, *, existing_history: list[dict], expected_user_id: str,
                               expected_client_turn_id: str) -> list[dict]:
-    """Optional recovery of spoken L1 into an EMPTY Agent history only.
+    """冷启动口语历史恢复：仅在 Agent 历史为空时，从服务响应中恢复 L1 口语消息。
 
-    Call before add_user_text. The current query is already last in the service
-    response and is deliberately excluded. No tools or execution state are
-    reconstructed; never use this to overwrite an active Agent history.
+    在 add_user_text 之前调用。当前查询已在服务响应末尾，故意排除。
+    不重建 tool 执行状态；绝不用此覆盖活跃的 Agent 历史。
     """
+    # 安全检查：绝不允许用 L1 口语历史覆盖已有 Agent/tool 历史
     if existing_history:
         raise ValueError('never replace existing Agent/tool history with spoken L1')
     if (response.get('operation') != 'prepare' or response.get('user_id') != expected_user_id or

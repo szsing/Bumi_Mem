@@ -1,6 +1,10 @@
-"""Separate SQLite namespace: never migrate a legacy Bumi database implicitly."""
+"""Stage-1 类型化记忆的 SQLite 模式定义：独立命名空间，绝不隐式迁移旧版 Bumi 数据库。
+
+APPLICATION_ID 和 SCHEMA_VERSION 故意大于旧版 Bumi 支持的版本号，
+确保旧版代码不会误打开 Stage-1 数据库。
+"""
 APPLICATION_ID = 0x42554D31  # BUM1
-SCHEMA_VERSION = 1001       # Deliberately > legacy Bumi's supported version 2.
+SCHEMA_VERSION = 1001       # 故意大于旧版 Bumi 支持的版本 2，防止误打开
 SCHEMA = """
 CREATE TABLE principals(person_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);
 CREATE TABLE spaces(space_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES principals(person_id), created_at REAL NOT NULL);

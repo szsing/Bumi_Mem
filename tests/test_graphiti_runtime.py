@@ -118,6 +118,9 @@ def adapter(tmp_path, client):
     result.journal = tmp_path / 'journal.db'
     result.client = client
     result._write_lock = asyncio.Lock()
+    async def no_overrides(group):
+        return []
+    result._admin_recall_overrides = no_overrides
     with result._db() as db:
         db.executescript('''CREATE TABLE ingestions(id TEXT PRIMARY KEY,group_id TEXT,state TEXT,payload TEXT,result TEXT,created_at REAL);
             CREATE TABLE community_jobs(group_id TEXT PRIMARY KEY,built INTEGER DEFAULT 0,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,error TEXT);
@@ -166,7 +169,8 @@ def test_combined_search_keeps_all_kinds_and_temporal_state(tmp_path):
             return self.values
     class Client:
         async def search_(self, query, **kwargs):
-            assert kwargs == {'group_ids': [group]}
+            assert kwargs['group_ids'] == [group]
+            assert kwargs['config'].edge_config.reranker.name == 'rrf'
             return types.SimpleNamespace(edges=[Item('e', fact='以前喜欢红色', invalid_at='2025-01-01T00:00:00Z')],
                 nodes=[Item('n', summary='小星')], episodes=[Item('p', content='一段对话')], communities=[Item('c', summary='共同兴趣')])
     async def run():
@@ -740,24 +744,16 @@ def test_foreign_group_results_are_dropped_and_warned_not_fatal(tmp_path, caplog
     asyncio.run(run())
 
 
-def test_bge_reranker_subclass_matches_upstream_contract():
-    """Record the upstream contract instead of guessing that super() is required."""
-    graphiti_core = pytest.importorskip('graphiti_core')
-    from graphiti_core.cross_encoder import bge_reranker_client as bge
-    from graphiti_core.cross_encoder import client as base
-    import inspect
-    # Upstream BGERerankerClient sets only self.model and defines no other init state.
-    src = inspect.getsource(bge.BGERerankerClient.__init__)
-    assert 'self.model' in src
-    # The parent is a pure ABC: it declares no __init__ at all, so there is no
-    # parent initialisation for a subclass to skip.
-    parent_src = inspect.getsource(base.CrossEncoderClient)
-    assert 'def __init__' not in parent_src
-    assert 'abstractmethod' in parent_src
-    # Our local subclass therefore only needs to set the model path.
-    from bumi_mem.graphiti_memory import GraphitiLongTermMemory
-    local = inspect.getsource(GraphitiLongTermMemory.__init__)
-    assert 'CrossEncoder' in local and 'self.model' in local
+def test_rrf_keeps_routes_and_limits_without_mutating_upstream():
+    from bumi_mem.graphiti_memory import rrf_search_config
+    from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_CROSS_ENCODER as original
+    config = rrf_search_config()
+    assert config.limit == original.limit == 10
+    for field in ('edge_config', 'node_config', 'episode_config', 'community_config'):
+        assert getattr(config, field).search_methods == getattr(original, field).search_methods
+        assert getattr(config, field).reranker.name == 'rrf'
+        assert getattr(original, field).reranker.name == 'cross_encoder'
+
 
 
 def test_recall_refs_are_replaced_in_one_write_transaction(tmp_path):
@@ -788,3 +784,44 @@ def test_recall_refs_are_replaced_in_one_write_transaction(tmp_path):
     engine.process_context(user_id='u1', agent_id='a1', query='还记得三角龙吗',
                            previous_ai_reply='三角龙')
     assert store.shared_memory_refs('a1', selected_message_ids=[m.message_id for m in store.list_shared_messages('a1')]) == []
+
+
+def test_graphiti_availability_recovers_without_consuming_write_jobs():
+    from bumi_mem.schemas import RetryableMemoryError
+    class Backend:
+        fail = True
+        probes = 0
+        async def warmup(self, **kwargs):
+            self.probes += 1
+            if self.fail:
+                raise RetryableMemoryError('database unavailable')
+        async def close(self):
+            pass
+    backend = Backend()
+    access = AsyncMemoryAccess(lambda: backend, degrade_cooloff_seconds=60)
+    try:
+        assert access.status == 'unchecked'
+        assert access.ensure_available() is False
+        assert access.degraded and backend.probes == 1
+        assert access.ensure_available() is False and backend.probes == 1
+        backend.fail = False
+        access.degrade_cooloff_seconds = 0
+        assert access.ensure_available() is True
+        assert access.status == 'ready' and backend.probes == 2
+    finally:
+        access.close()
+
+
+def test_rrf_warmup_has_no_model_reranker(tmp_path):
+    calls = []
+    class Client:
+        async def build_indices_and_constraints(self):
+            calls.append('indices')
+        embedder = types.SimpleNamespace()
+    async def embed(query):
+        calls.append('embedding')
+    client = Client()
+    client.embedder.create = embed
+    memory = adapter(tmp_path, client)
+    asyncio.run(memory.warmup(query='warmup'))
+    assert calls == ['indices', 'embedding']

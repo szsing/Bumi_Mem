@@ -1,3 +1,4 @@
+# 本次改动（2026-10-21）：将结构化缓存迁移断言更新为 schema 11，继续防止协议与提示词回归。
 """Structured-response regressions and safe migration from string responses."""
 from __future__ import annotations
 
@@ -174,7 +175,7 @@ def test_v8_string_response_rebuilds_structured_without_duplicate(tmp_path):
     assert set(rebuilt)=={'turn_id','current_user','long_term_memory','short_term_memory'}
     assert len(upgraded.list_shared_messages('bot'))==1
     with upgraded._connect() as conn:
-        assert conn.execute('PRAGMA user_version').fetchone()[0]==9
+        assert conn.execute('PRAGMA user_version').fetchone()[0]==11
     new.close()
 
 

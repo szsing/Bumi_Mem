@@ -82,9 +82,19 @@ bash scripts/run_memory_service.sh
 curl --fail-with-body http://127.0.0.1:8088/health/ready
 ```
 
-预期200，包含 `status=ready`、`warmed_up=true`。`/health/ready` 无法区分端口后面是谁的服务，
+预期200，包含 `status=ready`、`warmed_up=true`、`long_term_status`。`/health/ready` 无法区分端口后面是谁的服务，
 需再用自己的 `BUMI_SERVICE_API_KEY` 打一次 prepare 核对返回的 `agent_id`。
 不应同时启动第二个进程共用同一数据目录。
+
+`long_term_status` 取值含义（巡检应该看这个字段，不能只看 `status=ready`）：
+
+- `ready`：长期记忆（Qdrant/embedding）已确认可用。
+- `degraded`：长期记忆暂时不可用（连接失败/超时/启动预热失败），服务仍在正常提供短期记忆（L1）能力；应去排查 Qdrant/embedding 服务，不要当作整个服务故障去重启进程——短期能力本身没问题，重启不会让长期记忆更快恢复，反而会丢失尚未落盘的短期上下文。超过 `BUMI_LONG_TERM_DEGRADE_COOLOFF_SECONDS`（默认60秒）后下一次请求会自动重新探测，无需人工介入触发恢复。
+- `unchecked`：`BUMI_MEMORY_WARMUP=off` 时的状态，服务启动时跳过了长期记忆预热，尚未发生过任何一次真实检索/写入，不代表"确认可用"也不代表"降级"。
+
+长期处于 `degraded` 超过预期时间，才需要人工介入排查 Qdrant/embedding；短暂的 `degraded`（比如 Qdrant 容器重启几秒）是设计内的自愈行为。
+
+**已知限制（Known limitations）**：恢复探测目前复用触发它的那次普通请求自身的前台等待预算——普通聊天默认 60ms（`BUMI_MEMORY_READ_TIMEOUT`），"你记得吗"/"还记得……"这类显式回忆措辞默认 200ms（`BUMI_EXPLICIT_RECALL_TIMEOUT`），不是专门给探测用的更长超时——这是刻意的设计选择：验收要求是"超过阈值就跳过记忆，继续对话"，前台响应时间不能为了探测更准而被拖慢。代价是：长期记忆断线后第一次真正恢复连接时，`Mem0LongTermMemory` 往往需要重新建 collection/索引，这个过程可能比前台预算慢，导致第一次探测在前台视角仍是"超时失败"（尽管后端此时可能已经在背后连接成功），要等下一个冷却周期的探测才会被确认为 `ready`。实测观察到的是2个冷却周期，但**这不是保证的恢复上限**——如果初始化或检索持续偏慢，可能需要更多周期才能收敛。后续优化跟踪在 [Issue #27](https://github.com/Noetix-AI/Bumi_Mem/issues/27)：方向是把"恢复探测"和"前台等待预算"彻底分离（前台始终按既定预算准时返回短期上下文），探测改为后台异步完成后再安全更新熔断状态，同时保留 SDK 单线程串行执行和"同一时刻只有一个探测"的约束。
 
 第一次先前台看启动报错。常驻测试可在确认成功后用tmux或nohup；正式服务建议由运维使用systemd等进程管理，并保证使用正确Python环境。不要把SSH窗口关闭后仍会运行当作默认保证。
 

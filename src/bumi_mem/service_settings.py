@@ -1,4 +1,5 @@
-"""Environment-only server configuration; no hard-coded server filesystem paths."""
+# 本次改动（2026-10-21）：Graphiti HTTP 服务默认开启注册隔离，解析环境开关并传入引擎和图后端。
+"""环境变量驱动的服务配置：不硬编码服务器文件系统路径。"""
 from __future__ import annotations
 
 import math
@@ -10,8 +11,29 @@ from urllib.parse import urlparse
 from bumi_mem.identity import require_id
 
 
+def read_env_switch(name: str, default: str = 'on') -> bool:
+    """统一解析服务与 CLI 共用的环境开关，拒绝拼写错误。"""
+    value = os.getenv(name, default).strip().lower()
+    if value not in ('on', 'off', 'true', 'false'):
+        raise ValueError(f"{name} must be 'on'/'off' or 'true'/'false'")
+    return value in ('on', 'true')
+
+
 @dataclass(frozen=True)
 class ServiceSettings:
+    """服务配置：所有参数从环境变量读取，不可变。
+
+    核心属性:
+        data_dir:           数据目录
+        embed_model_path:   嵌入模型路径
+        api_key:            服务 API 密钥
+        memory_api_key:     记忆 LLM API 密钥
+        agent_id:           默认 Agent ID
+        memory_provider:    记忆提供者（deepseek/local/openai-compatible）
+        memory_model:       记忆 LLM 模型名
+        memory_base_url:    记忆 LLM API 基础 URL
+        embed_device:       嵌入设备（auto/cpu/cuda）
+    """
     data_dir: Path
     embed_model_path: Path
     api_key: str = field(repr=False)
@@ -19,7 +41,7 @@ class ServiceSettings:
     neo4j_uri: str = 'bolt://127.0.0.1:7687'
     neo4j_user: str = 'neo4j'
     neo4j_password: str = field(default='', repr=False)
-    reranker_model_path: Path = Path('/data1/sunzhixing/model/bge-reranker-v2-m3')
+    reranker_model_path: Path = Path('.')  # Deprecated; no longer loaded.
     extraction_turns: int = 10
     extraction_tokens: int = 8000
     community_every: int = 5
@@ -33,6 +55,10 @@ class ServiceSettings:
     read_timeout: float = 30.0
     explicit_recall_timeout: float = 30.0
     warmup_timeout: float = 120.0
+    memory_warmup_enabled: bool = True
+    long_term_degrade_enabled: bool = True
+    long_term_degrade_cooloff_seconds: float = 60.0
+    long_term_degrade_probe_timeout: float = 5.0
     max_messages: int = 20
     max_l1_tokens: int = 8000
     carryover_messages: int = 20
@@ -45,6 +71,8 @@ class ServiceSettings:
     retry_base_seconds: float = 5.0
     prefetch_ttl_seconds: float = 3.0
     prefetch_max_growth_chars: int = 12
+    reranker_fp16: bool = True
+    registered_isolation: bool = True
 
     def __post_init__(self):
         if not math.isfinite(self.explicit_recall_timeout) or self.explicit_recall_timeout <= 0:
@@ -63,7 +91,8 @@ class ServiceSettings:
             raise ValueError('memory base URL must be http(s), without embedded credentials')
         if self.embed_device not in ('auto', 'cpu', 'cuda'):
             raise ValueError('invalid embedding device')
-        for name in ('read_timeout', 'warmup_timeout'):
+        for name in ('read_timeout', 'warmup_timeout', 'long_term_degrade_cooloff_seconds',
+                     'long_term_degrade_probe_timeout'):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be positive and finite')
@@ -89,6 +118,7 @@ class ServiceSettings:
             if not value:
                 raise ValueError(f'{name} must be configured')
             return value
+
         return cls(
             data_dir=Path(required('BUMI_DATA_DIR')),
             embed_model_path=Path(required('BUMI_EMBED_MODEL_PATH')),
@@ -97,7 +127,9 @@ class ServiceSettings:
             neo4j_uri=os.getenv('BUMI_NEO4J_URI', 'bolt://127.0.0.1:7687'),
             neo4j_user=os.getenv('BUMI_NEO4J_USER', 'neo4j'),
             neo4j_password=required('BUMI_NEO4J_PASSWORD'),
-            reranker_model_path=Path(required('BUMI_RERANKER_MODEL_PATH')),
+            reranker_model_path=Path(os.getenv('BUMI_RERANKER_MODEL_PATH', '.')),
+            reranker_fp16=read_env_switch('BUMI_RERANKER_FP16'),
+            registered_isolation=read_env_switch('BUMI_REGISTERED_ISOLATION'),
             extraction_turns=int(os.getenv('BUMI_EXTRACTION_TURNS', '10')),
             extraction_tokens=int(os.getenv('BUMI_EXTRACTION_TOKENS', '8000')),
             community_every=int(os.getenv('BUMI_COMMUNITY_EVERY', '5')),
@@ -111,6 +143,11 @@ class ServiceSettings:
             read_timeout=float(os.getenv('BUMI_MEMORY_READ_TIMEOUT', '30')),
             explicit_recall_timeout=float(os.getenv('BUMI_EXPLICIT_RECALL_TIMEOUT', '30')),
             warmup_timeout=float(os.getenv('BUMI_MEMORY_WARMUP_TIMEOUT', '120')),
+            memory_warmup_enabled=read_env_switch('BUMI_MEMORY_WARMUP'),
+            long_term_degrade_enabled=read_env_switch('BUMI_LONG_TERM_DEGRADE_ENABLED'),
+            long_term_degrade_cooloff_seconds=float(os.getenv('BUMI_LONG_TERM_DEGRADE_COOLOFF_SECONDS', '60')),
+            long_term_degrade_probe_timeout=float(
+                os.getenv('BUMI_LONG_TERM_DEGRADE_PROBE_TIMEOUT_SECONDS', '5')),
             max_messages=int(os.getenv('BUMI_MAX_MESSAGES', '20')),
             max_l1_tokens=int(os.getenv('BUMI_MAX_L1_TOKENS', '8000')),
             carryover_messages=int(os.getenv('BUMI_CARRYOVER_MESSAGES', '20')),
@@ -144,7 +181,7 @@ def build_service_engine(settings: ServiceSettings):
     from bumi_mem.session_store import SQLiteSessionStore
     from bumi_mem.token_counter import ApproxTokenCounter
 
-    for path in (settings.embed_model_path, settings.reranker_model_path):
+    for path in (settings.embed_model_path,):
         if not Path(path).is_dir():
             raise ValueError(f'Expected existing local model directory: {path}')
     if not settings.neo4j_password:
@@ -159,8 +196,10 @@ def build_service_engine(settings: ServiceSettings):
     graph_config = GraphitiConfig(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password,
         settings.data_dir / 'graphiti', settings.embed_model_path, settings.reranker_model_path,
         device=settings.embed_device, community_every=settings.community_every,
-        max_coroutines=settings.graph_max_coroutines)
-    access = AsyncMemoryAccess(lambda: GraphitiLongTermMemory(provider, graph_config), read_timeout=settings.read_timeout)
+        max_coroutines=settings.graph_max_coroutines, reranker_fp16=settings.reranker_fp16, registered_isolation=settings.registered_isolation)
+    access = AsyncMemoryAccess(lambda: GraphitiLongTermMemory(provider, graph_config), read_timeout=settings.read_timeout,
+        degrade_cooloff_seconds=settings.long_term_degrade_cooloff_seconds,
+        degrade_probe_timeout=settings.long_term_degrade_probe_timeout)
     consolidator = SessionConsolidator(store=store, long_term=access,
         summary_provider=OpenAICompatibleProvider(provider), memory_provider_name=settings.memory_provider,
         memory_token_counter=counter, config=ConsolidatorConfig(backend='graphiti',
@@ -169,7 +208,13 @@ def build_service_engine(settings: ServiceSettings):
             local_chunk_tokens=settings.extraction_tokens, max_attempts=settings.max_attempts))
     return BumiMemory(store=store, long_term=access, chat_provider=None, consolidator=consolidator,
         chat_token_counter=counter, auto_start=False, config=BumiMemoryConfig(
-            semantic_state_enabled=False, max_messages=settings.max_messages,
+            registered_isolation=settings.registered_isolation, semantic_state_enabled=False, max_messages=settings.max_messages,
             max_l1_tokens=settings.max_l1_tokens, memory_read_timeout=settings.read_timeout,
             explicit_recall_timeout=settings.explicit_recall_timeout,
-            memory_warmup_timeout=settings.warmup_timeout))
+            memory_warmup_timeout=settings.warmup_timeout,
+            memory_warmup_enabled=settings.memory_warmup_enabled,
+            long_term_degrade_enabled=settings.long_term_degrade_enabled,
+            long_term_degrade_cooloff_seconds=settings.long_term_degrade_cooloff_seconds,
+            long_term_degrade_probe_timeout=settings.long_term_degrade_probe_timeout,
+            prefetch_ttl_seconds=settings.prefetch_ttl_seconds,
+            prefetch_max_growth_chars=settings.prefetch_max_growth_chars))

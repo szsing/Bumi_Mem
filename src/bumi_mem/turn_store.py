@@ -1,6 +1,6 @@
-"""Persistent two-phase turns. All transcript/turn/rotation writes are transactional.
+"""持久化两阶段轮次：所有转录/轮次/轮转写入都是事务性的。
 
-Mixin for SQLiteSessionStore; never holds a database transaction across model I/O.
+SQLiteSessionStore 的混入类；从不在模型 I/O 期间持有数据库事务。
 """
 from __future__ import annotations
 
@@ -13,19 +13,30 @@ from bumi_mem.schemas import BumiMemoryError
 
 
 class TurnConflict(BumiMemoryError):
+    """轮次冲突错误：幂等键冲突、轮次已关闭、Agent 忙等。"""
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
 
 
 class TurnNotFound(BumiMemoryError):
+    """轮次未找到错误。"""
     pass
 
 
-ACTIVE = ('preparing', 'awaiting_reply')
+ACTIVE = ('preparing', 'awaiting_reply')  # 轮次活跃状态集合
 
 
 class TurnStoreMixin:
+    """持久化两阶段轮次混入类：管理交互轮次的预留、提示词保存和完成。
+
+    两阶段协议：
+    1. reserve_turn：预留轮次，写入用户消息，状态设为 preparing
+    2. save_turn_prompt：保存组装好的提示词，状态设为 awaiting_reply
+    3. finish_turn：写入 AI 回复，状态设为 completed/interrupted/cancelled/failed
+
+    所有写操作在同一事务中完成，不在事务内执行模型 I/O。
+    """
     def reserve_turn(self, *, user_id, agent_id, query, token_count, idempotency_key,
                      ttl_seconds, settings, max_messages, max_l1_tokens):
         with self._connect(write=True) as conn:
@@ -55,8 +66,7 @@ class TurnStoreMixin:
         session = conn.execute("SELECT session_id FROM sessions WHERE user_id=? AND agent_id=? "
                                "AND status='active'", (user_id, agent_id)).fetchone()
         sid = session['session_id'] if session else self._insert_session(conn, user_id, agent_id)
-        # Timeout/cancelled queries still count as real speech. Bound the window
-        # even if a client repeatedly disappears without sending a reply.
+        # 超时/取消的查询仍算真实发言。即使客户端反复消失不发送回复，也要限制窗口
         stats = conn.execute('SELECT COUNT(*) AS n, COALESCE(SUM(m.token_count),0) AS tokens '
                              'FROM shared_l1 w JOIN messages m USING(message_id) '
                              'WHERE w.agent_id=? AND w.context_only=0', (agent_id,)).fetchone()
@@ -64,7 +74,7 @@ class TurnStoreMixin:
         if settings.get('backend') == 'graphiti':
             pending_tokens = conn.execute(
                 "SELECT COALESCE(SUM(m.token_count),0) FROM messages m JOIN sessions s USING(session_id) "
-                "WHERE s.agent_id=? AND s.status='active' AND m.context_only=0", (agent_id,)).fetchone()[0]
+                "WHERE s.agent_id=? AND s.status='active' AND m.context_only=0 AND m.memory_excluded=0 AND NOT EXISTS (SELECT 1 FROM memory_snapshot_sources c WHERE c.message_id=m.message_id)", (agent_id,)).fetchone()[0]
             graph_token_boundary = pending_tokens >= settings['extraction_tokens']
         if graph_token_boundary or (settings.get('backend') != 'graphiti' and (stats['n'] >= max_messages or stats['tokens'] >= max_l1_tokens)):
             receipt = self._submit_shared(conn, sid, reason='unfinished_turn_boundary', settings=settings,
@@ -142,16 +152,15 @@ class TurnStoreMixin:
             if (scope['generation'] != row['generation'] or
                     row['context_epoch'] != self._context_epoch(conn, agent_id) or
                     (reply_metadata is not None and (not reply_metadata['alignment_covers_output'] or status != 'completed'))):
-                # Preserve spoken agent text in shared L1 after forget-all, but
-                # do not let a delayed answer resurrect the deleted user's L3.
+                # forget-all 后保留已说的 agent 文本在共享 L1，但不让延迟答案复活已删除用户的 L3
                 conn.execute('UPDATE messages SET memory_excluded=1 WHERE message_id=?', (message.message_id,))
         if reply_metadata is not None and not reply_metadata['alignment_covers_output']:
-            # An empty aligned prefix is NOT evidence that the robot was silent.
+            # 空的对齐前缀不是机器人沉默的证据
             notice = self._append_message(conn, row['session_id'], role='system',
                 content=self.speech_notice(reply_metadata, turn_id=turn_id), token_count=notice_tokens,
                 context_only=True, occurred_at=occurred_at)
             conn.execute('UPDATE messages SET memory_excluded=1 WHERE message_id=?', (notice.message_id,))
-        # Release the turn within this same transaction, prior to shared rotation.
+        # 在同一事务中释放轮次，先于共享轮转
         conn.execute('UPDATE interaction_turns SET status=? WHERE turn_id=?', (status, turn_id))
         stats = conn.execute('SELECT COUNT(*) AS n,COALESCE(SUM(m.token_count),0) AS tokens '
                              'FROM shared_l1 w JOIN messages m USING(message_id) '
@@ -159,10 +168,10 @@ class TurnStoreMixin:
         if settings.get('backend') == 'graphiti':
             completed = conn.execute(
                 "SELECT COUNT(*) FROM interaction_turns t JOIN sessions s USING(session_id) "
-                "WHERE s.agent_id=? AND s.status='active' AND t.status='completed'", (agent_id,)).fetchone()[0]
+                "WHERE s.agent_id=? AND s.status='active' AND t.status='completed' AND NOT EXISTS (SELECT 1 FROM memory_snapshot_sources c WHERE c.message_id=t.source_message_id)", (agent_id,)).fetchone()[0]
             tokens = conn.execute(
                 "SELECT COALESCE(SUM(m.token_count),0) FROM messages m JOIN sessions s USING(session_id) "
-                "WHERE s.agent_id=? AND s.status='active' AND m.context_only=0", (agent_id,)).fetchone()[0]
+                "WHERE s.agent_id=? AND s.status='active' AND m.context_only=0 AND m.memory_excluded=0 AND NOT EXISTS (SELECT 1 FROM memory_snapshot_sources c WHERE c.message_id=m.message_id)", (agent_id,)).fetchone()[0]
             reason = ('extraction_turn_limit' if completed >= settings['extraction_turns'] else
                       'extraction_token_limit' if tokens >= settings['extraction_tokens'] else None)
         else:

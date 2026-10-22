@@ -1,3 +1,4 @@
+"""LoCoMo 评估服务器：提供 Mem0 记忆的 HTTP API，用于 LoCoMo 基准测试。"""
 from __future__ import annotations
 
 import logging

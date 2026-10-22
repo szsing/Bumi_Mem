@@ -1,4 +1,4 @@
-"""Provider-aware token counting."""
+"""提供者感知的 token 计数：近似计数、HuggingFace 精确计数和固定计数。"""
 
 from __future__ import annotations
 

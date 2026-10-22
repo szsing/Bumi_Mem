@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 0 only. No core Bumi changes; no paid request except explicit api-smoke."""
+"""Stage-0 基础检查：不修改 Bumi 核心代码；除显式 api-smoke 外不发起付费请求。"""
 from __future__ import annotations
 import argparse, datetime, hashlib, importlib.metadata as metadata, json, os
 from pathlib import Path

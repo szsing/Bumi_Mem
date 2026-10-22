@@ -1,4 +1,4 @@
-"""Small user-ID boundary and volatile frontend identity binding; no voice recognition."""
+"""用户 ID 边界和易失性前端身份绑定；不涉及语音识别。"""
 from dataclasses import dataclass
 import threading
 from uuid import uuid4

@@ -1,3 +1,4 @@
+# 本次改动（2026-10-21）：将迁移目标更新为 schema 11，继续验证共享短期窗口和历史来源。
 from __future__ import annotations
 
 import json
@@ -35,7 +36,7 @@ def test_b_sees_a_and_agent_speech_but_only_b_private_l3(tmp_path):
     prompt = b.prompt_messages
     assert 'B_PRIVATE_L3' in prompt[0]['content']
     refs = json.loads(prompt[0]['content'].split('[共享 L3 引用 / shared memory references]\n', 1)[1].split('\n', 1)[0])
-    assert any(r['owner_user_id'] == 'A' and r['memory'] == 'A_PRIVATE_L3' for r in refs)
+    assert any(r['user_id'] == 'A' and r['content'] == 'A_PRIVATE_L3' for r in refs)
     assert [r['memory'] for r in b.recalled] == ['B_PRIVATE_L3']
     assert 'A_PRIVATE_L3' not in prompt[0]['content'].split('[共享 L3 引用 / shared memory references]', 1)[0]
     assert [m['role'] for m in prompt[1:]] == ['user', 'assistant', 'user']
@@ -207,7 +208,7 @@ def test_migrate_v2_backfills_speaker_and_only_imports_live_window_once(tmp_path
     reopened = SQLiteSessionStore(path)
     assert reopened.list_shared_messages('bot') == migrated.list_shared_messages('bot')
     with sqlite3.connect(path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 9
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 11
 
 
 def test_tampered_owner_snapshot_is_rejected_before_llm_or_write(tmp_path):

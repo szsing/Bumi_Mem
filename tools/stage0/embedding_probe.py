@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline component timing, NOT Memory Bundle latency or retrieval-quality evidence."""
+"""离线组件计时：测量嵌入模型加载和推理耗时，不是记忆包延迟或检索质量证据。"""
 from __future__ import annotations
 
 import argparse, concurrent.futures, hashlib, importlib.metadata, json, os

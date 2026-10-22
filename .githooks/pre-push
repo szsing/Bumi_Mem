@@ -1,0 +1,14 @@
+#!/bin/sh
+# 拦直推 main（中心 2026-09-18 定：任何代码更新走分支 + PR，包括中心负责人）。
+# 装一次：git config core.hooksPath .githooks
+# 真要绕过：git push --no-verify —— 绕过了也会被 guard-main 这个 Action 记一笔。
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	case "${remote_ref}" in
+	refs/heads/main | refs/heads/master)
+		printf '✋ 不要直推 %s：本仓库任何改动都走分支 + PR（包括中心负责人）。\n' "${remote_ref}" >&2
+		printf '   git switch -c <类型>/<简述> && git push -u origin HEAD && gh pr create\n' >&2
+		exit 1
+		;;
+	esac
+done
+exit 0

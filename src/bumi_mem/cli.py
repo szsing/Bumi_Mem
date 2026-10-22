@@ -1,4 +1,4 @@
-"""Interactive CLI for the Bumi_Mem MVP."""
+"""Bumi_Mem MVP 交互式命令行界面。"""
 
 from __future__ import annotations
 
@@ -17,11 +17,13 @@ from bumi_mem.async_memory_access import AsyncMemoryAccess
 from bumi_mem.paths import DATA_ROOT, MODEL_ROOT, PROJECT_ROOT, configure_runtime
 from bumi_mem.providers import OpenAICompatibleProvider, ProviderConfig
 from bumi_mem.schemas import ConsolidationSubmission, ProviderConfigurationError
+from bumi_mem.service_settings import read_env_switch
 from bumi_mem.session_store import SQLiteSessionStore
 from bumi_mem.token_counter import ApproxTokenCounter, HuggingFaceTokenCounter, TokenCounter
 
 
 def _normalize_base_url(value: str) -> str:
+    """规范化 Base URL：去除尾部斜杠，确保以 /v1 结尾。"""
     value = value.rstrip("/")
     return value if value.endswith("/v1") else value + "/v1"
 
@@ -34,6 +36,21 @@ def _provider_config(
     base_url_override: str | None,
     max_tokens: int,
 ) -> ProviderConfig:
+    """构建 LLM 提供者配置：根据 provider 类型（local/deepseek）和环境变量组装。
+
+    参数:
+        provider:          提供者类型，"local" 或 "deepseek"
+        purpose:           用途，"chat" 或 "memory"（影响默认模型和温度）
+        model_override:    命令行指定的模型覆写
+        base_url_override: 命令行指定的 Base URL 覆写
+        max_tokens:        最大 token 数
+
+    返回:
+        ProviderConfig 实例。
+
+    副作用:
+        读取多个环境变量（BUMI_*_MODEL、BUMI_*_BASE_URL、DEEPSEEK_* 等）。
+    """
     prefix = f"BUMI_{purpose.upper()}_"
     if provider == "local":
         model = model_override or os.getenv(prefix + "MODEL") or "qwen2.5-7b-instruct"
@@ -83,6 +100,11 @@ def _provider_config(
 
 
 def _check_local_provider(config: ProviderConfig) -> None:
+    """检查本地模型服务是否就绪：访问 /health 端点，超时 3 秒。
+
+    异常:
+        ProviderConfigurationError: 本地模型未就绪时抛出。
+    """
     health = config.base_url.removesuffix("/v1") + "/health"
     try:
         with urlopen(health, timeout=3) as response:  # noqa: S310 - local URL only
@@ -95,12 +117,28 @@ def _check_local_provider(config: ProviderConfig) -> None:
 
 
 def _token_counter(provider: str) -> TokenCounter:
+    """根据提供者类型创建 token 计数器：local 用 HuggingFace，其他用近似计数。"""
     if provider == "local":
         return HuggingFaceTokenCounter(MODEL_ROOT / "Qwen2.5-7B-Instruct")
     return ApproxTokenCounter()
 
 
 def build_engine(args: argparse.Namespace) -> BumiMemory:
+    """从命令行参数构建完整的 BumiMemory 引擎。
+
+    参数:
+        args: 解析后的命令行参数
+
+    返回:
+        已配置的 BumiMemory 实例（auto_start=False，需手动调用 start）。
+
+    副作用:
+        - 调用 configure_runtime() 设置运行时环境
+        - 检查本地提供者健康状态
+        - 创建 SQLite 会话存储和 Mem0 长期记忆适配器
+        - 启动 SerialMemoryAccess 守护线程
+    """
+    reranker_fp16 = read_env_switch('BUMI_RERANKER_FP16')
     configure_runtime()
     chat_config = _provider_config(
         args.chat_provider,
@@ -137,12 +175,15 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
         password=os.environ['BUMI_NEO4J_PASSWORD'],
         data_dir=DATA_ROOT / 'graphiti',
         embed_model=Path(os.environ['BUMI_EMBED_MODEL_PATH']),
-        reranker_model=Path(os.environ['BUMI_RERANKER_MODEL_PATH']),
+        reranker_model=None,
         device=args.embed_device,
+        reranker_fp16=reranker_fp16,
         community_every=int(os.getenv('BUMI_COMMUNITY_EVERY', '5')),
     )
     l3 = AsyncMemoryAccess(lambda: GraphitiLongTermMemory(memory_config, adapter_config),
-                           read_timeout=args.memory_read_timeout)
+                           read_timeout=args.memory_read_timeout,
+                           degrade_cooloff_seconds=args.long_term_degrade_cooloff_seconds,
+                           degrade_probe_timeout=args.long_term_degrade_probe_timeout)
     consolidator = SessionConsolidator(
         store=store,
         long_term=l3,
@@ -173,19 +214,25 @@ def build_engine(args: argparse.Namespace) -> BumiMemory:
             search_threshold=args.search_threshold,
             max_answer_tokens=args.max_answer_tokens,
             memory_read_timeout=args.memory_read_timeout,
+            explicit_recall_timeout=args.explicit_recall_timeout,
             memory_warmup_enabled=not args.no_memory_warmup,
             memory_warmup_timeout=args.memory_warmup_timeout,
             memory_warmup_query=args.memory_warmup_query,
+            long_term_degrade_enabled=not args.no_long_term_degrade,
+            long_term_degrade_cooloff_seconds=args.long_term_degrade_cooloff_seconds,
+            long_term_degrade_probe_timeout=args.long_term_degrade_probe_timeout,
         ),
         auto_start=False,
     )
 
 
 def _memory_text(item: dict[str, Any]) -> str:
+    """从记忆字典中提取显示文本：依次尝试 memory/text/data 字段。"""
     return str(item.get("memory", item.get("text", item.get("data", ""))))
 
 
 def _print_memories(rows: list[dict[str, Any]]) -> None:
+    """格式化打印记忆列表，含序号、ID、内容和相似度分数。"""
     if not rows:
         print("  （没有结果）")
         return
@@ -196,11 +243,13 @@ def _print_memories(rows: list[dict[str, Any]]) -> None:
 
 
 def _print_submission(receipt: ConsolidationSubmission, *, debug: bool) -> None:
+    """调试模式下打印整理提交回执信息。"""
     if debug:
         print(f"[后台整理] job={receipt.job_id} status={receipt.status} new_session={receipt.new_session_id}")
 
 
 def _print_jobs(engine: BumiMemory, args: argparse.Namespace) -> None:
+    """打印后台任务列表，含 job ID、类型、状态、尝试次数和错误。"""
     jobs = engine.memory_jobs(user_id=args.user_id, agent_id=args.agent_id)
     if not jobs:
         print("（没有后台任务）")
@@ -211,6 +260,7 @@ def _print_jobs(engine: BumiMemory, args: argparse.Namespace) -> None:
 
 
 def _help() -> None:
+    """打印交互式命令帮助信息。"""
     print("""命令：
   /help                  显示帮助
   /user <id>             开发用身份绑定/切换；生产由可信声纹前端提供
@@ -236,6 +286,17 @@ def _help() -> None:
 
 
 def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
+    """运行交互式命令行界面：预热记忆、进入主循环、退出时关闭引擎。
+
+    参数:
+        engine: BumiMemory 引擎实例
+        args:   命令行参数
+
+    副作用:
+        - 调用 engine.start() 预热记忆
+        - 进入交互循环处理用户输入
+        - 退出时调用 engine.close()
+    """
     try:
         if engine.config.memory_warmup_enabled:
             print(
@@ -252,12 +313,20 @@ def run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
                 f"Memory 预热完成：{elapsed_ms:.3f} ms；embedding 与向量库已就绪。",
                 flush=True,
             )
+        elif engine.long_term_degraded:
+            print("警告：长期记忆暂不可用，当前仅使用短期记忆（L1）运行。", file=sys.stderr, flush=True)
         _run_interactive(engine, args)
     finally:
         engine.close()
 
 
 def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
+    """交互式主循环：解析并执行用户命令或对话输入。
+
+    支持的命令：/help、/user、/logout、/remember、/read、/memories、/search、
+    /session、/jobs、/retry、/recall、/debug、/new、/discard、/forget、/core、
+    /forget-all、/quit。其他输入作为对话文本发送给引擎。
+    """
     debug = bool(args.debug)
     recall_enabled = True
     identity = UserIdentity()
@@ -394,7 +463,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
                 if stats.effective_messages:
                     action = input("输入 save / discard / cancel（save 按用户保存任务；discard 清空本 agent 所有用户的共享短期上下文）：").strip().lower()
                     if action == "save":
-                        # Do not let the worker start the new quit-save job as we exit.
+                        # 退出前停止 worker，防止其启动新的 quit-save 作业
                         engine.worker.stop(timeout=0.0)
                         receipt = engine.end_session(user_id=args.user_id, agent_id=args.agent_id, reason="quit_save")
                         _print_submission(receipt, debug=debug)
@@ -427,6 +496,7 @@ def _run_interactive(engine: BumiMemory, args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数：提供者、模型、记忆配置、整理配置等。"""
     parser = argparse.ArgumentParser(description="Bumi_Mem layered companion-memory CLI")
     parser.add_argument("--user-id", default=None, help="显式用户身份；不提供时长期记忆保持锁定")
     parser.add_argument("--agent-id", default="bumi_companion")
@@ -448,7 +518,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-answer-tokens", type=int, default=512)
     parser.add_argument("--summary-max-tokens", type=int, default=512)
     parser.add_argument("--memory-max-tokens", type=int, default=None)
-    parser.add_argument("--memory-read-timeout", type=float, default=30.0)
+    parser.add_argument("--memory-read-timeout", type=float, default=float(os.getenv("BUMI_MEMORY_READ_TIMEOUT", "30")))
+    parser.add_argument("--explicit-recall-timeout", type=float, default=float(os.getenv("BUMI_EXPLICIT_RECALL_TIMEOUT", "30")))
     parser.add_argument(
         "--memory-warmup-timeout",
         type=float,
@@ -463,6 +534,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip startup embedding and vector-store warmup",
     )
+    parser.add_argument(
+        "--no-long-term-degrade",
+        action="store_true",
+        help="fail startup instead of degrading to short-term-only when long-term warmup fails",
+    )
+    parser.add_argument(
+        "--long-term-degrade-cooloff-seconds",
+        type=float,
+        default=float(os.getenv("BUMI_LONG_TERM_DEGRADE_COOLOFF_SECONDS", "60")),
+    )
+    parser.add_argument(
+        "--long-term-degrade-probe-timeout",
+        type=float,
+        default=float(os.getenv("BUMI_LONG_TERM_DEGRADE_PROBE_TIMEOUT_SECONDS", "5")),
+    )
     parser.add_argument("--memory-max-attempts", type=int, default=3)
     parser.add_argument("--memory-retry-base-seconds", type=float, default=5.0)
     parser.add_argument("--debug", action="store_true")
@@ -470,6 +556,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI 入口：解析参数、构建引擎、运行交互界面。"""
     args = parse_args()
     try:
         engine = build_engine(args)

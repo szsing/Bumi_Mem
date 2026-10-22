@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin launcher for the Bumi_Mem CLI."""
+"""Bumi_Mem CLI 的薄启动器。"""
 
 from bumi_mem.cli import main
 

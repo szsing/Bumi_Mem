@@ -1,10 +1,9 @@
-"""SQLite L1/L2 storage and durable, leased background memory jobs.
+# 本次改动（2026-10-21）：接入注册表存储并迁移至 schema 11，阻止旧程序降级读取新库。
+"""SQLite 持久化存储：L1/L2 消息、会话、共享窗口、后台作业队列。
 
-External model/vector calls never run inside a SQLite transaction. A session
-shared-window rotation and all owner job snapshots commit together. Per-user
-sessions remain private extraction/audit streams, while shared_l1 references form
-one chronological foreground context per agent. Frozen owner sessions can coexist
-with the new conversation.
+外部模型/向量调用不在 SQLite 事务内执行。会话窗口轮转和所有者作业快照
+在同一事务中提交。每用户会话保持私有的抽取/审计流，shared_l1 引用构成
+每个 agent 的一个按时间排序的前台上下文。冻结的所有者会话可与新对话共存。
 """
 from __future__ import annotations
 
@@ -30,6 +29,8 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+from bumi_mem.registry import RegistryStoreMixin
+from bumi_mem.control_store import ControlStoreMixin
 from bumi_mem.turn_store import TurnStoreMixin
 from bumi_mem.context_store import ContextStoreMixin
 from bumi_mem.shared_memory import SharedMemoryStoreMixin
@@ -39,7 +40,16 @@ from bumi_mem.event_time import message_time
 from bumi_mem.agent_store import AgentStoreMixin
 
 
-class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMixin, SemanticStateStoreMixin, AgentStoreMixin):
+class SQLiteSessionStore(RegistryStoreMixin, ControlStoreMixin, TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMixin, SemanticStateStoreMixin, AgentStoreMixin):
+    """SQLite 持久化存储：L1/L2 消息、会话、共享窗口、后台作业队列。
+
+    设计原则：
+    - 外部模型/向量调用不在 SQLite 事务内执行
+    - 会话窗口轮转和所有者作业快照在同一事务中提交
+    - 每用户会话保持私有的抽取/审计流
+    - shared_l1 引用构成每个 agent 的一个按时间排序的前台上下文
+    - 冻结的所有者会话可与新对话共存
+    """
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,7 +73,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] > 9:
+            if conn.execute("PRAGMA user_version").fetchone()[0] > 11:
                 raise RuntimeError("Database schema is newer than this Bumi version; refusing to downgrade")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
@@ -157,8 +167,8 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                          "context_only INTEGER NOT NULL DEFAULT 0)")
             conn.execute("CREATE INDEX IF NOT EXISTS shared_l1_agent ON shared_l1(agent_id,position)")
             if conn.execute('PRAGMA user_version').fetchone()[0] < 3:
-                # Migrate only live windows, never resurrect discarded/frozen history.
-                # Carry-over copies retain their source identity and remain context-only.
+                # 只迁移活跃窗口，不复活已丢弃/冻结的历史
+                # 携带副本保留其来源身份并保持 context-only
                 conn.execute("INSERT OR IGNORE INTO shared_l1(agent_id,message_id,context_only) "
                              "SELECT s.agent_id,m.message_id,m.context_only FROM messages m "
                              "JOIN sessions s USING(session_id) WHERE s.status='active' "
@@ -169,7 +179,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                 conn.execute('DROP INDEX one_open_session_per_pair')
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_open_session_per_pair "
                          "ON sessions(user_id,agent_id) WHERE status='active'")
-            # Never relabel live running work just because another reader starts.
+            # 不因另一个读者启动就重新标记正在运行的工作
             conn.execute("CREATE TABLE IF NOT EXISTS interaction_turns ("
                          "turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id), "
                          "user_id TEXT NOT NULL, agent_id TEXT NOT NULL, query TEXT NOT NULL, "
@@ -190,8 +200,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                          "state TEXT NOT NULL DEFAULT 'preparing', response_json TEXT, created_at REAL NOT NULL, "
                          "UNIQUE(agent_id,idempotency_key))")
             if conn.execute('PRAGMA user_version').fetchone()[0] < 5:
-                # An assistant speaks as the agent, not as a user. Sessions and
-                # old task snapshots still preserve extraction provenance.
+                # assistant 以 agent 身份说话，而非 user。会话和旧任务快照仍保留抽取来源
                 conn.execute("UPDATE messages SET user_id='' WHERE role!='user'")
                 conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
             # v6: source-linked shared recall, semantic state and cross-user cache revocation.
@@ -205,7 +214,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                 for name, definition in additions:
                     if name not in existing_columns:
                         conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
-            # A v5 pending turn can safely recover its original user evidence.
+            # v5 待处理轮次可安全恢复其原始用户证据
             conn.execute("UPDATE interaction_turns SET source_message_id=(SELECT message_id FROM messages m "
                          "WHERE m.session_id=interaction_turns.session_id AND m.role='user' "
                          "AND m.content=interaction_turns.query ORDER BY m.sequence_no DESC LIMIT 1) "
@@ -214,12 +223,14 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                 conn.execute("UPDATE interaction_turns SET prompt_json=NULL WHERE status IN ('preparing','awaiting_reply')")
                 conn.execute("UPDATE context_requests SET response_json=NULL WHERE state!='revoked'")
             self.create_agent_tables(conn)
+            self.create_control_tables(conn)
+            self.create_registry_tables(conn)
             version = conn.execute('PRAGMA user_version').fetchone()[0]
             if version < 8:
                 self.migrate_context_request_protocols(conn)
             if version < 9:
                 self.migrate_structured_turn_responses(conn)
-            conn.execute('PRAGMA user_version=9')
+            conn.execute('PRAGMA user_version=11')
 
     @staticmethod
     def _session(row: sqlite3.Row | None) -> SessionRecord | None:
@@ -345,7 +356,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
             raise KeyError(session_id)
         if old['status'] != 'active' and not (legacy and old['status'] in ('processing', 'failed')):
             raise SessionBlockedError(f'cannot submit {old["status"]} session')
-        rows = conn.execute('SELECT * FROM messages WHERE session_id=? AND context_only=0 ORDER BY sequence_no',
+        rows = conn.execute('SELECT * FROM messages WHERE session_id=? AND context_only=0 AND message_id NOT IN (SELECT message_id FROM memory_snapshot_sources) ORDER BY sequence_no',
                             (session_id,)).fetchall()
         eligible = [] if is_guest(old['user_id']) else [self._message(r) for r in rows if not r['memory_excluded']]
         tail = [self._message(r) for r in rows[-carryover_messages:]] if carryover_messages else []
@@ -474,7 +485,24 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
         return self.read_scope(user_id, agent_id)[1]
 
     def request_forget(self, *, user_id: str, agent_id: str, max_attempts: int = 3) -> MemoryJob:
-        """Suppress reads immediately; serialize physical deletion behind in-flight writes."""
+        """请求遗忘全部记忆：立即抑制读取，将物理删除序列化到后台作业。
+
+        流程：
+        1. 递增作用域代数并标记 delete_pending
+        2. 取消所有进行中的整理作业
+        3. 废弃所有进行中/失败的会话
+        4. 撤销所有待处理的上下文请求和交互轮次
+        5. 删除所有共享引用和语义状态
+        6. 排除所有消息的抽取资格
+        7. 入队 delete 作业
+
+        参数:
+            user_id:      用户 ID
+            agent_id:     Agent ID
+            max_attempts: 最大重试次数
+        返回:
+            入队的 delete MemoryJob
+        """
         with self._connect(write=True) as conn:
             scope = self._scope(conn, user_id, agent_id)
             generation = scope['generation'] + 1
@@ -524,6 +552,18 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
         except (TypeError, ValueError):
             return 0.0
 
+    def has_pending_jobs(self) -> bool:
+        """是否存在任何非终态作业（queued/retry_wait/running）。
+
+        故意比 oldest_due_job_age_seconds() 更宽松：'running' 状态可能是租约已过期、
+        等待 claim_job() 内部清理逻辑重新排队的僵尸作业（见 claim_job 开头的租约清理），
+        这里不展开那层判断，只用于"要不要碰长期记忆"这个粗粒度决策，交给 claim_job() 处理细节。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM memory_jobs WHERE status IN ('queued','retry_wait','running') LIMIT 1").fetchone()
+        return row is not None
+
     def claim_job(self, owner: str, *, lease_seconds: float) -> MemoryJob | None:
         now = time.time()
         with self._connect(write=True) as conn:
@@ -533,7 +573,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
             conn.execute('INSERT INTO memory_worker_lease(singleton,owner,expires_at) VALUES(1,?,?) '
                          'ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at',
                          (owner, now + lease_seconds))
-            # A persisted "writing" checkpoint after a crash is NOT evidence of failure.
+            # 崩溃后持久化的 "writing" 检查点不是失败的证据
             for row in conn.execute("SELECT * FROM memory_jobs WHERE status='running' AND lease_until<=?", (now,)).fetchall():
                 uncertain = conn.execute("SELECT 1 FROM memory_chunks WHERE job_id=? AND status='writing'", (row['job_id'],)).fetchone()
                 error = 'Write outcome unknown after interruption; explicit replay confirmation required.' if uncertain else 'Interrupted; recovered from lease expiry.'
@@ -564,6 +604,14 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
             return self._job(conn.execute('SELECT * FROM memory_jobs WHERE job_id=?', (row['job_id'],)).fetchone())
 
     def renew_lease(self, owner: str, *, lease_seconds: float) -> bool:
+        """续租当前作业的工作锁，防止因租约过期被其他工作线程抢占。
+
+        参数:
+            owner:         工作线程标识
+            lease_seconds: 新租约时长
+        返回:
+            是否续租成功
+        """
         now = time.time()
         with self._connect(write=True) as conn:
             changed = conn.execute('UPDATE memory_worker_lease SET expires_at=? WHERE singleton=1 AND owner=? AND expires_at>?',
@@ -573,6 +621,7 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
             return bool(changed)
 
     def release_lease(self, owner: str) -> None:
+        """释放工作锁，允许其他工作线程认领作业。"""
         with self._connect(write=True) as conn:
             conn.execute('DELETE FROM memory_worker_lease WHERE singleton=1 AND owner=?', (owner,))
 
@@ -623,6 +672,15 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
                          (status, json.dumps(events or [], ensure_ascii=False, default=str), error, chunk_id))
 
     def finish_job(self, job_id: str, owner: str) -> None:
+        """标记作业为成功完成。
+
+        对于 consolidate 作业：检查所有 chunk 是否成功，标记消息为已整理。
+        对于 delete 作业：清除 delete_pending 标记。
+
+        参数:
+            job_id: 作业 ID
+            owner:  工作线程标识
+        """
         with self._connect(write=True) as conn:
             row = self._assert_current(conn, job_id, owner)
             if row['kind'] == 'consolidate':
@@ -640,6 +698,15 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
 
     def fail_job(self, job_id: str, owner: str, error: str, *, retry_delay: float,
                  retryable: bool = True) -> None:
+        """标记作业为失败，可重试时设为 retry_wait 状态。
+
+        参数:
+            job_id:      作业 ID
+            owner:       工作线程标识
+            error:       错误信息
+            retry_delay: 重试等待时间（秒）
+            retryable:   是否可重试
+        """
         with self._connect(write=True) as conn:
             row = self._assert_current(conn, job_id, owner)
             state = 'retry_wait' if retryable and row['attempts'] < row['max_attempts'] else 'failed'
@@ -768,6 +835,20 @@ class SQLiteSessionStore(TurnStoreMixin, ContextStoreMixin, SharedMemoryStoreMix
 
     def retry_job(self, job_id: str, *, user_id: str, agent_id: str, max_attempts: int = 3,
                   allow_replay: bool = False) -> MemoryJob:
+        """重试一个失败的作业。
+
+        对于有不确定写入结果（writing/uncertain chunk）的作业，
+        需要显式设置 allow_replay=True 才能重试。
+
+        参数:
+            job_id:       作业 ID
+            user_id:      用户 ID
+            agent_id:     Agent ID
+            max_attempts: 追加的最大重试次数
+            allow_replay: 是否允许重放不确定的写入
+        返回:
+            更新后的 MemoryJob
+        """
         with self._connect(write=True) as conn:
             row = conn.execute('SELECT * FROM memory_jobs WHERE job_id=? AND user_id=? AND agent_id=?',
                                (job_id, user_id, agent_id)).fetchone()

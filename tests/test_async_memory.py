@@ -14,7 +14,7 @@ from bumi_mem.cli import run_interactive
 from bumi_mem.long_term import FakeLongTermMemory
 from bumi_mem.memory_access import SerialMemoryAccess
 from bumi_mem.providers import FakeTextProvider
-from bumi_mem.schemas import MemoryReadUnavailable, RetryableMemoryError
+from bumi_mem.schemas import MemoryReadUnavailable, RetryableMemoryError, ProviderConfigurationError
 from bumi_mem.session_store import SQLiteSessionStore
 from test_bumi_memory import make_engine, chat_turn, submit
 
@@ -509,3 +509,307 @@ def test_engine_start_warms_backend_once_without_a_user_scope(tmp_path):
         assert memory.warmup_calls == ['记忆系统预热']
     finally:
         engine.close()
+
+
+def test_factory_failure_marks_degraded_and_short_circuits_during_cooloff():
+    calls = []
+
+    def factory():
+        calls.append(1)
+        raise ConnectionError('connection refused')
+
+    access = SerialMemoryAccess(factory, read_timeout=0.05, degrade_cooloff_seconds=60.0)
+    assert access.status == 'unchecked'
+    with pytest.raises(RetryableMemoryError):
+        access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')
+    assert access.status == 'degraded'
+    assert len(calls) == 1
+    # 冷却期内再调用：立即短路，不会再碰 factory。
+    with pytest.raises(RetryableMemoryError):
+        access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')
+    assert len(calls) == 1
+    access.close()
+
+
+def test_recovers_after_cooloff_when_probe_succeeds():
+    attempts = []
+
+    def factory():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ConnectionError('connection refused')
+        return FakeLongTermMemory()
+
+    access = SerialMemoryAccess(factory, read_timeout=0.5, degrade_cooloff_seconds=0.02)
+    with pytest.raises(RetryableMemoryError):
+        access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')
+    assert access.status == 'degraded'
+    time.sleep(0.05)
+    access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')
+    assert access.status == 'ready'
+    assert len(attempts) == 2
+    access.close()
+
+
+def test_permanent_config_error_does_not_enter_degraded():
+    def factory():
+        raise ProviderConfigurationError('bad config')
+
+    access = SerialMemoryAccess(factory, read_timeout=0.05)
+    with pytest.raises(RetryableMemoryError):
+        access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')
+    assert access.status == 'unchecked'
+    access.close()
+
+
+def test_unknown_error_from_search_does_not_flip_circuit_but_still_raises():
+    class Weird(FakeLongTermMemory):
+        def search(self, **kwargs):
+            raise KeyError('weird')
+
+    access = SerialMemoryAccess(lambda: Weird(), read_timeout=0.5)
+    with pytest.raises(KeyError):
+        access.search(user_id='u', agent_id='a', query='q', top_k=1, threshold=0.1)
+    assert access.status == 'unchecked'
+    access.close()
+
+
+def test_unknown_error_from_warmup_is_treated_as_degraded():
+    class Weird(FakeLongTermMemory):
+        def warmup(self, **kwargs):
+            raise KeyError('weird')
+
+    access = SerialMemoryAccess(lambda: Weird(), read_timeout=0.5)
+    with pytest.raises(KeyError):
+        access.warmup(timeout=1.0, query='q')
+    assert access.status == 'degraded'
+    access.close()
+
+
+def test_ensure_available_probes_once_when_unchecked_and_becomes_ready():
+    access = SerialMemoryAccess(lambda: FakeLongTermMemory(), read_timeout=0.5, degrade_probe_timeout=0.5)
+    assert access.status == 'unchecked'
+    assert access.ensure_available() is True
+    assert access.status == 'ready'
+    access.close()
+
+
+def test_ensure_available_short_circuits_during_cooloff_without_touching_backend():
+    calls = []
+
+    def factory():
+        calls.append(1)
+        raise OSError('down')
+
+    access = SerialMemoryAccess(factory, read_timeout=0.05, degrade_cooloff_seconds=60.0)
+    assert access.ensure_available() is False
+    assert access.status == 'degraded'
+    assert len(calls) == 1
+    assert access.ensure_available() is False
+    assert len(calls) == 1
+    access.close()
+
+
+def test_ensure_available_raises_identified_permanent_error_instead_of_swallowing():
+    def factory():
+        raise ProviderConfigurationError('bad config')
+
+    access = SerialMemoryAccess(factory, read_timeout=0.05)
+    with pytest.raises(RetryableMemoryError):
+        access.ensure_available()
+    access.close()
+
+
+def test_concurrent_calls_only_one_probe_reaches_backend_after_cooloff():
+    entered, release = threading.Event(), threading.Event()
+    hits = []
+
+    class Gate(FakeLongTermMemory):
+        def search(self, **kwargs):
+            hits.append(1)
+            entered.set()
+            assert release.wait(2)
+            return super().search(**kwargs)
+
+    memory = Gate()
+    attempts = {'n': 0}
+
+    def factory():
+        attempts['n'] += 1
+        if attempts['n'] == 1:
+            raise ConnectionError('still down')
+        return memory
+
+    access = SerialMemoryAccess(factory, read_timeout=0.5, degrade_cooloff_seconds=0.02)
+    with pytest.raises(RetryableMemoryError):
+        access.search(user_id='u', agent_id='a', query='q', top_k=1, threshold=0.1)
+    assert access.status == 'degraded'
+    time.sleep(0.05)
+    errors = []
+
+    def call():
+        try:
+            access.search(user_id='u', agent_id='a', query='q', top_k=1, threshold=0.1)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=call) for _ in range(5)]
+    for t in threads:
+        t.start()
+    assert entered.wait(2)
+    time.sleep(0.05)
+    release.set()
+    for t in threads:
+        t.join(2)
+    assert len(hits) == 1
+    assert len(errors) == 4
+    access.close()
+
+
+def test_concurrent_calls_only_one_probe_reaches_backend_when_unchecked():
+    entered, release = threading.Event(), threading.Event()
+    hits = []
+
+    class Gate(FakeLongTermMemory):
+        def search(self, **kwargs):
+            hits.append(1)
+            entered.set()
+            assert release.wait(2)
+            return super().search(**kwargs)
+
+    access = SerialMemoryAccess(lambda: Gate(), read_timeout=0.5)
+    assert access.status == 'unchecked'
+    errors = []
+
+    def call():
+        try:
+            access.search(user_id='u', agent_id='a', query='q', top_k=1, threshold=0.1)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=call) for _ in range(5)]
+    for t in threads:
+        t.start()
+    assert entered.wait(2)
+    time.sleep(0.05)
+    release.set()
+    for t in threads:
+        t.join(2)
+    assert len(hits) == 1
+    assert len(errors) == 4
+    access.close()
+
+
+def test_stale_success_cannot_overwrite_a_fresher_failure(monkeypatch):
+    # 熔断在 status != 'ready' 时会用一把锁保证只有一个请求去探测，所以要复现"旧成功
+    # 覆盖新故障"必须先让状态落在 ready（稳态，两边都不碰那把锁），才会有 A/B 真正并发、
+    # 结果被乱序应用的空间——这正是 Codex 描述的生产场景：大量并发读写都在正常流动时，
+    # 一个更早派发、更晚被调度去"应用结果"的成功调用，不能盖掉一个更晚派发、先被调度、
+    # 真正失败了的调用。
+    class Backend(FakeLongTermMemory):
+        def search(self, **kwargs):
+            raise ConnectionError('search failed')
+
+    access = SerialMemoryAccess(lambda: Backend(), read_timeout=0.5)
+    access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')  # seq=0，推进到 ready
+    assert access.status == 'ready'
+
+    reached_a, release_a = threading.Event(), threading.Event()
+    original_record = access._record_outcome
+
+    def patched(seq, *args, **kwargs):
+        if seq == 1:  # A：seq=1，写操作，会成功
+            reached_a.set()
+            assert release_a.wait(2)
+        return original_record(seq, *args, **kwargs)
+
+    monkeypatch.setattr(access, '_record_outcome', patched)
+
+    results = {}
+
+    def call_a():
+        results['a'] = access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')
+
+    thread_a = threading.Thread(target=call_a)
+    thread_a.start()
+    assert reached_a.wait(2)  # A 已经在后端真正执行完（成功），正卡在"应用结果"这一步
+    with pytest.raises(ConnectionError):
+        access.search(user_id='u', agent_id='a', query='q', top_k=1, threshold=0.1)  # B，seq=2，失败
+    assert access.status == 'degraded'  # B 的失败已经生效
+    release_a.set()
+    thread_a.join(2)
+    assert 'a' in results  # A 本身确实成功了（没有抛异常），只是它的状态更新被拒绝
+    assert access.status == 'degraded'  # 旧的成功（seq=0）不能覆盖新的故障（seq=1）
+    access.close()
+
+
+def test_fail_fast_outcome_does_not_suppress_an_earlier_pending_failure(monkeypatch):
+    # A（seq=1，真实的连接失败，真正反映可用性）先派发，但调用方线程被人为卡住，还没
+    # 应用结果；B（seq=2，参数错误，fail-fast，不反映可用性）后派发、先被调度、应用完毕。
+    # fail-fast 的 B 不该占用 seq 位，否则 A 后面应用 seq=1 时会被 "1 <= 2" 误判成过期丢弃，
+    # 一次真实的连接故障就这样消失，熔断永远停在 ready，worker 也不会再去探测恢复。
+    class Backend(FakeLongTermMemory):
+        def search(self, **kwargs):
+            raise ConnectionError('search failed')
+        def get_all(self, **kwargs):
+            raise TypeError('bad params')
+
+    access = SerialMemoryAccess(lambda: Backend(), read_timeout=0.5)
+    access.add_session(user_id='u', agent_id='a', messages=[], metadata={}, prompt='')  # seq=0，推进到 ready
+    assert access.status == 'ready'
+
+    reached_a, release_a = threading.Event(), threading.Event()
+    original_record = access._record_outcome
+
+    def patched(seq, *args, **kwargs):
+        if seq == 1:  # A：真实的连接失败
+            reached_a.set()
+            assert release_a.wait(2)
+        return original_record(seq, *args, **kwargs)
+
+    monkeypatch.setattr(access, '_record_outcome', patched)
+
+    results = {}
+
+    def call_a():
+        try:
+            access.search(user_id='u', agent_id='a', query='q', top_k=1, threshold=0.1)
+        except Exception as exc:
+            results['a'] = exc
+
+    thread_a = threading.Thread(target=call_a)
+    thread_a.start()
+    assert reached_a.wait(2)  # A 已经在后端真正失败，正卡在"应用结果"这一步
+    with pytest.raises(TypeError):
+        access.get_all(user_id='u', agent_id='a')  # B，seq=2，fail-fast
+    assert access.status == 'ready'  # fail-fast 不该改变状态，也不该占用 seq 位
+    release_a.set()
+    thread_a.join(2)
+    assert isinstance(results.get('a'), ConnectionError)
+    assert access.status == 'degraded'  # A 的真实故障最终必须生效，不能被 B 吞掉
+    access.close()
+
+
+def test_cuda_accelerator_and_oom_errors_are_fail_fast():
+    import torch
+    from bumi_mem.memory_access import _is_fail_fast
+
+    try:
+        raise torch.AcceleratorError('boom')
+    except Exception as exc:
+        assert _is_fail_fast(exc, lenient_unknown=True) is True
+    try:
+        raise torch.cuda.OutOfMemoryError('boom')
+    except Exception as exc:
+        assert _is_fail_fast(exc, lenient_unknown=True) is True
+
+
+def test_cause_chain_names_includes_location_but_not_message():
+    from bumi_mem.memory_access import _cause_chain_names
+
+    try:
+        raise RuntimeError('do not leak this api-key-abc123')
+    except Exception as exc:
+        chain = _cause_chain_names(exc)
+    assert chain.startswith('RuntimeError@test_async_memory.py:')
+    assert 'api-key-abc123' not in chain

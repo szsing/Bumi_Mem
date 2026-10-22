@@ -1,4 +1,4 @@
-"""Deterministic date provenance; never consult the worker's clock."""
+"""确定性日期溯源：基于消息时间戳归一化相对日期，不查询工作线程时钟。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,7 +13,7 @@ class NormalizedRelativeDates:
     observed_at: str
 
 
-# Longer English expressions must not be partially rewritten as yesterday/tomorrow.
+# 较长的英文表达不得被部分重写为 yesterday/tomorrow
 _RELATIVE_DAY = re.compile(
     r"\b(?:the\s+)?day\s+(?:before\s+yesterday|after\s+tomorrow)\b|"
     r"\b(?:yesterday|today|tomorrow)\b|昨天|今天|明天", re.IGNORECASE

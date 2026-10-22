@@ -1,7 +1,7 @@
-"""Bounded shared L3 references and source-aware read suppression.
+"""有界共享 L3 引用和源感知读取抑制。
 
-References are DATA attached to a real user turn, never chat speech, never
-consolidation input. All recipients may see them while the anchor is in L1.
+引用是附加在真实用户轮次上的数据，不是对话发言，不是整理输入。
+锚点在 L1 中时所有接收者可见。
 """
 from __future__ import annotations
 
@@ -15,19 +15,29 @@ from bumi_mem.schemas import MemoryScopeError
 
 
 def reference_key(row: dict[str, Any]) -> str:
+    """计算记忆行的唯一引用键：优先使用 id 字段，否则用 memory/text 内容的 SHA256 哈希。"""
     return str(row.get('id') or ('text:' + hashlib.sha256(
         str(row.get('memory', row.get('text', ''))).encode()).hexdigest()))
 
 
 def source_ids(row: dict[str, Any]) -> set[str]:
+    """提取记忆行的来源消息 ID 集合（用于溯源和抑制）。"""
     meta = row.get('metadata') or {}
     ids = meta.get('source_message_ids', [])
     if isinstance(ids, str):
-        ids = [ids]
+        ids = [ids]  # 兼容单字符串格式
     return {x for x in ids if isinstance(x, str)}
 
 
 class SharedMemoryStoreMixin:
+    """共享 L3 引用存储混入类：管理引用的创建、查询、失效和逻辑删除。
+
+    核心概念：
+    - 引用（reference）：附加在真实用户轮次上的 L3 记忆数据，非对话发言
+    - 锚点（anchor）：引用所依附的 L1 消息，锚点离开 L1 后引用自动失效
+    - 墓碑（tombstone）：逻辑删除标记，阻止被删除记忆的后续读取
+    - 源抑制（blocked source）：阻止特定来源消息的后续抽取
+    """
     @staticmethod
     def create_shared_memory_tables(conn):
         statements = [
@@ -105,7 +115,7 @@ class SharedMemoryStoreMixin:
                                   (anchor_message_id,)).fetchone()
             if not anchor or (anchor['user_id'], anchor['agent_id'], anchor['role']) != (user_id, agent_id, 'user'):
                 raise MemoryScopeError('memory reference anchor does not belong to current user')
-            # Defensive reclamation: L1 anchors alone define lifetime, no new TTL.
+            # 防御性回收：L1 锚点单独定义生命周期，无新 TTL
             conn.execute('DELETE FROM shared_memory_refs WHERE agent_id=? AND anchor_message_id NOT IN '
                          '(SELECT message_id FROM shared_l1 WHERE agent_id=?)', (agent_id, agent_id))
             if replace_user_refs:
@@ -136,7 +146,7 @@ class SharedMemoryStoreMixin:
                                         "AND memory_id=? AND version_hash=? AND status='active'",
                                         (agent_id, user_id, mid, version)).fetchone()
                 if existing and (visible_message_ids is None or existing['anchor_message_id'] in visible_message_ids):
-                    continue  # Do not renew a still-visible reference on prompt assembly.
+                    continue  # 提示词组装时不续期仍可见的引用
                 conn.execute("UPDATE shared_memory_refs SET status='superseded' "
                              "WHERE agent_id=? AND user_id=? AND memory_id=? AND status='active'",
                              (agent_id, user_id, mid))
@@ -170,7 +180,7 @@ class SharedMemoryStoreMixin:
             invalid = [r['ref_id'] for r in rows if memory_conflicts(
                 str(json.loads(r['payload_json']).get('memory', '')), current_rows)]
             conn.executemany("UPDATE shared_memory_refs SET status='superseded' WHERE ref_id=?", [(x,) for x in invalid])
-            # Core changes themselves change the meaning of a cached prompt.
+            # 核心变更本身改变了缓存提示词的含义
             self._bump_context_epoch(conn, agent_id)
 
     def request_forget_memory(self, *, user_id, agent_id, memory):

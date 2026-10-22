@@ -1,4 +1,8 @@
-"""Stage-1 typed contracts. Authenticated identities are supplied by trusted code."""
+"""Stage-1 类型化合约：强类型的数据模型和校验规则。
+
+认证身份由可信的上游代码提供，本模块不负责身份验证。
+所有模型使用 Pydantic strict 模式，禁止额外字段，确保数据边界清晰。
+"""
 from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Annotated, Any, Literal
@@ -10,6 +14,7 @@ Kind = Literal["identity", "behavior", "episode", "record_index"]
 
 
 def timestamp(value: str | None) -> float | None:
+    """将 ISO 8601 字符串转为 Unix 时间戳；None 返回 None。要求带时区偏移。"""
     if value is None:
         return None
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -19,14 +24,26 @@ def timestamp(value: str | None) -> float | None:
 
 
 def iso(value: float | None) -> str | None:
+    """将 Unix 时间戳转为 UTC ISO 8601 字符串；None 返回 None。"""
     return None if value is None else datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
 class Contract(BaseModel):
+    """合约基类：strict 模式、禁止额外字段、不可变、禁止 NaN。"""
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True, allow_inf_nan=False, revalidate_instances="always")
 
 
 class Scope(Contract):
+    """访问作用域：定义一次记忆访问的空间、主体、受众和用途。
+
+    属性:
+        space_id:          空间 ID
+        actor_id:          行为者 ID（未知身份时为 None）
+        audience_ids:      受众 ID 列表
+        identity_status:   身份状态（'verified_by_upstream'/'unknown'）
+        purpose:           用途
+        audience_confirmed: 受众是否已确认
+    """
     space_id: Identifier
     actor_id: Identifier | None
     audience_ids: list[Identifier]
@@ -48,6 +65,15 @@ class Scope(Contract):
 
 
 class EventTime(Contract):
+    """事件时间：支持未知/天/天部分/区间四种精度。
+
+    属性:
+        precision:  时间精度（'unknown'/'day'/'day_part'/'interval'）
+        local_date: 本地日期（ISO 8601）
+        day_part:   天的部分（'morning'/'afternoon'/'evening'/'night'）
+        start_at:   区间起始时间
+        end_at:     区间结束时间
+    """
     precision: Literal["unknown", "day", "day_part", "interval"] = "unknown"
     local_date: str | None = None
     day_part: Literal["morning", "afternoon", "evening", "night"] | None = None
@@ -81,12 +107,14 @@ class EventTime(Contract):
 
 
 class IdentityPayload(Contract):
+    """身份载荷：存储身份断言（如称呼、别名）。"""
     predicate: Identifier
     value: str = Field(min_length=1)
     context: str = "default"
 
 
 class BehaviorPayload(Contract):
+    """行为载荷：存储交互偏好、互动边界等行为模式。"""
     pattern_type: Literal["explicit_interaction_preference", "interaction_pattern", "decision_pattern", "interaction_boundary"]
     preference: str = Field(min_length=1)
     topic_tags: list[str] = Field(default_factory=list)
@@ -95,6 +123,7 @@ class BehaviorPayload(Contract):
 
 
 class EpisodePayload(Contract):
+    """事件载荷：存储生活事件、共享经历、助手承诺等。"""
     event_type: Literal["activity_plan", "life_event", "shared_experience", "assistant_commitment"]
     activity: Literal["meal", "movie", "outing", "meeting", "exercise", "other"] = "other"
     event_status: Literal["planned", "tentative", "completed", "cancelled", "disputed"]
@@ -111,6 +140,7 @@ class EpisodePayload(Contract):
 
 
 class RecordPayload(Contract):
+    """记录索引载荷：存储事实摘要和关键词。"""
     gist: str = Field(min_length=1)
     keywords: list[str] = Field(default_factory=list)
 
@@ -119,6 +149,7 @@ PAYLOADS = {"identity": IdentityPayload, "behavior": BehaviorPayload, "episode":
 
 
 class ObservationInput(Contract):
+    """观测输入：一条对话消息的来源和内容。"""
     observation_id: Identifier
     conversation_id: Identifier
     revision: int = Field(default=1, ge=1)

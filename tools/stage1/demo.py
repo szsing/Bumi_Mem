@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual Stage-1 acceptance demo. No API, models, GPU or legacy database access."""
+"""Stage-1 手动验收演示：不依赖 API、模型、GPU 或旧版数据库。"""
 from datetime import datetime, timezone
 import argparse
 import json

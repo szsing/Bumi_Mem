@@ -1,0 +1,14 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文字记忆控制测试</title><style>body{font:16px system-ui;max-width:1000px;margin:36px auto;padding:0 20px;background:#f5f7fa;color:#182b42}input,textarea,button{font:inherit;padding:10px;margin:6px 0;box-sizing:border-box}input,textarea{width:100%}button{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:16px}article{background:white;padding:16px;margin:10px 0;border:1px solid #ddd}label{display:block}</style>
+<h1>文字记忆控制测试</h1><p>模拟 Agent 调用。配置服务器绑定的测试用户和独立控制密钥。密钥只保存在页面内存。</p>
+<label>控制密钥<input id="key" type="password" autocomplete="off"></label><label>绑定的用户 ID<input id="user"></label>
+<label>当前用户消息<textarea id="query" placeholder="记住：我喜欢喝无糖拿铁。或：别记上一句。或：忘记：无糖拿铁"></textarea></label>
+<label>上一轮 Agent 已确认说出的回复（可留空）<textarea id="reply"></textarea></label>
+<button id="send">发送文字</button><button id="retry">重试上次请求</button><button id="poll">刷新最后操作状态</button>
+<div id="candidates"></div><pre id="out">等待请求</pre>
+<script>
+let lastBody=null,operation=null;const el=id=>document.getElementById(id);
+async function call(path,body){const response=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json','Authorization':'Bearer '+el('key').value},...(body?{body:JSON.stringify(body)}:{})});const data=await response.json();el('out').textContent=JSON.stringify(data,null,2);if(response.ok)render(data.memory_control||data);return data}
+function render(control){el('candidates').replaceChildren();if(!control.operation_id)return;operation=control.operation_id;if(control.status!=='needs_selection')return;for(const item of control.candidates||[]){const box=document.createElement('article'),text=document.createElement('p'),button=document.createElement('button');text.textContent=item.content+'（关联事实 '+item.affected_facts+' 条，旧来源 '+item.source_count+' 条）';button.textContent=item.can_delete?'确认删除及关联旧来源范围':'缺少可靠来源，不能安全删除';button.disabled=!item.can_delete;button.onclick=()=>{if(!confirm('确认停止召回这条记忆及上述关联来源范围？聊天原文与备份会保留。'))return;lastBody={turn_id:crypto.randomUUID(),user_id:el('user').value,query:null,memory_control_reply:{operation_id:control.operation_id,memory_id:item.id,version:item.version,confirm_source_scope:true}};call('/v2/memory/context',lastBody).catch(error=>el('out').textContent=String(error))};box.append(text,button);el('candidates').append(box)}}
+el('send').onclick=()=>{lastBody={turn_id:crypto.randomUUID(),user_id:el('user').value,query:el('query').value,previous_ai_reply:el('reply').value||null};call('/v2/memory/context',lastBody).catch(error=>el('out').textContent=String(error))};el('retry').onclick=()=>lastBody&&call('/v2/memory/context',lastBody);el('poll').onclick=()=>operation&&call('/v2/memory/operations/'+encodeURIComponent(operation));
+</script></html>

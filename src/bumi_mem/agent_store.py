@@ -7,10 +7,17 @@ from bumi_mem.turn_store import ACTIVE, TurnConflict, TurnNotFound
 
 
 def canonical(value):
+    """将值序列化为确定性 JSON 字符串（排序键、紧凑分隔符）。"""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
 
 
 class AgentStoreMixin:
+    """Agent 桥接存储混入类：管理显式轮次请求和独立事件的事务性存储。
+
+    与旧版三字段交换不同，Agent 协议使用显式的 prepare/complete 两阶段：
+    - reserve_agent_turn：预留轮次（幂等，同一 client_turn_id 不重复创建）
+    - complete_agent_turn：完成轮次（写入 AI 回复和语音证据）
+    """
     @staticmethod
     def create_agent_tables(conn):
         conn.execute('''CREATE TABLE IF NOT EXISTS agent_turn_requests (
@@ -42,7 +49,7 @@ class AgentStoreMixin:
                 if turn['status'] not in ACTIVE:
                     raise TurnConflict('turn_already_closed')
                 return dict(turn)
-            # Unlike legacy exchange, never close another pending turn implicitly.
+            # 与旧版交换不同，永不隐式关闭另一个待处理轮次
             turn = self._reserve_turn(conn, user_id=request.memory_user_id, agent_id=agent_id,
                                       query=request.query, token_count=token_count, idempotency_key=None,
                                       ttl_seconds=300, protocol='agent', occurred_at=request.occurred_at,
@@ -89,8 +96,8 @@ class AgentStoreMixin:
                 if previous['payload_json'] != payload:
                     raise TurnConflict('idempotency_conflict')
                 return json.loads(previous['response_json'])
-            # Program-owned speech/control is shared, not attributed as somebody's
-            # personal user fact, and never has an extraction owner with L3 access.
+            # 程序拥有的语音/控制是共享的，不归属为某人的个人用户事实，
+            # 且永远没有带 L3 访问的抽取所有者
             owner = conn.execute("SELECT session_id FROM sessions WHERE user_id=? AND agent_id=? AND status='active'",
                                  (GUEST_USER_ID, agent_id)).fetchone()
             sid = owner['session_id'] if owner else self._insert_session(conn, GUEST_USER_ID, agent_id)
