@@ -1,3 +1,4 @@
+# 本次改动（2026-10-21）：将 isolation.html 纳入 Python 包资源，安装后保留隔离测试页面。
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
@@ -33,3 +34,6 @@ include = ["bumi_mem*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.setuptools.package-data]
+bumi_mem = ["admin.html", "control.html", "isolation.html"]

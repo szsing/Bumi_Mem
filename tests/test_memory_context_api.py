@@ -1,3 +1,4 @@
+# 本次改动（2026-10-21）：将旧库迁移断言更新为 schema 11，保留上下文协议回归。
 from __future__ import annotations
 
 import asyncio
@@ -66,8 +67,8 @@ def test_A_then_B_agent_reply_has_only_agent_identity_and_B_has_private_L3(harne
     direct_context, shared_context = messages[0]['content'].split('[共享 L3 引用 / shared memory references]\n', 1)
     assert 'A_PRIVATE' not in direct_context
     refs = json.loads(shared_context.split('\n', 1)[0])
-    assert any(r['owner_user_id'] == 'A' and r['memory'] == 'A_PRIVATE' for r in refs)
-    assert any(r['owner_user_id'] == 'B' and r['memory'] == 'B_PRIVATE' for r in refs)
+    assert any(r['user_id'] == 'A' and r['content'] == 'A_PRIVATE' for r in refs)
+    assert any(r['user_id'] == 'B' and r['content'] == 'B_PRIVATE' for r in refs)
     assert 'A_PUBLIC' in messages[1]['content']
     header = messages[2]['content'].split('\n',1)[0]
     assert '"agent_id": "bot"' in header and '"speaker_role": "assistant"' in header
@@ -272,7 +273,7 @@ def test_auth_input_limits_extra_fields_and_old_routes(harness):
 def test_openapi_contains_context_debug_and_health_ready(harness):
     client, *_ = harness
     schema=client.get('/openapi.json').json()
-    assert {path for path in schema['paths'] if path.startswith('/v1/')} == {'/v1/memory/context', '/v1/memory/debug'}
+    assert {path for path in schema['paths'] if path.startswith('/v1/')} == {'/v1/memory/context', '/v1/memory/debug', '/v1/admin/groups', '/v1/admin/graph', '/v1/admin/memories', '/v1/admin/memories/{memory_id}'}
     assert client.get('/v1/memory/debug', params={'user_id':'A'}).status_code == 401
     properties=schema['components']['schemas']['ContextRequest']['properties']
     assert set(properties) == {'user_id','previous_ai_reply','query',
@@ -281,7 +282,7 @@ def test_openapi_contains_context_debug_and_health_ready(harness):
     assert 'query_occurred_at' not in required and 'previous_reply_occurred_at' not in required
     assert KEY not in json.dumps(schema)
     assert client.get('/health/live').status_code == 200
-    assert client.get('/health/ready').json() == {'status':'ready','warmed_up':True}
+    assert client.get('/health/ready').json() == {'status':'ready','warmed_up':True,'long_term_status':'ready'}
 
 
 def test_migrate_v4_speaker_identity_without_changing_extraction_owner(tmp_path):
@@ -301,7 +302,7 @@ def test_migrate_v4_speaker_identity_without_changing_extraction_owner(tmp_path)
     drain(new)
     assert memory.add_calls[0]['user_id'] == 'A'
     with sqlite3.connect(store.path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 9
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 11
 
 
 def test_sync_and_async_clients_only_use_context_route():

@@ -1,3 +1,4 @@
+"""测试提供者配置：验证聊天和记忆模型配置的独立性。"""
 from __future__ import annotations
 
 from bumi_mem.cli import _provider_config

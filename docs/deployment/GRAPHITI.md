@@ -9,7 +9,7 @@
 - 原始消息、未满批次和已排队任务持久化。没有空闲 flush；关闭服务不强制提交未满批次。
 - 通过上游 `add_episode_bulk([RawEpisode(...)])` 写入一批 message episode；超长批次分成多个，按顺序执行。每批不跨不同所有者合并。
 - 使用固定上游代码的默认 C2；不传 custom extraction instructions，不限定旧的七类记忆，不先生成 L2 摘要。默认语言行为同上游，中文输入主要产生中文事实，关系标签可能是英文。
-- 原生 `search_()` 综合默认配方，涵盖边、节点、episode 和 community；本地 BGE 重排。原 Mem0 top-k/score 阈值不映射。上游每类默认上限及 BGE 最低分配置照用，BGE 分数不是概率。
+- 原生 `search_()` 综合检索，涵盖边、节点、episode 和 community；保留既有混合查询方法与每类10条上限，四类排序改为RRF，不加载BGE，也不调用默认模型重排API。原 Mem0 top-k/score 阈值不映射。
 - 原生 Graphiti 保留文本、向量与图结构，Neo4j 同时存储相关索引。无需 Qdrant。
 - 当前和历史结果都可能召回，内容标明图对象类型、有效/失效/记录时间；记录时间不能当事件发生时间。外部响应仍受上下文长度预算限制，不保证所有图结果都进入最终上下文。
 - 旧 semantic_state 的即时更新、机器人承诺写入、核心/历史注入和冲突过滤在 Graphiti 服务关闭；显式 `remember()` 停用。
@@ -60,18 +60,9 @@ python -c "from importlib.metadata import distribution; print(distribution('grap
 
 已有 embedding：`/data1/sunzhixing/model/Qwen3-Embedding-0.6B`。
 
-新增 reranker：`/data1/sunzhixing/model/bge-reranker-v2-m3`。
+当前默认RRF排序无需下载或配置BGE。旧 `BUMI_RERANKER_MODEL_PATH` 可保留但不再使用，也不校验目录是否存在。
 
-```bash
-mkdir -p /data1/sunzhixing/model
-python3 -m venv /data1/sunzhixing/model/.hf-download-env
-/data1/sunzhixing/model/.hf-download-env/bin/python -m pip install -U huggingface_hub
-HF_HUB_OFFLINE=0 /data1/sunzhixing/model/.hf-download-env/bin/hf download \
-  BAAI/bge-reranker-v2-m3 \
-  --local-dir /data1/sunzhixing/model/bge-reranker-v2-m3
-```
-
-服务只从本地模型目录加载，不自动下载。模型层适配仅替换上游 BGE 的硬编码仓库名为目录；继承原生 rank 方法。Qwen 使用本地 SentenceTransformer 的 encode，向量维度必须为配置的 1024。`auto` 的 GPU 使用取决于实际 Torch 环境；强制 GPU 用 `BUMI_EMBED_DEVICE=cuda`。
+服务仅从本地目录加载 Qwen embedding，不自动下载；向量维度保持1024。`auto` 是否使用GPU取决于Torch环境；强制GPU使用 `BUMI_EMBED_DEVICE=cuda`。启动预热仅检查图索引与向量编码。
 
 ## 3. 新建配置和 Neo4j
 
@@ -123,7 +114,7 @@ python -m bumi_mem.service_probe
 bash scripts/run_memory_service.sh
 ```
 
-主服务启动预热会检查图索引、加载两个本地模型并跑一次向量/重排，不做抽取。`/health/ready` 成功不等于记忆质量通过。只运行一个 worker，不与验收探针同时打开同一数据目录。
+主服务启动预热会检查图索引、加载本地 embedding 并跑一次向量编码，不做抽取。`/health/ready` 成功不等于记忆质量通过。只运行一个 worker，不与验收探针同时打开同一数据目录。
 
 读超时首版设为 30 秒，便于真实验证原生综合检索；不代表已达到原先 60ms 目标。模型加载预热预算 300 秒，可配置。重排/向量推理及 Neo4j 性能应在目标服务器测量。
 
@@ -167,4 +158,4 @@ SQLite 原始消息/任务在 `BUMI_DATA_DIR/bumi_memory.sqlite3`；Graphiti 写
 
 离线：`python -m pytest -q -p no:cacheprovider`。新增 Graphiti 专项测试覆盖批次独立、跨重启尾部、语义路径停用、异步并发与关闭、超长输入、原生调用参数、历史结果以及 community 重试。上传包不包含旧 Mem0 子模块时，一项读取其源码的历史测试会跳过。
 
-服务器上还需确认：真实 C2 中文抽取正确、偏好更新历史可辨、同一 namespace 数据持久化、BGE 与 Qwen 设备/显存、综合检索输出、community 构建和故障恢复。未运行这些真实检查前，不声称已在机器人或服务器验收通过。
+服务器上还需确认：真实 C2 中文抽取正确、偏好更新历史可辨、同一 namespace 数据持久化、Qwen 设备/显存、综合检索输出、community 构建和故障恢复。未运行这些真实检查前，不声称已在机器人或服务器验收通过。

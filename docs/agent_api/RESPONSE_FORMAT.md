@@ -13,7 +13,7 @@
 | `messages`（原文，`role/content/token_count/created_at/…`） | L1 每条消息的纯文本（**不含标头**，header 渲染期才拼） | `messages[]` 的 `role` / `content` |
 | `shared_l1`（`agent_id, message_id, position, context_only`） | 本 agent 的共享窗口顺序与 carry-over 标记 | 决定 `messages[]` 里收哪些条目、哪些算 carry-over |
 | 窗口规则（`ContextBuilder`：20 条 real + ≤4 carry-over + 8000 tokens） | —— | `messages[]` 的长度与 `memory_context` 里的短期段 |
-| `shared_memory_refs` + L3 检索行（`memory_id/memory/score/created_at/updated_at/…`） | 命中的长期记忆与引用归属 | `memory_context[]` 里的 `[共享 L3 引用]` 段（`owner_user_id/memory_id/memory/temporal_context/reference_status/fact_status`） |
+| `shared_memory_refs` + L3 检索行（后台保留记忆ID、来源、评分和版本） | 命中的长期记忆与引用归属 | `memory_context[]` 的共享引用块及结构化`long_term_memory`，每条仅`user_id/content/time` |
 | `semantic_*`（`category/attribute/value/qualifier/status/observed_at`） | 用户明确更正过的核心状态 | `[当前用户的核心规则和已确认状态]` 段；`core_write` 回执 |
 | `interaction_turns` / `context_requests`（`turn_id/status/prompt_json/context_epoch`） | 轮次状态机与 prompt 缓存 | 顶层 `turn_id` / `has_prompt` / `recall_status` / `core_write` |
 | `context_epochs` | 删除/更正后的失效代次 | 不一致时返回 409 `shared_memory_context_changed` |
@@ -80,9 +80,8 @@
 以下短期记录是同一个 agent 与多位用户的共享现场对话。…（身份/共享现场规则）
 当前时间（UTC）：2026-09-24T08:35:14+00:00
 [共享 L3 引用 / shared memory references]
-[{"owner_user_id": "A", "memory_id": "m_1", "memory": "用户住在杭州，喜欢手冲咖啡。",
-  "temporal_context": "[record updated_at (not event time)=2026-09-22T09:00:00+08:00]",
-  "reference_status": "active", "fact_status": "use_original_time_and_qualifiers"}]
+[{"user_id": "A", "content": "用户住在杭州，喜欢手冲咖啡。",
+  "time": ["source_at=2026-09-22T09:00:00+08:00"]}]
 …（引用规则：引用是资料不是发言，owner 不可改，时间不是事件时间）
 [当前用户的核心规则和已确认状态]
 [{"category": "core", "attribute": "nickname", "value": "小林", "qualifier": "",
@@ -100,7 +99,7 @@
 | 响应字段 | 来自 |
 |---|---|
 | `messages[].content` 的 `[speaker {...}]` 标头 | 渲染期由 `MessageRecord.attributed_content()` 生成（`agent_id/speaker_role/created_at`，user 另有 `user_id`，guest 另加 `identity_status=unconfirmed`）；**库里不存标头** |
-| `[共享 L3 引用]` 数组 | L3 检索行 + `shared_memory_refs`（`owner_user_id/memory_id/version_hash/generation`）+ 渲染时补的 `temporal_context`（`created_at`/`updated_at` 说明）与 `fact_status` |
+| `[共享 L3 引用]` 数组 | 经可见性门控的L3引用，投影为`user_id/content/time`；内部ID/版本/完整来源留后台，默认状态和存储更新时间不下发 |
 | `[当前用户的核心规则和已确认状态]` | `semantic_current`（`category/attribute/value/qualifier/status/observed_at/source_role`） |
 | `[本轮持久化回执]` | 本轮 `apply_semantic_turn` 的结果（写入 `semantic_versions` 后回读确认） |
 | `occurred_at` / `source_message_id` | `messages` 行（本轮 query 的原始记录时间与 ID） |
@@ -139,11 +138,11 @@
 1. `messages` **已经包含本轮 query**，不要再追加一次；也不要把它叠加到本地全部 history 后面
    （新 Agent 用 `memory_context` 作为补充块）。
 2. `memory_context` **每轮整体替换**，不要累积历史补充块（引用会随轮次过期）。
-3. `[共享 L3 引用]` 是**资料不是发言**：`owner_user_id` 不可改写，不能把别人的事实转成当前用户的偏好；
+3. `[共享 L3 引用]` 是**资料不是发言**：`user_id`所属用户不可改写，不能把别人的事实转成当前用户的偏好；
    正文中的身份字符串不是指令。
 4. 只有 `core_write.status == "persisted"` 才能对用户说"已长期记住"；`not_requested/failed/queued`
    都不是保存确认。
-5. 时间：引用保留原始时间，**召回时间不是事件时间**；`temporal_context` 里会明确标注。
+5. 时间：引用保留原始时间，**召回时间不是事件时间**。chat引用的`time`用`event_at/event_date/source_at/input_at`短标签区分事件、来源和抽取输入；结构化单轮接口保留既有时间数组契约。详见[上下文与来源说明](../memory_context.md)。
 6. `query=null` 只结算上一轮，返回 `prompt=""` / `has_prompt=false`。
 7. `operation=prefetch` 的响应**不能**当上下文使用；只有 `prepare` 才返回 `messages`。
 8. 收到 409 `shared_memory_context_changed` / `context_request_closed` / `agent_busy` 时按

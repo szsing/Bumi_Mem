@@ -1,4 +1,4 @@
-"""Validate preparation artifacts, not future retrieval/policy behavior."""
+"""验证 Stage-0 预备产物：检查数据格式和模式，不验证未来的检索/策略行为。"""
 import io
 import json
 from pathlib import Path

@@ -1,4 +1,8 @@
-"""Manual typed memory foundation; no LLM, embedding, vector store or legacy writes."""
+"""手动类型化记忆基础：不使用 LLM、嵌入、向量存储或旧版写入。
+
+提供受信任的进程内 API，身份必须来自已认证的上游代码。
+create_principal/create_space 是配置 API，不是模型工具。
+"""
 from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
@@ -20,17 +24,20 @@ from .schema import APPLICATION_ID, SCHEMA, SCHEMA_VERSION
 
 
 def encode(value):
+    """将值序列化为确定性 JSON（排序键、紧凑分隔符、禁止 NaN）。"""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
 def digest(value):
+    """计算字符串的 SHA256 摘要。"""
     return hashlib.sha256(value.encode('utf8')).hexdigest()
 
 
 class TypedMemoryStore:
-    """Trusted in-process API. Scope identity must come from authenticated code.
+    """类型化记忆存储：受信任的进程内 API。
 
-    create_principal/create_space are provisioning APIs, never model tools.
+    身份必须来自已认证的上游代码。
+    create_principal/create_space 是配置 API，不是模型工具。
     """
     retention_seconds = 14 * 24 * 3600
 
@@ -527,7 +534,7 @@ class TypedMemoryStore:
                 if not PolicyEngine.permits(requirements=requirements, rules=rules, recipients=set(draft.audience_ids), purpose=purpose, category=category, shared=shared):
                     raise AccessDenied('projection is not currently authorized')
             projected = {name: flat[name] for name in draft.attributes}
-            # Availability is a claim about a plan, not a completed action.
+            # 可用性是关于计划的主张，不是已完成动作
             if m['kind'] == 'episode' and flat.get('event_status') in ('planned', 'tentative') and projected.get('availability') in ('busy', 'free'):
                 projected['availability'] = 'possibly_' + projected['availability']
             vid = str(uuid4())
@@ -608,8 +615,8 @@ class TypedMemoryStore:
         rules = self._rules(c, ctx.space_id)
         raw_requirement = Requirement(row['observation_id'], row['owner_id'], frozenset({row['owner_id']}), frozenset({'text'}))
         if not PolicyEngine.permits(requirements=[raw_requirement], rules=rules, recipients=ctx.recipients, purpose=ctx.purpose, category='private', shared=False): return False
-        # Block whole raw turns conservatively when linked semantic data is denied
-        # or withdrawn. This is not automatic text redaction or physical deletion.
+        # 当关联的语义数据被拒绝或撤回时，保守地阻塞整个原始轮次
+        # 这不是自动文本编辑或物理删除
         linked = c.execute('SELECT DISTINCT v.memory_id,v.version FROM version_spans v JOIN source_spans s USING(span_id) WHERE s.observation_id=? AND s.revision=?', (row['observation_id'], row['revision'])).fetchall()
         for item in linked:
             try:

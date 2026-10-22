@@ -1,3 +1,5 @@
+# 本次改动（2026-10-21）：将数据库升级断言更新为 schema 11，继续验证现有 Agent HTTP 行为。
+"""测试 Agent REST API：验证 HTTP 接口的请求/响应格式和并发行为。"""
 from __future__ import annotations
 
 import json
@@ -83,7 +85,7 @@ def test_v3_database_upgrade_preserves_shared_window(tmp_path):
     upgraded = SQLiteSessionStore(store.path)
     assert upgraded.list_shared_messages('bot') == store.list_shared_messages('bot')
     with sqlite3.connect(store.path) as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == 9
+        assert c.execute('PRAGMA user_version').fetchone()[0] == 11
         assert c.execute('SELECT COUNT(*) FROM interaction_turns').fetchone()[0] == 0
 
 def test_config_validation_and_missing_local_model_do_not_download(tmp_path):
@@ -93,9 +95,33 @@ def test_config_validation_and_missing_local_model_do_not_download(tmp_path):
     with pytest.raises(ValueError,match='existing local model'):
         build_service_engine(config)
     for changes in ({'api_key':'short'},{'read_timeout':0},{'embed_device':'bad'},
-                    {'memory_api_key':''},{'read_timeout':float('nan')}):
+                    {'memory_api_key':''},{'read_timeout':float('nan')},
+                    {'long_term_degrade_cooloff_seconds':0},{'long_term_degrade_cooloff_seconds':float('nan')},
+                    {'long_term_degrade_probe_timeout':0},{'long_term_degrade_probe_timeout':float('nan')}):
         with pytest.raises(ValueError):
             replace(config,**changes)
+
+def _env_for_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv('BUMI_NEO4J_PASSWORD', 'test-only-password')
+    monkeypatch.setenv('BUMI_RERANKER_MODEL_PATH', str(tmp_path / 'missing-reranker'))
+    monkeypatch.setenv('BUMI_DATA_DIR', str(tmp_path))
+    monkeypatch.setenv('BUMI_EMBED_MODEL_PATH', str(tmp_path / 'missing'))
+    monkeypatch.setenv('BUMI_SERVICE_API_KEY', KEY)
+    monkeypatch.setenv('BUMI_MEMORY_API_KEY', 'secret')
+
+def test_degrade_and_warmup_switches_accept_on_off_and_true_false(tmp_path, monkeypatch):
+    _env_for_from_env(monkeypatch, tmp_path)
+    monkeypatch.setenv('BUMI_LONG_TERM_DEGRADE_ENABLED', 'true')
+    monkeypatch.setenv('BUMI_MEMORY_WARMUP', 'off')
+    settings = ServiceSettings.from_env()
+    assert settings.long_term_degrade_enabled is True
+    assert settings.memory_warmup_enabled is False
+
+def test_degrade_switch_rejects_unrecognized_value(tmp_path, monkeypatch):
+    _env_for_from_env(monkeypatch, tmp_path)
+    monkeypatch.setenv('BUMI_LONG_TERM_DEGRADE_ENABLED', 'maybe')
+    with pytest.raises(ValueError):
+        ServiceSettings.from_env()
 
 def test_startup_warmup_failure_never_serves_ready(tmp_path):
     config = ServiceSettings(data_dir=tmp_path,embed_model_path=tmp_path/'missing',api_key=KEY,memory_api_key='fake')
@@ -109,6 +135,44 @@ def test_startup_warmup_failure_never_serves_ready(tmp_path):
             pass
     assert not app.state.ready and engine._closed
 
+def test_startup_warmup_failure_degrades_to_short_term_only_by_default(tmp_path):
+    class Down(FakeLongTermMemory):
+        def warmup(self, **kwargs):
+            raise OSError('down')
+    config = ServiceSettings(data_dir=tmp_path, embed_model_path=tmp_path/'missing', api_key=KEY, memory_api_key='fake')
+    engine, store, memory, chat, summary = make_engine(tmp_path, long_term=Down())
+    engine.chat_provider = None
+    engine.worker.start = lambda: None
+    app = create_app(config, engine_factory=lambda _: engine)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert app.state.ready is True
+        assert client.get('/health/ready').json()['long_term_status'] == 'degraded'
+        # 旧版请求体：recall_status 可见。
+        legacy = client.post('/v1/memory/context', headers=AUTH,
+                             json={'user_id': 'u1', 'previous_ai_reply': None, 'query': '你好'})
+        assert legacy.status_code == 200, legacy.text
+        assert legacy.json()['recall_status'] == 'unavailable'
+        # 新版请求体：没有 recall_status 字段，验证 long_term_memory 为空、short_term_memory 正常。
+        turn = client.post('/v1/memory/context', headers=AUTH,
+                           json={'turn_id': 't1', 'user_id': 'u1', 'previous_ai_reply': None, 'query': '你好'})
+        assert turn.status_code == 200, turn.text
+        body = turn.json()
+        assert set(body) == {'turn_id', 'current_user', 'long_term_memory', 'short_term_memory'}
+        assert body['long_term_memory'] == []
+        assert body['short_term_memory']
+
+
+def test_health_ready_reports_unchecked_when_warmup_skipped(tmp_path):
+    config = ServiceSettings(data_dir=tmp_path, embed_model_path=tmp_path/'missing', api_key=KEY, memory_api_key='fake')
+    engine, _, memory, _, _ = make_engine(tmp_path)
+    engine.config.memory_warmup_enabled = False
+    engine.chat_provider = None
+    engine.worker.start = lambda: None
+    app = create_app(config, engine_factory=lambda _: engine)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.get('/health/ready').json()['long_term_status'] == 'unchecked'
+
+
 def test_second_http_process_cannot_open_same_data_directory(harness):
     _, _, _, _, _, _, _, config = harness
     # A second lifespan obtains a separate OS lock handle, even in this test process.
@@ -117,7 +181,8 @@ def test_second_http_process_cannot_open_same_data_directory(harness):
         with TestClient(app):
             pass
 
-def test_factory_constructs_only_memory_provider_and_defers_sdk(tmp_path, monkeypatch):
+@pytest.mark.parametrize('reranker_fp16', [True, False])
+def test_factory_constructs_only_memory_provider_and_defers_sdk(tmp_path, monkeypatch, reranker_fp16):
     import bumi_mem.providers as providers
     import bumi_mem.graphiti_memory as ltm
     from bumi_mem.providers import FakeTextProvider
@@ -140,7 +205,8 @@ def test_factory_constructs_only_memory_provider_and_defers_sdk(tmp_path, monkey
     model = tmp_path/'model'; model.mkdir()
     config = ServiceSettings(data_dir=tmp_path/'data',embed_model_path=model,api_key=KEY,
                              memory_api_key='memory-secret',memory_model='memory-model',
-                             reranker_model_path=model,neo4j_password='test-neo4j')
+                             reranker_model_path=model,neo4j_password='test-neo4j',
+                             reranker_fp16=reranker_fp16)
     engine = build_service_engine(config)
     try:
         assert engine.chat_provider is None
@@ -149,6 +215,13 @@ def test_factory_constructs_only_memory_provider_and_defers_sdk(tmp_path, monkey
         assert native == []
         engine.start()
         assert len(native) == 1 and native[0][1].embed_model == model
+        assert native[0][1].reranker_fp16 is reranker_fp16
         assert backend.warmup_calls
     finally:
         engine.close()
+
+def test_rrf_settings_do_not_require_reranker_directory(tmp_path, monkeypatch):
+    _env_for_from_env(monkeypatch, tmp_path)
+    monkeypatch.delenv('BUMI_RERANKER_MODEL_PATH', raising=False)
+    settings = ServiceSettings.from_env()
+    assert settings.embed_model_path == tmp_path / 'missing'

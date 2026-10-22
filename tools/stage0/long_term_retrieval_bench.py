@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real, isolated Mem0 write/reopen/search benchmark. No chat answers or GPU repair."""
+"""Mem0 写入/重开/搜索的真实隔离基准测试。不涉及聊天回答或 GPU 修复。"""
 from __future__ import annotations
 import argparse, datetime, functools, hashlib, importlib, importlib.metadata
 import json, logging, os, random, stat, sys, threading, time

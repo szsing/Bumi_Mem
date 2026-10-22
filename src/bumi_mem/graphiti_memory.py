@@ -1,4 +1,5 @@
-"""Graphiti-native L3. Upstream prompts and search recipes are not overridden.
+# 本次改动（2026-10-21）：接入隔离配置、共同事实索引及查询，个人检索仅返回关系事实并复用查询向量。
+"""Graphiti-native L3. Upstream extraction prompts are preserved; retrieval uses RRF.
 
 The local journal records ingestion outcomes, not an alternative memory store.
 An interrupted write is uncertain and is never automatically replayed.
@@ -17,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from bumi_mem.isolation_graph import IsolationGraphMixin
+from bumi_mem.control_graph import ControlGraphMixin
 from bumi_mem.identity import require_pair
 from bumi_mem.providers import ProviderConfig, bind_provider_request_options
 from bumi_mem.schemas import (
@@ -33,12 +36,14 @@ class GraphitiConfig:
     password: str = field(repr=False)
     data_dir: Path
     embed_model: Path
-    reranker_model: Path
+    reranker_model: Path | None = None  # Deprecated; accepted for old configurations.
     database: str = 'neo4j'
     device: str = 'auto'
     embedding_dims: int = 1024
     community_every: int = 5
     max_coroutines: int = 3
+    reranker_fp16: bool = True
+    registered_isolation: bool = False
 
 
 def graph_group(user_id: str, agent_id: str) -> str:
@@ -46,7 +51,25 @@ def graph_group(user_id: str, agent_id: str) -> str:
     return 'bumi_' + hashlib.sha256(json.dumps([user_id, agent_id]).encode()).hexdigest()
 
 
-class GraphitiLongTermMemory:
+def rrf_search_config():
+    """Same four hybrid routes and limits as before, without model reranking."""
+    from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_CROSS_ENCODER
+    from graphiti_core.search.search_config import (
+        EdgeReranker, NodeReranker, EpisodeReranker, CommunityReranker,
+    )
+    config = COMBINED_HYBRID_SEARCH_CROSS_ENCODER.model_copy(deep=True)
+    for field, enum in (
+        ('edge_config', EdgeReranker), ('node_config', NodeReranker),
+        ('episode_config', EpisodeReranker), ('community_config', CommunityReranker),
+    ):
+        getattr(config, field).reranker = enum.rrf
+    return config
+
+
+from bumi_mem.admin_memory import AdminMemoryMixin
+
+
+class GraphitiLongTermMemory(IsolationGraphMixin, ControlGraphMixin, AdminMemoryMixin):
     backend_name = 'graphiti'
 
     def __init__(self, llm: ProviderConfig, config: GraphitiConfig):
@@ -54,8 +77,8 @@ class GraphitiLongTermMemory:
         from graphiti_core.llm_client.config import LLMConfig
         from bumi_mem.graphiti_llm import ValidatedGraphitiClient
         from graphiti_core.embedder.client import EmbedderClient, EmbedderConfig
-        from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
-        from sentence_transformers import SentenceTransformer, CrossEncoder
+        from graphiti_core.cross_encoder.client import CrossEncoderClient
+        from sentence_transformers import SentenceTransformer
 
         self.config = config
         self._write_lock = asyncio.Lock()
@@ -96,11 +119,10 @@ class GraphitiLongTermMemory:
                 texts = [input_data] if isinstance(input_data, str) else list(input_data)
                 return (await self.create_batch(texts))[0]
 
-        class LocalBGE(BGERerankerClient):
-            def __init__(self):
-                # Only replace the upstream hard-coded repository name with a
-                # local path. Inherit its ranking implementation unchanged.
-                self.model = CrossEncoder(str(config.reranker_model), device=device, local_files_only=True)
+        class DisabledReranker(CrossEncoderClient):
+            async def rank(self, query, passages):
+                # Passing None would construct Graphiti's default API reranker.
+                raise RuntimeError('Model reranking is disabled; use the RRF search configuration')
 
         self.llm_client = ValidatedGraphitiClient(
             config=LLMConfig(model=llm.model, small_model=llm.model,
@@ -113,7 +135,7 @@ class GraphitiLongTermMemory:
         self.client = Graphiti(
             config.uri, config.user, config.password,
             llm_client=self.llm_client,
-            embedder=LocalEmbedder(), cross_encoder=LocalBGE(),
+            embedder=LocalEmbedder(), cross_encoder=DisabledReranker(),
             max_coroutines=config.max_coroutines,
         )
         # Database selection belongs to the Neo4j driver, not query text.
@@ -131,8 +153,9 @@ class GraphitiLongTermMemory:
 
     async def warmup(self, *, query: str):
         await self.client.build_indices_and_constraints()
+        if self.config.registered_isolation:
+            await self.isolation_prepare()
         await self.client.embedder.create(query)
-        await self.client.cross_encoder.rank(query, [query])
 
     async def add_session(self, *, user_id, agent_id, messages, metadata, prompt=None,
                           replay_authorization=None):
@@ -140,7 +163,9 @@ class GraphitiLongTermMemory:
         from graphiti_core.utils.bulk_utils import RawEpisode
         group = graph_group(user_id, agent_id)
         key = metadata['consolidation_id']
-        stable_metadata = {k: v for k, v in metadata.items() if k != 'consolidation_attempt'}
+        if self.config.registered_isolation and user_id not in {u['user_id'] for u in metadata.get('registered_users',[]) if u.get('active',True)}:
+            raise RetryableMemoryError('Owner is not registered; Graphiti write never started')
+        stable_metadata = {k: v for k, v in metadata.items() if k not in ('consolidation_attempt','registered_users')}
         payload = json.dumps({'messages': messages, 'metadata': stable_metadata}, ensure_ascii=False, sort_keys=True)
         async with self._write_lock:
             with self._db() as db:
@@ -163,6 +188,16 @@ class GraphitiLongTermMemory:
             # side effects. The journal row is rolled back and the caller may
             # retry normally.
             try:
+                if hasattr(self.client, 'driver'):
+                    blocked = await self.control_blocks(group_id=group)
+                    messages = [m for m in messages if m.get('source_message_id') not in blocked]
+                    await self.control_record_batch(group_id=group, batch_id=key,
+                        source_ids=[m['source_message_id'] for m in messages if m.get('source_message_id')])
+                    if not messages:
+                        receipt = [{'backend':'graphiti','episode_uuids':[],'withdrawn':True}]
+                        with self._db() as db:
+                            db.execute("UPDATE ingestions SET state='complete',result=? WHERE id=?", (json.dumps(receipt),key))
+                        return receipt
                 body = '\n'.join(f"{m['role']}: {m['content']}" for m in messages)
                 reference = datetime.fromisoformat(messages[0]['observed_at'])
                 episode = RawEpisode(name=key, content=body, source=EpisodeType.message,
@@ -208,6 +243,12 @@ class GraphitiLongTermMemory:
                 raise MemoryWriteUncertainError(
                     'Graphiti write returned no usable receipt; the graph may already '
                     'contain this batch. Automatic replay disabled') from exc
+            if self.config.registered_isolation:
+                await self.isolation_index(user_id=user_id,agent_id=agent_id,messages=messages,
+                    users=metadata.get('registered_users',[]))
+            if hasattr(self.client, 'driver'):
+                await self.control_refresh_edges(group_id=group,edge_ids=receipt[0]['edge_uuids'],
+                    source_ids=[m['source_message_id'] for m in messages if m.get('source_message_id')])
             with self._db() as db:
                 db.execute("UPDATE ingestions SET state='complete',result=? WHERE id=?",
                            (json.dumps(receipt), key))
@@ -246,14 +287,40 @@ class GraphitiLongTermMemory:
 
     async def search(self, *, user_id, agent_id, query, **_legacy_options):
         group = graph_group(user_id, agent_id)
-        # No Mem0 thresholds or top-k translation; upstream default combined
-        # search config (including its per-kind limits and BGE rerank) is used.
-        result = await self.client.search_(query, group_ids=[group])
+        isolated = self.config.registered_isolation or _legacy_options.get('registered_isolation',False)
+        users = _legacy_options.get('registered_users',[])
+        if isolated and user_id not in {u['user_id'] for u in users if u.get('active',True)}:
+            return []
+        config = rrf_search_config()
+        if isolated:
+            config.node_config = config.episode_config = config.community_config = None
+        query_vector = await self.client.embedder.create(query) if isolated else None
+        result = await self.client.search_(query, group_ids=[group], config=config,
+            **({'query_vector':query_vector} if isolated else {}))
         rows = []
+        overrides = await self._admin_recall_overrides(group)
+        suppressed, has_blocks = (await self.control_suppressed(group_id=group)
+                                  if hasattr(self.client, 'driver') else (set(), False))
+        fresh_edges = await self.control_fresh_edges(group_id=group) if has_blocks else set()
+        blocked_sources = (await self.control_blocks(group_id=group)
+                           if has_blocks and any(o.get('control_relearned') for o in overrides) else set())
+        changed = {o['id']: o for o in overrides}
+        # Derived summaries and original episodes can repeat deleted/edited facts.
+        # Until rebuilt against manual revisions, expose facts plus explicit edits only.
+        for override in overrides:
+            fresh = override.get('control_relearned') and not (set(override.get('control_source_ids') or []) & blocked_sources)
+            if not override['deleted'] and (not has_blocks or fresh):
+                rows.append(dict(id='edge:'+override['id'],memory='[管理员修订] '+override['content'],
+                    user_id=user_id,agent_id=agent_id,fact_status='admin_corrected',
+                    metadata={'backend':'graphiti','kind':'edge','admin_version':override['version']}))
         foreign = []
         for kind, values in [('edge', result.edges), ('node', result.nodes),
                              ('episode', result.episodes), ('community', result.communities)]:
+            if isolated and kind!='edge':
+                continue
             for item in values:
+                if item.group_id == group and overrides and (kind != 'edge' or item.uuid in changed):
+                    continue
                 if item.group_id != group:
                     # Never publish another namespace's content into this user's
                     # context. One bad item must not discard a whole recall, but
@@ -261,6 +328,8 @@ class GraphitiLongTermMemory:
                     foreign.append((kind, getattr(item, 'uuid', None), item.group_id))
                     continue
                 raw = item.model_dump(mode='json')
+                if has_blocks and (kind != 'edge' or (item.uuid not in fresh_edges and (not raw.get('episodes') or set(raw['episodes']) & suppressed))):
+                    continue
                 text = raw.get('fact') or raw.get('summary') or raw.get('content') or raw.get('name')
                 if not text:
                     continue
@@ -280,6 +349,8 @@ class GraphitiLongTermMemory:
                            ', '.join(f'{kind}:{uuid}' for kind, uuid, _ in foreign[:10]))
             self._audit_replay(group, {'job_id': f'search:{agent_id}'}, 'foreign_namespace',
                                f'{len(foreign)} item(s) from foreign group_id={foreign[0][2]}; dropped')
+        if isolated:
+            rows += await self.isolation_shared_search(user_id=user_id,agent_id=agent_id,query=query,users=users,query_vector=query_vector)
         return rows
 
     async def build_due_communities(self):
@@ -332,6 +403,7 @@ class GraphitiLongTermMemory:
         group = graph_group(user_id, agent_id)
         async with self._write_lock:
             await self.client.driver.execute_query('MATCH (n {group_id: $group}) DETACH DELETE n', group=group)
+            await self._admin_query('MATCH (f:BumiSharedFact {agent_id:$agent,owner_id:$user}) SET f.deleted=true,f.version=f.version+1 RETURN count(f) AS n',agent=agent_id,user=user_id)
             with self._db() as db:
                 db.execute('DELETE FROM ingestions WHERE group_id=?', (group,))
                 db.execute('DELETE FROM community_jobs WHERE group_id=?', (group,))

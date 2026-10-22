@@ -1,4 +1,4 @@
-"""Server preflight: configuration/device checks and one small LLM JSON request.
+"""服务预检：配置/设备检查和一次小型 LLM JSON 请求。
 
 Does not create a memory database, download embedding weights or open a service
 port. The actual embedding/Neo4j warmup is checked when the service starts.
@@ -41,7 +41,7 @@ def main():
         if missing:
             print('Missing Python modules: ' + ', '.join(missing))
             raise RuntimeError('activate/install a compatible service environment before probing the paid API')
-        if not settings.embed_model_path.is_dir() or not settings.reranker_model_path.is_dir():
+        if not settings.embed_model_path.is_dir():
             raise ValueError('embedding directory is missing')
         device = resolve_embed_device(settings.embed_device)
         if device == 'cuda':
@@ -59,7 +59,7 @@ def main():
             print('Memory LLM JSON request passed.', flush=True)
         print('Next: start the service and check /health/ready. Full embedding warmup and real memory quality are not proven by this probe.', flush=True)
     except Exception as exc:
-        # Do not print raw vendor error bodies/credentials.
+        # 不打印原始供应商错误体/凭据
         status = getattr(exc, 'status_code', None)
         print(f'Preflight failed: {type(exc).__name__}; HTTP status={status}. Check environment, model path, CUDA and LLM credentials/model access. No raw key was printed.')
         raise SystemExit(1) from None

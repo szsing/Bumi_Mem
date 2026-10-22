@@ -1,3 +1,4 @@
+"""测试启动预热（warmup）流程：验证 Mem0 后端初始化和嵌入设备解析。"""
 from __future__ import annotations
 
 import pytest

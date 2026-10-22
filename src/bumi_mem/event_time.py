@@ -1,4 +1,4 @@
-"""Validate trusted event timestamps; absent timestamps mean server receipt time."""
+"""验证可信事件时间戳；缺失时间戳表示服务器接收时间。"""
 from datetime import datetime
 
 

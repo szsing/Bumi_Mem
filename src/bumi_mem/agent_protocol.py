@@ -1,7 +1,7 @@
-"""Explicit, retry-safe wire protocol for bumi-agent's custom Pipecat 1.8 loop.
+"""显式、重试安全的线协议：bumi-agent 的自定义 Pipecat 1.8 循环。
 
-These models do not import Pipecat or any robot/ASR/TTS dependency. The legacy
-three-field exchange remains available on the same route.
+这些模型不导入 Pipecat 或任何 robot/ASR/TTS 依赖。
+旧版三字段交换在同一路由上仍然可用。
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ def _checked_id(value):
 
 
 class AgentModel(BaseModel):
+    """Agent 协议基础模型：严格模式，禁止额外字段，提供 ID 和时间校验。"""
     model_config = ConfigDict(extra='forbid', strict=True)
 
     @field_validator('client_turn_id', 'turn_id', 'event_id', 'user_id', 'prefetch_id',
@@ -42,7 +43,7 @@ class AgentModel(BaseModel):
 
 
 class SpeakerIdentityInput(BaseModel):
-    # Match the agent's history_metadata(); discard scores/biometric diagnostics.
+    """说话人身份输入：匹配 agent 的 history_metadata()，丢弃评分/生物特征诊断信息。"""
     model_config = ConfigDict(extra='ignore', strict=True)
     status: Literal['matched', 'unknown', 'timeout', 'unavailable', 'insufficient_audio', 'disabled']
     profile_id: str | None = Field(default=None, max_length=128)
@@ -62,7 +63,7 @@ class SpeakerIdentityInput(BaseModel):
 
 
 class SpeechEvidence(AgentModel):
-    """Text coverage of published output, NOT a physical loudspeaker acknowledgement."""
+    """语音证据：已发布输出的文本覆盖度，不是物理扬声器播放确认。"""
     delivery_basis: Literal['dds_successful_publish', 'text_only', 'unknown'] = 'text_only'
     alignment_covers_output: bool = True
     alignment_status: str = Field(default='text_only', min_length=1, max_length=64, pattern=r'^[A-Za-z0-9_-]+$')

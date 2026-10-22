@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Data-driven long-form evaluation for Mem0 v2.0.20."""
+"""数据驱动的 Mem0 v2.0.20 长文本评估：验证记忆抽取和检索的质量。"""
 
 from __future__ import annotations
 

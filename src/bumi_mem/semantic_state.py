@@ -83,21 +83,21 @@ from uuid import uuid4
 from bumi_mem.identity import is_guest, require_pair
 
 
-MAX_CURRENT_ROWS = 64
-MAX_SOURCE_CHARS = 512
-MAX_VALUE_CHARS = 240
+MAX_CURRENT_ROWS = 64    # 每个活跃作用域的最大当前状态行数（含已撤回/已完成）
+MAX_SOURCE_CHARS = 512   # 输入语法最大字符数
+MAX_VALUE_CHARS = 240    # 值字段最大字符数
 
 
 class SemanticScopeError(ValueError):
-    """Guest, stale-generation or deletion-pending semantic access."""
+    """语义作用域错误：陌生用户、过期代数或删除待处理时的访问。"""
 
 
 class SemanticCapacityError(ValueError):
-    """A new state key would exceed the non-evicting current-context bound."""
+    """语义容量错误：新状态键将超过非驱逐的当前上下文上限。"""
 
 
 class SemanticSourceConflict(ValueError):
-    """An idempotency key was reused for different immutable source input."""
+    """语义源冲突：幂等键被复用于不同的不可变源输入。"""
 
 
 @dataclass(frozen=True)
@@ -114,7 +114,7 @@ class SemanticChange:
                           ensure_ascii=False, separators=(',', ':'))
 
 
-# Deliberately finite objects/actions. Do not grow into a permissive text tail.
+# 刻意有限的对象/动作。不要扩展为宽松的文本尾部
 _ZH_OBJECT = r'(咖啡|绿茶|红茶|茶|辣食|甜食)'
 _EN_OBJECT = r'(coffee|tea|spicy food|sweets)'
 _ZH_TIME = r'(今天|最近|现在)?'
@@ -140,7 +140,7 @@ def parse_semantic_turn(text: str) -> tuple[SemanticChange, ...]:
     if match is None:
         match = re.fullmatch(r'Please call me (' + _NAME + r')', body, re.I)
     if match:
-        # Name slots are opaque, but obvious alternatives/particles are not names.
+        # 名字槽是不透明的，但明显的替代/助词不是名字
         if re.search(r'或者|还是|随便|也行|都可以|哈哈|谢谢|不要|请|[吧吗呢么]$|\b(?:or|and|not|please)\b', match[1], re.I):
             return ()
         return (SemanticChange('core', 'nickname', '', match[1]),)
@@ -280,7 +280,7 @@ class SemanticStateMixin:
 
     def record_assistant_promise(self, user_id: str, agent_id: str, source_message_id: str,
                                  text: str, observed_at: str, generation: int) -> dict:
-        # Only caller-supplied actually spoken speech, never model draft or user quote.
+        # 仅调用方提供的实际说出的话，不是模型草稿或用户引用
         match = None if _REJECT.search(text) else re.fullmatch(r'(?:我答应你|我承诺)([^。！？!?\n]{1,240})[。.]?', text.strip())
         changes = () if match is None else (SemanticChange('robot_promise', match[1], '', match[1], 'promised'),)
         return self._apply_semantic_source(user_id, agent_id, source_message_id, text,
@@ -355,8 +355,7 @@ class SemanticStateMixin:
                              'ON CONFLICT(user_id,agent_id,generation,state_key) '
                              'DO UPDATE SET change_id=excluded.change_id',
                              (*owner, row['state_key'], row['change_id']))
-            # Parent integration: publish state, invalidate conflicting references
-            # and revoke cached contexts in the SAME commit, only on a new write.
+            # 父集成：发布状态、使冲突引用失效、在同一提交中撤销缓存上下文（仅新写入时）
             if changes and hasattr(self, '_bump_context_epoch'):
                 refs = conn.execute("SELECT ref_id,payload_json FROM shared_memory_refs WHERE user_id=? AND agent_id=? AND status='active'",
                                     (user_id, agent_id)).fetchall()
@@ -397,8 +396,7 @@ class SemanticStateMixin:
 
     @staticmethod
     def invalidate_semantic_scope(conn: sqlite3.Connection, user_id: str, agent_id: str) -> None:
-        # Cleanup can remove legacy guest data too; unlike read/write it need not
-        # admit the identity as an authenticated owner.
+        # 清理可删除旧版访客数据；与读/写不同，不需要身份验证为认证所有者
         require_pair(user_id, agent_id)
         for table in ('semantic_current', 'semantic_versions', 'semantic_sources', 'semantic_withdrawals'):
             conn.execute(f'DELETE FROM {table} WHERE user_id=? AND agent_id=?', (user_id, agent_id))
@@ -466,5 +464,5 @@ def memory_conflicts(text: str, current_rows: list[dict]) -> bool:
 
 
 
-# Parent-facing name; retain the shorter name for standalone users/tests.
+# 父面向名称；保留较短名称供独立用户/测试使用
 SemanticStateStoreMixin = SemanticStateMixin

@@ -1,4 +1,5 @@
-"""Engine operations for the custom Agent, without any Pipecat runtime coupling."""
+# 本次改动（2026-10-21）：Agent prepare/prefetch 核验注册身份，未知 profile 归一为 guest，切换身份清理长期缓存。
+"""Agent 引擎操作：为自定义 Agent 提供记忆操作，不依赖 Pipecat 运行时。"""
 import logging
 import time
 from collections import deque
@@ -15,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class AgentEngineMixin:
+    """Agent 引擎混入类：为自定义 Agent 提供记忆操作，不依赖 Pipecat 运行时。
+
+    核心方法：
+    - prefetch_agent：流式前缀预取，在 ASR 稳定前缀上提前跑检索
+    - prepare_agent：组装提示词，返回完整的上下文消息列表
+    - complete_agent：完成轮次，写入 AI 回复
+    """
     def prefetch_agent(self, *, request: AgentPrefetchRequest, agent_id: str) -> dict:
         """流式前缀预取：在 ASR 稳定前缀上提前跑检索。
 
@@ -24,7 +32,7 @@ class AgentEngineMixin:
         if self._closed:
             raise RuntimeError('memory engine is closed')
         require_id(agent_id, 'agent_id')
-        user_id = request.memory_user_id
+        user_id = self.store.resolve_registered_user(request.memory_user_id, agent_id)
         self.worker.note_foreground()
         started = time.perf_counter()
         scope = self.store.read_scope(user_id, agent_id)
@@ -79,6 +87,9 @@ class AgentEngineMixin:
         if self._closed:
             raise RuntimeError('memory engine is closed')
         require_id(agent_id, 'agent_id')
+        resolved = self.store.resolve_registered_user(request.memory_user_id,agent_id)
+        if resolved != request.memory_user_id:
+            request = request.model_copy(update={'user_id':GUEST_USER_ID,'speaker':None})
         with self._pair_lock(request.memory_user_id, agent_id):
             prefetch_info: dict = {'status': 'none'}
             prefetched: list[dict] | None = None
@@ -97,6 +108,12 @@ class AgentEngineMixin:
                     'user', request.query, request.memory_user_id, agent_id, request.occurred_at or message_time())) + 4,
                 settings=self.consolidator._settings(), max_messages=self.config.max_messages,
                 max_l1_tokens=self.config.max_l1_tokens)
+            if self.store.isolation_switch(turn['user_id'],agent_id):
+                self.prefetch.clear()
+                with self.store._connect(write=True) as conn:
+                    conn.execute('UPDATE interaction_turns SET context_epoch=? WHERE turn_id=?',
+                        (self.store._context_epoch(conn,agent_id),turn['turn_id']))
+                turn = self.store.get_turn(turn['turn_id'],agent_id)
             self.worker.wake()
             prepared = self._prompt_for_turn(turn, prefetched=prefetched)
             self._record_prefetch(prefetch_info['status'],
@@ -111,8 +128,7 @@ class AgentEngineMixin:
             return dict(operation='prepare', turn_id=turn['turn_id'], client_turn_id=request.client_turn_id,
                         user_id=turn['user_id'], agent_id=agent_id, messages=prepared['messages'],
                         source_message_id=turn['source_message_id'], occurred_at=source_time,
-                        # The actual Agent owns tool/local-control history. This is
-                        # only the memory-owned supplement, not a replacement history.
+                        # 实际 Agent 拥有工具/本地控制历史。这只是记忆拥有的补充，不是替代历史
                         memory_context=supplement, has_prompt=True,
                         recall_status=prepared['recall_status'], core_write=prepared['core_write'])
 

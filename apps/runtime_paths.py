@@ -1,4 +1,7 @@
-"""Shared paths for code in the clean repository and external runtime state."""
+"""共享路径配置：代码仓库和外部运行时状态的路径常量。
+
+所有路径通过环境变量可覆盖，确保运行时产物不落入 Git 仓库内。
+"""
 
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ CONDA_ROOT = RUNTIME_ROOT / "conda"
 
 
 def configure_environment(root: Path | None = None) -> None:
-    """Keep generated state outside the Git repository."""
+    """配置运行时环境变量并创建所需目录，确保生成状态不落入 Git 仓库。"""
 
     del root  # Kept for compatibility with existing callers.
     paths = {

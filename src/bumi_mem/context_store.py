@@ -1,4 +1,4 @@
-"""Single-call exchange: finish previous AI speech + reserve current query atomically."""
+"""单次调用交换：原子地完成上一轮 AI 回复 + 预留当前查询。"""
 from __future__ import annotations
 
 import json
@@ -32,12 +32,15 @@ def _structured_single_response(payload, client_id):
 
 
 class ContextStoreMixin:
-    def migrate_context_request_protocols(self, conn):
-        """v8 migration; no network, transcript/L3 rewrite or guessed replay.
+    """单次调用交换混入类：原子地完成上一轮 AI 回复 + 当前查询的预留。
 
-        v7 reused a printable prefix, and sometimes cleared every format marker
-        after completion. Only provable single requests are rekeyed. Ambiguous
-        old rows stay intact and explicitly block reuse until reviewed.
+    包含 v7→v8 和 v8→v9 的 schema 迁移逻辑，以及幂等请求的缓存校验。
+    """
+    def migrate_context_request_protocols(self, conn):
+        """v8 迁移：将旧版可打印前缀的幂等键转为不可伪造的内部前缀。
+
+        不执行网络请求、不重写转录/L3、不猜测重放。
+        只对可证明的单次请求重新键入，模糊的旧行保持不变并阻止复用。
         """
         columns = {r['name'] for r in conn.execute('PRAGMA table_info(context_requests)')}
         if 'request_kind' not in columns:
@@ -53,14 +56,13 @@ class ContextStoreMixin:
             if not isinstance(key, str):
                 continue
             if key.startswith(TURN_REQUEST_PREFIX):
-                # This representation could never be a valid external legacy ID.
+                # 此表示不可能是有效的外部旧版 ID
                 conn.execute("UPDATE context_requests SET request_kind='single' WHERE request_id=?", (row['request_id'],))
                 continue
             if not key.startswith(LEGACY_TURN_REQUEST_PREFIX):
                 continue
-            # Keep the old name reserved even if the record moves. An older
-            # crash/race may have lost the original caller mode; never use its
-            # now-free printable key to silently create another input.
+            # 保留旧名称即使记录移动。旧崩溃/竞争可能丢失原始调用者模式；
+            # 永远不使用其现已空闲的可打印键静默创建另一个输入
             conn.execute('UPDATE context_requests SET pre_v8_key=? WHERE request_id=?', (key, row['request_id']))
             client_id = key[len(LEGACY_TURN_REQUEST_PREFIX):]
             response = _json_object(row['response_json'])
@@ -83,13 +85,13 @@ class ContextStoreMixin:
             elif not proven_legacy:
                 conn.execute("UPDATE context_requests SET request_kind='ambiguous' WHERE request_id=?", (row['request_id'],))
                 stale_agents.add(row['agent_id'])
-        # Never replay a pre-fix prompt that lost a failed write or misstated a
-        # control result. Keep pending speech/source records for normal settlement.
+        # 永不重放丢失失败写入或误述控制结果的修复前提示。
+        # 保留待处理的语音/来源记录供正常结算
         for agent_id in stale_agents:
             self._bump_context_epoch(conn, agent_id)
 
     def migrate_structured_turn_responses(self, conn):
-        """v9: invalidate 0.5.x string responses without rewriting messages/L3."""
+        """v9 迁移：使 0.5.x 的字符串响应失效，不重写 messages/L3。"""
         rows = conn.execute("SELECT request_id,agent_id,turn_id,response_json FROM context_requests "
                             "WHERE request_kind='single'").fetchall()
         stale_agents = set()
@@ -187,8 +189,7 @@ class ContextStoreMixin:
                 previous_reply_saved = result['reply_saved']
                 consolidation_status = result['consolidation_status']
             elif previous_ai_reply:
-                # There is no reliable original context for this reply. Do not
-                # silently save it under the new user's extraction session.
+                # 此回复没有可靠的原始上下文。不在新用户的抽取会话下静默保存
                 raise TurnConflict('no_previous_turn')
             request_id = 'ctx_' + uuid4().hex
             turn_id = None

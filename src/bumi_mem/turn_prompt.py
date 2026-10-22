@@ -1,10 +1,8 @@
-"""Single-string turn prompt for the one-request-per-turn protocol.
+"""单字符串轮次提示词：每轮一次请求协议的提示词渲染。
 
-Rendered from the SAME structured rows the legacy message list consumes
-(semantic current/history rows, published shared L3 references and the bounded
-L1 window). This module never re-splits an already assembled prompt string, and
-never invents a fact, owner, status or date that its inputs do not carry. It
-performs no IO, no retrieval and no model call.
+从与旧版消息列表相同的结构化行渲染（语义当前/历史行、已发布共享 L3 引用
+和有界 L1 窗口）。本模块从不重新拆分已组装的提示词字符串，不虚构输入
+未携带的事实/所有者/状态/日期。不执行 I/O、检索或模型调用。
 """
 from __future__ import annotations
 
@@ -15,6 +13,7 @@ from typing import Any, Sequence
 from bumi_mem.event_time import message_time
 from bumi_mem.identity import is_guest
 from bumi_mem.schemas import MessageRecord
+from bumi_mem.provenance import display_memory_body
 
 # Internal storage keys cannot be supplied by a legacy Idempotency-Key:
 # identity.require_id rejects this non-printable unit separator. The explicit
@@ -33,22 +32,20 @@ SHORT_TERM_HEADER = '[短期对话]'
 NO_LONG_TERM = '暂无相关长期记忆'
 EVENT_LABEL = '程序事件记录（非发言）'
 
-# Distinct labels: an event date, the original speech time and the record update
-# time are different facts and must never be merged into one timestamp.
+# 展示事件和来源时间；存储更新时间只用于后台版本/审计，不进入回答上下文。
 _TIME_LABELS = (('observed_at', '来源发言时间'), ('event_date', '事件时间'),
-                ('event_at', '事件时间'), ('updated_at', '记录更新时间（不是事件时间）'))
+                ('event_at', '事件时间'))
 
 _STATUS_TEXT = {'confirmed': '已确认', 'retracted': '已撤回，不再有效',
                 'planned': '计划中', 'promised': '已承诺', 'active': '进行中',
-                'completed': '已完成', 'cancelled': '已取消，不再有效'}
+                'completed': '已完成', 'cancelled': '已取消，不再有效'}  # 事实状态中文映射
 
 _BOUNDARY_TEXT = {'jokes': '不要开玩笑', 'appearance': '不要评价外貌'}
 _PERSONAL_TEXT = {'residence': '居住地', 'work_location': '工作地'}
 _LIKE_TEXT = {'like': '喜欢', 'dislike': '不喜欢'}
 _DRINK_TEXT = {'yes': '喝', 'no': '不喝'}
 
-# Retrieval state, not instructions: an empty block must not be mistaken for
-# "this user has no memory" when the read actually failed.
+# 检索状态而非指令：空块不得被误解为"该用户没有记忆"（实际可能是读取失败）
 _RECALL_NOTE = {
     'unavailable': '本轮长期检索暂不可用；以下只是可靠读取到的部分，不表示没有相关记忆。',
     'deleting': '该用户的长期记忆正在删除处理中，本轮不提供检索结果；不表示从未有过记忆。',
@@ -58,7 +55,7 @@ _RECALL_NOTE = {
 
 def _memory_body(row: dict[str, Any]) -> str:
     from bumi_mem.recall_context import reference_body
-    return reference_body(row)
+    return reference_body(dict(row, memory=display_memory_body(row)))
 
 
 def _inline_data(value: Any) -> str:
@@ -83,8 +80,8 @@ def _time_notes(row: dict[str, Any]) -> list[str]:
         if value and (label, str(value)) not in seen:
             seen.add((label, str(value)))
             notes.append(f'{label}：{value}')
-    # Consolidation stores chunk-level evidence, not a per-fact event timestamp.
-    # Do not invent which original message supports an individual extracted fact.
+    # 整理存储分块级证据，而非逐事实的事件时间戳
+    # 不虚构哪个原始消息支持哪条抽取事实
     sources = metadata.get('source_messages')
     times = list(dict.fromkeys(str(source['observed_at']) for source in sources
                   if isinstance(source, dict) and source.get('observed_at'))) if isinstance(sources, list) else []
@@ -105,7 +102,15 @@ def _time_notes(row: dict[str, Any]) -> list[str]:
 
 
 def _core_description(row: dict[str, Any]) -> str:
-    """Plain wording for one confirmed state row; no state_key/generation/score."""
+    """将一条核心状态行转为自然语言描述，不暴露内部字段（state_key/generation/score）。
+
+    按类别分派：
+    - core/nickname：称呼偏好
+    - boundary：互动边界规则
+    - personal：个人信息（居住地、工作地、饮用偏好等）
+    - preference：偏好（喜欢/不喜欢）
+    - plan/user_promise/robot_promise：计划和承诺
+    """
     category, attribute = str(row.get('category', '')), str(row.get('attribute', ''))
     value = row.get('value')
     if category == 'core' and attribute == 'nickname':
@@ -182,7 +187,7 @@ def _bounded_reference_lines(refs, max_chars):
         line = _reference_line(row)
         if line in seen:
             continue
-        seen.add(line)  # Time/status are part of the line: do not collapse them.
+        seen.add(line)  # 时间/状态是行的一部分：不折叠它们
         size = len(line) + (1 if lines else 0)
         if used + size > max_chars:
             omitted = True
@@ -206,7 +211,7 @@ def _long_term_lines(*, user_id: str, refs: Sequence[dict[str, Any]],
     body, omitted = _bounded_reference_lines(refs, max_reference_chars)
     if omitted:
         lines.append('- ' + REFERENCES_OMITTED)
-    # Required current rules are never sacrificed to retrieval/history budgets.
+    # 必需的当前规则不会被检索/历史预算牺牲
     body.extend(_core_line(row) for row in core_rows)
     body.extend(_core_line(row, historical=True) for row in history_rows[:max_history_rows])
     if len(history_rows) > max_history_rows:
@@ -277,7 +282,7 @@ def _short_term_lines(selected: Sequence[MessageRecord], agent_id: str) -> list[
                 speaker += '（未确认身份）'
             lines.append(f'{stamp}{speaker}：{_inline_data(message.content)}')
         elif message.role == 'assistant':
-            # An assistant utterance belongs to the agent, never to a user.
+            # assistant 发言属于 agent，不属于用户
             lines.append(f'{stamp}机器人 {_inline_data(message.agent_id or agent_id)}：{_inline_data(message.content)}')
         else:
             lines.append(f'{stamp}{EVENT_LABEL}：{_inline_data(_event_description(message.content))}')

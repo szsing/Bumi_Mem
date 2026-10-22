@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""LongMemEval Pair-6 评估脚本：在 6 个精选问题上评估 Mem0 记忆系统的性能。"""
 from __future__ import annotations
 
 import argparse

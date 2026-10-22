@@ -255,7 +255,7 @@ def test_reference_payload_retains_event_time_and_never_uses_recall_date(tmp_pat
     exchange(engine, 'A', 'hi')
     guest = exchange(engine, GUEST_USER_ID, '继续', previous='收到')
     assert 'event_date=2026-09-20' in text(guest)
-    assert 'source observed_at=2026-09-21T12:00:00+08:00' in text(guest)
+    assert 'source_at=2026-09-21T12:00:00+08:00' in text(guest)
 
 
 def test_plan_state_does_not_become_completed_just_because_time_passed(tmp_path):

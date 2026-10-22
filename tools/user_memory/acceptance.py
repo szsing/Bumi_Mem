@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Only three-user isolation and acknowledged-record recovery. No latency benchmark.
+"""三用户隔离与已确认记录恢复的验收测试。不含延迟基准测试。
 
-Kills only a Popen child owned by this tool. Never suspends, reboots or powers off a host.
+仅杀死本工具拥有的 Popen 子进程，绝不挂起、重启或关机主机。
 """
 from __future__ import annotations
 import argparse
