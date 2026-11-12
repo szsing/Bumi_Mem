@@ -34,7 +34,7 @@ EVENT_LABEL = '程序事件记录（非发言）'
 
 # 展示事件和来源时间；存储更新时间只用于后台版本/审计，不进入回答上下文。
 _TIME_LABELS = (('observed_at', '来源发言时间'), ('event_date', '事件时间'),
-                ('event_at', '事件时间'))
+                ('event_at', '事件时间'), ('reference_time', '来源片段参考时间，非事件时间'))
 
 _STATUS_TEXT = {'confirmed': '已确认', 'retracted': '已撤回，不再有效',
                 'planned': '计划中', 'promised': '已承诺', 'active': '进行中',

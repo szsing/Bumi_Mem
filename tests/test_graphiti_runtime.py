@@ -171,7 +171,8 @@ def test_combined_search_keeps_all_kinds_and_temporal_state(tmp_path):
         async def search_(self, query, **kwargs):
             assert kwargs['group_ids'] == [group]
             assert kwargs['config'].edge_config.reranker.name == 'rrf'
-            return types.SimpleNamespace(edges=[Item('e', fact='以前喜欢红色', invalid_at='2025-01-01T00:00:00Z')],
+            return types.SimpleNamespace(edges=[Item('e', fact='以前喜欢红色', invalid_at='2025-01-01T00:00:00Z',
+                reference_time='2024-09-13T08:00:00+08:00')],
                 nodes=[Item('n', summary='小星')], episodes=[Item('p', content='一段对话')], communities=[Item('c', summary='共同兴趣')])
     async def run():
         memory = adapter(tmp_path, Client())
@@ -179,6 +180,18 @@ def test_combined_search_keeps_all_kinds_and_temporal_state(tmp_path):
         assert len(rows) == 4
         assert rows[0]['fact_status'] == 'historical_version'
         assert {r['metadata']['kind'] for r in rows} == {'edge', 'node', 'episode', 'community'}
+        # Source time must survive Graphiti -> adapter -> structured API/chat.
+        from bumi_mem.turn_context import render_turn_context
+        from bumi_mem.memory_view import reference_item
+        from bumi_mem.turn_prompt import _reference_line
+        stamp = '2024-09-13T08:00:00+08:00'
+        assert rows[0]['metadata']['reference_time'] == stamp
+        body = render_turn_context(turn_id='t', user_id='u', selected=[], refs=rows,
+            core_rows=[], history_rows=[], max_reference_chars=6000)
+        edge = next(item for item in body['long_term_memory'] if '以前喜欢红色' in item['content'])
+        assert stamp in edge['time']
+        assert 'source_reference_at=' + stamp in reference_item(rows[0], labelled_times=True)['time']
+        assert '来源片段参考时间，非事件时间' in _reference_line(rows[0])
     asyncio.run(run())
 
 
@@ -655,13 +668,13 @@ def test_per_message_time_and_source_reach_raw_episode_content(tmp_path, raw_epi
     from bumi_mem.schemas import MessageRecord
     records = [
         MessageRecord(message_id='m1', session_id='s', sequence_no=1, role='user',
-                      content='我叫小星', token_count=1, created_at='2026-10-15T10:00:00+08:00',
+                      content='我们把行程改到周日上午', token_count=1, created_at='2026-09-09T10:00:00+08:00',
                       user_id='u', agent_id='a'),
         MessageRecord(message_id='m2', session_id='s', sequence_no=2, role='assistant',
-                      content='你好小星', token_count=1, created_at='2026-10-15T10:00:05+08:00',
+                      content='知道了', token_count=1, created_at='2026-09-09T10:00:05+08:00',
                       user_id='u', agent_id='a'),
         MessageRecord(message_id='m3', session_id='s', sequence_no=3, role='user',
-                      content='我喜欢三角龙', token_count=1, created_at='2026-10-15T10:01:00+08:00',
+                      content='今天终于看到蜻蜓了', token_count=1, created_at='2026-09-13T10:01:00+08:00',
                       user_id='u', agent_id='a'),
     ]
     messages = [r.to_extraction_message() for r in records]
@@ -670,16 +683,67 @@ def test_per_message_time_and_source_reach_raw_episode_content(tmp_path, raw_epi
         memory = adapter(tmp_path, Client())
         await memory.add_session(user_id='u', agent_id='a', messages=messages,
                                  metadata=dict(consolidation_id='k', job_id='j'))
-        content = captured['episodes'][0].content
-        # Every message's own timestamp and source id must be present, so a
-        # multi-turn batch is not flattened onto a single reference time.
-        for record in records:
+        episodes = captured['episodes']
+        assert len(episodes) == len(records)
+        assert len({episode.name for episode in episodes}) == len(records)
+        for record, episode in zip(records, episodes):
+            content = episode.content
             assert record.created_at in content, f'missing time for {record.message_id}'
             assert record.message_id in content, f'missing source id for {record.message_id}'
-        # Ordering is preserved end to end.
-        assert content.index('m1') < content.index('m2') < content.index('m3')
-        # Sanity: this is NOT merely "role: content".
-        assert content != '\n'.join(f"{m['role']}: {m['content'].split(chr(10),1)[-1]}" for m in messages)
+            assert episode.reference_time == datetime.fromisoformat(record.created_at)
+        assert '2026-09-13终于看到蜻蜓了' in episodes[-1].content
+        assert (episodes[-1].reference_time.date() - episodes[0].reference_time.date()).days == 4
+    asyncio.run(run())
+
+
+def test_invalid_later_message_time_never_starts_bulk_write(tmp_path, raw_episode_modules):
+    class Client:
+        async def add_episode_bulk(self, *args, **kwargs):
+            pytest.fail('invalid source time must fail before any Graphiti write')
+
+    async def run():
+        from bumi_mem.schemas import RetryableMemoryError
+        memory = adapter(tmp_path, Client())
+        for invalid in ('not-a-date', '2026-09-13T10:00:00'):
+            with pytest.raises(RetryableMemoryError, match='never started'):
+                await memory.add_session(user_id='u', agent_id='a', messages=[
+                    dict(role='user', content='改定行程', observed_at='2026-09-09T10:00:00+08:00'),
+                    dict(role='user', content='看到蜻蜓', observed_at=invalid)],
+                    metadata=dict(consolidation_id='k', job_id='j'))
+            with memory._db() as db:
+                assert db.execute('SELECT count(*) FROM ingestions').fetchone()[0] == 0
+    asyncio.run(run())
+
+
+def test_per_message_episode_names_keep_batch_withdrawal_lineage(tmp_path, raw_episode_modules):
+    class Client:
+        driver = object()
+        async def add_episode_bulk(self, episodes, **kwargs):
+            self.episodes = episodes
+            return types.SimpleNamespace(episodes=[types.SimpleNamespace(uuid=f'ep{i}')
+                for i in range(len(episodes))], nodes=[], edges=[])
+
+    async def run():
+        client = Client()
+        memory = adapter(tmp_path, client)
+        recorded = []
+        async def query(cypher, **params):
+            if 'BumiControlBlock' in cypher:
+                return []
+            if 'BumiControlBatch' in cypher:
+                recorded.append(params)
+            return []
+        memory._admin_query = query
+        args = dict(user_id='u', agent_id='a', messages=[
+            dict(role='user', content='改期', observed_at='2026-09-09T10:00:00+08:00', source_message_id='m1'),
+            dict(role='user', content='看到了', observed_at='2026-09-13T10:00:00+08:00', source_message_id='m2')],
+            metadata=dict(consolidation_id='k', job_id='j'))
+        receipt = await memory.add_session(**args)
+        assert receipt[0]['episode_uuids'] == ['ep0', 'ep1']
+        assert set(recorded[0]['names']) == {'k', *(e.name for e in client.episodes)}
+        assert recorded[0]['ids'] == ['m1', 'm2']
+        assert await memory.add_session(**args) == receipt
+        assert len(recorded) == 1  # completed batches never reingest/backfill
     asyncio.run(run())
 
 

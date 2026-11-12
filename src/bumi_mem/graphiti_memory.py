@@ -191,18 +191,30 @@ class GraphitiLongTermMemory(IsolationGraphMixin, ControlGraphMixin, AdminMemory
                 if hasattr(self.client, 'driver'):
                     blocked = await self.control_blocks(group_id=group)
                     messages = [m for m in messages if m.get('source_message_id') not in blocked]
-                    await self.control_record_batch(group_id=group, batch_id=key,
-                        source_ids=[m['source_message_id'] for m in messages if m.get('source_message_id')])
                     if not messages:
                         receipt = [{'backend':'graphiti','episode_uuids':[],'withdrawn':True}]
                         with self._db() as db:
                             db.execute("UPDATE ingestions SET state='complete',result=? WHERE id=?", (json.dumps(receipt),key))
                         return receipt
-                body = '\n'.join(f"{m['role']}: {m['content']}" for m in messages)
-                reference = datetime.fromisoformat(messages[0]['observed_at'])
-                episode = RawEpisode(name=key, content=body, source=EpisodeType.message,
-                                     source_description='Bumi conversation batch',
-                                     reference_time=reference)
+                # Native attribution is per episode: do not flatten messages from
+                # different times onto the first message's reference timestamp.
+                # Keep source headers/normalized dates in content as additional
+                # evidence, and retain a single bulk write/replay boundary.
+                episodes = []
+                for index, message in enumerate(messages):
+                    reference = datetime.fromisoformat(message['observed_at'].replace('Z', '+00:00'))
+                    if reference.utcoffset() is None:
+                        raise ValueError('Graphiti source time must include a timezone offset')
+                    episodes.append(RawEpisode(
+                        name=key if len(messages) == 1 else f'{key}:message:{index}',
+                        content=f"{message['role']}: {message['content']}",
+                        source=EpisodeType.message,
+                        source_description='Bumi conversation message',
+                        reference_time=reference))
+                if hasattr(self.client, 'driver'):
+                    await self.control_record_batch(group_id=group, batch_id=key,
+                        source_ids=[m['source_message_id'] for m in messages if m.get('source_message_id')],
+                        episode_names=[episode.name for episode in episodes])
             except Exception as exc:
                 with self._db() as db:
                     db.execute('DELETE FROM ingestions WHERE id=?', (key,))
@@ -217,7 +229,7 @@ class GraphitiLongTermMemory(IsolationGraphMixin, ControlGraphMixin, AdminMemory
             # SDK also owns a 4-attempt retry on the LLM call, so adding another
             # automatic retry here would multiply attempts and duplicate episodes.
             try:
-                result = await self.client.add_episode_bulk([episode], group_id=group)
+                result = await self.client.add_episode_bulk(episodes, group_id=group)
             except asyncio.CancelledError:
                 # Cancellation is control flow, not a write outcome. Keep the
                 # journal so a blind replay stays blocked, then propagate.
@@ -333,7 +345,8 @@ class GraphitiLongTermMemory(IsolationGraphMixin, ControlGraphMixin, AdminMemory
                 text = raw.get('fact') or raw.get('summary') or raw.get('content') or raw.get('name')
                 if not text:
                     continue
-                times = {k: raw[k] for k in ('valid_at', 'invalid_at', 'expired_at', 'created_at') if raw.get(k)}
+                times = {k: raw[k] for k in ('valid_at', 'invalid_at', 'expired_at', 'created_at',
+                                            'reference_time') if raw.get(k)}
                 historical = any(datetime.fromisoformat(raw[k].replace('Z', '+00:00')) <= datetime.now(timezone.utc)
                                  for k in ('invalid_at', 'expired_at') if raw.get(k))
                 text = f'[{kind}] ' + text
