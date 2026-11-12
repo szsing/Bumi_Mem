@@ -15,10 +15,11 @@ def memory_times(row: dict[str, Any], *, labelled: bool = False) -> list[str]:
     metadata = row.get('metadata')
     metadata = metadata if isinstance(metadata, dict) else {}
     result = []
-    for key in ("valid_at", "invalid_at", "expired_at"):
+    for key in ("valid_at", "invalid_at", "expired_at", "reference_time"):
         value = metadata.get(key)
         if value:
-            result.append(f"{key}={value}" if labelled else str(value))
+            label = 'source_reference_at' if key == 'reference_time' else key
+            result.append(f"{label}={value}" if labelled else str(value))
     for key, label in (('event_at', 'event_at'), ('event_date', 'event_date'),
                        ('observed_at', 'source_at')):
         for value in (row.get(key), metadata.get(key)):

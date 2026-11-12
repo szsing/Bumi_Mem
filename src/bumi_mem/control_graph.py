@@ -21,10 +21,14 @@ class ControlGraphMixin:
                 SET b.group_id=$g,b.source_id=sid RETURN b.key AS key''',g=group_id,ids=source_ids)
         return {'source_ids':source_ids}
 
-    async def control_record_batch(self, *, group_id, batch_id, source_ids):
-        await self._admin_query('''MERGE (b:BumiControlBatch {key:$key})
-            ON CREATE SET b.group_id=$g,b.batch_id=$batch,b.source_ids=$ids RETURN b.key AS key''',
-            key=group_id+'::'+batch_id,g=group_id,batch=batch_id,ids=sorted(set(source_ids)))
+    async def control_record_batch(self, *, group_id, batch_id, source_ids, episode_names=None):
+        # Episode names are used by suppression lookups. Preserve conservative
+        # batch-wide withdrawal even when ingestion emits per-message episodes.
+        names = sorted(set([batch_id, *(episode_names or [])]))
+        await self._admin_query('''UNWIND $names AS name
+            MERGE (b:BumiControlBatch {key:$g+'::'+name})
+            ON CREATE SET b.group_id=$g,b.batch_id=name,b.source_ids=$ids RETURN b.key AS key''',
+            names=names,g=group_id,ids=sorted(set(source_ids)))
 
     async def control_suppressed(self, *, group_id):
         blocked = await self.control_blocks(group_id=group_id)
